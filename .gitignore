@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.worktrees/
+
+# macOS
+.DS_Store
+
+# Playwright MCP temporary output
+.playwright-mcp/
+
+# Browser/debug artifacts (may contain page data, cookies, or local paths)
+screenshots/
+*.har
+*.trace.zip
+
+# Local agent and tool state
+.agents/
+.claude/
+.opencode/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.npmrc
+credentials*.json
+secrets*.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Generated icon source (downloaded/regenerated on demand)
+extension/images/.opencode-favicon-source.png
+
+# Logs
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db

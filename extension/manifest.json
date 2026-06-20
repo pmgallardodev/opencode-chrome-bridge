@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCode Chrome Bridge",
+  "description": "Let OpenCode inspect and control Chrome through a local native bridge.",
+  "version": "1.0.0",
+  "author": "pmgallardodev",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuLDFMcQxfXiSJfCvfZQ7tZWFYXphw1jvoD6jsiHNUeg77dZz3S44sXRxeWRQ4yxAYZKViTKAEWEeuyduSrBdERBwZ/LGidlBOPXgHiksLEZu4BP0pnInZ2k++G6BodGBE9OkiZyLqVXlFOS5zmDvL/5MGCYGJGgFm6A3BLyd2m+XJ93UqjH2B8w3dXyrPqu9pfqmV1iTVr3uRPou2bT879MgcY24mRn2ILEZM6yWCi4CrBmOqQYWgY5+O/ve/AgASvJAPWnJGXXAyszTi/v+UC4QfDrz076Qs1RV8v5wuTO6cOgBDE18dmZ5oZdLuurg0yXUWor76+V73KfnuomOrwIDAQAB",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [],
+  "web_accessible_resources": [
+    {
+      "matches": ["<all_urls>"],
+      "resources": ["images/cursor-chat.png"]
+    }
+  ],
+  "icons": {
+    "16": "images/icon16.png",
+    "32": "images/icon32.png",
+    "48": "images/icon48.png",
+    "128": "images/icon128.png"
+  },
+  "action": {
+    "default_title": "OpenCode Chrome Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/icon16.png",
+      "32": "images/icon32.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'none';"
+  },
+  "permissions": [
+    "alarms",
+    "bookmarks",
+    "debugger",
+    "downloads",
+    "downloads.ui",
+    "history",
+    "nativeMessaging",
+    "scripting",
+    "storage",
+    "tabGroups",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

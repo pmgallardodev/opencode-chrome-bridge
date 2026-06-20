@@ -1,0 +1,196 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCode</title>
+    <style>
+      :root {
+        --bg: #202020;
+        --card: #171717;
+        --card-line: #2b2b2b;
+        --text: #e8e8e8;
+        --muted: #a9a9a9;
+        --soft: #7d7d7d;
+        --green: #00d26a;
+        --green-bg: #053f20;
+        --green-line: #0b6d38;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        letter-spacing: 0;
+        margin: 0;
+        width: 360px;
+      }
+
+      main {
+        padding: 22px 16px 18px;
+      }
+
+      .hero {
+        align-items: center;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin: 0 0 20px;
+      }
+
+      .brand-mark {
+        display: block;
+        height: 32px;
+        image-rendering: auto;
+        width: 32px;
+      }
+
+      h1 {
+        font-size: 18px;
+        font-weight: 500;
+        line-height: 1;
+        margin: 0;
+      }
+
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--card-line);
+        border-radius: 8px;
+        padding: 12px;
+      }
+
+      .panel-top {
+        align-items: center;
+        display: flex;
+        justify-content: space-between;
+        min-height: 26px;
+      }
+
+      .status-pill {
+        align-items: center;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 999px;
+        color: var(--muted);
+        display: inline-flex;
+        font-size: 13px;
+        font-weight: 500;
+        gap: 7px;
+        padding: 3px 9px;
+      }
+
+      .connected .status-pill {
+        background: var(--green-bg);
+        border-color: var(--green-line);
+        color: var(--green);
+      }
+
+      .dot {
+        background: currentColor;
+        border-radius: 50%;
+        height: 6px;
+        width: 6px;
+      }
+
+      .icon-button {
+        align-items: center;
+        appearance: none;
+        background: transparent;
+        border: 0;
+        border-radius: 6px;
+        color: var(--muted);
+        cursor: pointer;
+        display: inline-flex;
+        height: 26px;
+        justify-content: center;
+        padding: 0;
+        width: 26px;
+      }
+
+      .icon-button:hover {
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+      }
+
+      .icon-button svg {
+        height: 16px;
+        width: 16px;
+      }
+
+      p {
+        color: var(--muted);
+        margin: 12px 0 0;
+      }
+
+      a,
+      button.link {
+        appearance: none;
+        background: none;
+        border: 0;
+        color: #cfcfcf;
+        cursor: pointer;
+        font: inherit;
+        padding: 0;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+
+      .version {
+        color: var(--soft);
+        font-size: 12px;
+        margin-top: 10px;
+      }
+
+      .copyright {
+        color: var(--soft);
+        font-size: 11px;
+        margin-top: 6px;
+      }
+
+      #statusDetail {
+        color: var(--soft);
+        display: block;
+        font-size: 12px;
+        margin-top: 6px;
+        min-height: 16px;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <img class="brand-mark" src="images/icon48.png" alt="" width="32" height="32" />
+        <h1>OpenCode</h1>
+      </section>
+
+      <section id="status" class="panel">
+        <div class="panel-top">
+          <div class="status-pill">
+            <span class="dot"></span>
+            <span id="statusText">Checking</span>
+          </div>
+          <button id="settingsButton" class="icon-button" type="button" title="Open OpenCode installation docs" aria-label="Open OpenCode installation docs">
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.6 1z"></path>
+            </svg>
+          </button>
+        </div>
+
+        <p>
+          Control Chrome with OpenCode.
+          <button id="learnMore" class="link" type="button">Learn more</button>
+        </p>
+        <span id="statusDetail">Native host com.opencode.chrome_bridge</span>
+        <div class="version">Version <span id="version">v1.0.0</span></div>
+        <div class="copyright">Copyright 2026 <button id="copyrightLink" class="link" type="button">pmgallardodev</button></div>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
