@@ -9,6 +9,8 @@
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-8A2BE2?style=flat-square" alt="PRs Welcome" /></a>
+  <a href="https://github.com/pmgallardodev/opencode-chrome-bridge/issues"><img src="https://img.shields.io/github/issues/pmgallardodev/opencode-chrome-bridge?style=flat-square" alt="Issues" /></a>
 </p>
 
 Control your real Chrome browser from OpenCode.
