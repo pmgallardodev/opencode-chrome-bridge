@@ -21,7 +21,7 @@
     "smoke:native": "node scripts/smoke-native-host.mjs"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.8"
+    "@opencode-ai/plugin": "1.17.9"
   },
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
