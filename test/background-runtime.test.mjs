@@ -35,6 +35,48 @@ test("tab claims fail closed when persisted lease data is malformed", async () =
   );
 });
 
+test("loadTabLeases clears stale in-memory entries before repopulating", async () => {
+  const firstLease = {
+    claimedAt: Date.now(),
+    origin: "user",
+    sessionId: "session-a",
+    state: "active",
+    tabId: 7,
+    turnId: "turn-a"
+  };
+  const secondLease = {
+    claimedAt: Date.now(),
+    origin: "agent",
+    sessionId: "session-b",
+    state: "active",
+    tabId: 9,
+    turnId: "turn-b"
+  };
+  let callCount = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => {
+      callCount += 1;
+      if (callCount === 1) return { opencodeTabLeases: { "7": firstLease } };
+      return { opencodeTabLeases: { "9": secondLease } };
+    }
+  });
+
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" });
+  // Force a second loadTabLeases call by resetting the memoization flag and
+  // invoking loadTabLeases directly through the harness VM context.
+  await harness.reloadTabLeases();
+  // After the second load, tab 7 (no longer in storage) must not linger in
+  // memory. A claim on tab 7 from a different session should succeed because
+  // the in-memory map was cleared before repopulating with tab 9's lease.
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-c", turnId: "turn-c", origin: "user" });
+  // Tab 9 is now in memory from the second load, so a claim from another
+  // session must be rejected.
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 9, sessionId: "session-d", turnId: "turn-d", origin: "user" }),
+    /already part of browser session session-b/u
+  );
+});
+
 test("tab lifecycle persistence failures preserve the previous fail-closed lease", async () => {
   const existingLease = {
     claimedAt: Date.now(),
@@ -54,10 +96,11 @@ test("tab lifecycle persistence failures preserve the previous fail-closed lease
   });
 
   await harness.execute("endTurn", { sessionId: "unused", turnId: "unused" });
-  await assert.rejects(
-    harness.events.tabsOnRemoved.emit(7, { windowId: 1, isWindowClosing: false }),
-    /session storage write failed/u
-  );
+  // The tabs.onRemoved listener fires removeClosedTabLease as a fire-and-forget
+  // promise (Chrome does not await returns from event listeners). Wait for the
+  // background's tab-lease mutation queue to settle before asserting side effects.
+  await harness.events.tabsOnRemoved.emit(7, { windowId: 1, isWindowClosing: false });
+  await harness.awaitTabLeaseQueue();
   await assert.rejects(
     harness.execute("claimTab", { tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user" }),
     /already part of browser session session-a/u
@@ -382,6 +425,15 @@ function createBackgroundHarness({
       context.__testMethod = method;
       context.__testParams = params;
       return vm.runInContext("executeCommand(__testMethod, __testParams)", context);
+    },
+    reloadTabLeases() {
+      return vm.runInContext(
+        "tabLeasesLoaded = false; tabLeasesLoadPromise = null; loadTabLeases()",
+        context
+      );
+    },
+    awaitTabLeaseQueue() {
+      return vm.runInContext("tabLeaseMutationQueue", context);
     }
   };
 }

@@ -53,7 +53,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
     sendResponse({ connected: nativePort !== null });
-    return true;
   }
   return false;
 });
@@ -82,7 +81,11 @@ function connectNativeHost() {
 }
 
 function scheduleReconnect() {
-  chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: 0.1, periodInMinutes: 0.5 }).catch(() => {});
+  // Chrome MV3 silently clamps alarm periods to a minimum of 1 minute in
+  // production builds (smaller values only work in unpacked developer mode).
+  // Use the smallest production-safe values so reconnect latency is bounded
+  // and predictable across installed extensions.
+  chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: 1, periodInMinutes: 1 }).catch(() => {});
 }
 
 async function handleNativeMessage(message) {
@@ -704,6 +707,9 @@ function withTabLeaseMutation(callback) {
 
 async function loadTabLeases() {
   const stored = (await chrome.storage.session.get(TAB_LEASES_STORAGE_KEY))[TAB_LEASES_STORAGE_KEY];
+  // Clear before repopulating so a partial failure on a later retry does not
+  // leave stale entries from a previous load mixed with the new snapshot.
+  tabLeases.clear();
   if (stored != null) {
     if (typeof stored !== "object" || Array.isArray(stored)) {
       throw new Error("stored tab lease data is invalid");
@@ -1228,7 +1234,6 @@ function registerBrowserEventListeners() {
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
     sendEvent({ category: "tabs", type: "tabRemoved", tabId, windowId: removeInfo.windowId, isWindowClosing: removeInfo.isWindowClosing });
-    return persistence;
   });
   chrome.tabs.onActivated.addListener((activeInfo) =>
     sendEvent({ category: "tabs", type: "tabActivated", tabId: activeInfo.tabId, windowId: activeInfo.windowId })
@@ -1237,7 +1242,6 @@ function registerBrowserEventListeners() {
     const persistence = replaceClosedTabLease(addedTabId, removedTabId);
     persistence.catch(reportLeasePersistenceError);
     sendEvent({ category: "tabs", type: "tabReplaced", addedTabId, removedTabId });
-    return persistence;
   });
   chrome.windows.onFocusChanged.addListener((windowId) =>
     sendEvent({ category: "windows", type: "windowFocusChanged", windowId })
@@ -1503,7 +1507,8 @@ function limitString(value, name, maxLength) {
 // "ControlOrMeta" maps to Control on non-Mac, Meta (Cmd) on Mac.
 function resolveModifiers(modifiers) {
   if (!Array.isArray(modifiers) || modifiers.length === 0) return 0;
-  const isMac = /mac/i.test(navigator.platform);
+  const platform = navigator.userAgentData?.platform ?? navigator.platform ?? "";
+  const isMac = /mac/i.test(platform);
   let mask = 0;
   for (const mod of modifiers) {
     switch (mod) {
