@@ -154,7 +154,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         }
       }),
       chrome_set_viewport: tool({
-        description: "Resize the Chrome window containing a tab to the given width and height in CSS pixels.",
+        description: "Emulate a viewport size for a Chrome tab through CDP without resizing the browser window.",
         args: {
           tabId: schema.number().int().describe("Chrome tab id used to identify the window."),
           width: schema.number().int().min(100).max(7680).describe("Window width in pixels."),
@@ -165,7 +165,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         }
       }),
       chrome_reset_viewport: tool({
-        description: "Restore the Chrome window to its normal (non-forced) state after a viewport resize.",
+        description: "Clear CDP viewport emulation for a Chrome tab and restore its normal page metrics.",
         args: {
           tabId: schema.number().int().describe("Chrome tab id used to identify the window.")
         },

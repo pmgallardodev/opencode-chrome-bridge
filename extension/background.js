@@ -8,6 +8,8 @@ const CONSOLE_LOG_BUFFER_MAX_CHARS = 2_000_000;
 const MAX_CONSOLE_LOG_TEXT_CHARS = 20_000;
 const MAX_CONSOLE_LOG_URL_CHARS = 2_048;
 const MAX_EXTENSION_EVENT_CHARS = 170_000;
+const MAX_NATIVE_RESPONSE_BYTES = 15 * 1024 * 1024;
+const MAX_NATIVE_ERROR_CHARS = 2_000;
 const TAB_LEASES_STORAGE_KEY = "opencodeTabLeases";
 const MAX_CAPTURE_DIMENSION = 10000;
 const MAX_CAPTURE_AREA = 25_000_000;
@@ -92,14 +94,29 @@ async function handleNativeMessage(message) {
   if (message?.type !== "command" || typeof message.id !== "string") return;
   try {
     const result = await executeCommand(message.method, message.params ?? {});
-    nativePort?.postMessage({ type: "response", id: message.id, ok: true, result });
+    postNativeResponse({ type: "response", id: message.id, ok: true, result });
   } catch (error) {
-    nativePort?.postMessage({
+    postNativeResponse({
       type: "response",
       id: message.id,
       ok: false,
-      error: error?.message || String(error)
+      error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS)
     });
+  }
+}
+
+function postNativeResponse(message) {
+  const port = nativePort;
+  if (!port) return;
+  const serialized = JSON.stringify(message);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_NATIVE_RESPONSE_BYTES) {
+    throw new Error("Chrome command response is too large for the local bridge");
+  }
+  try {
+    port.postMessage(message);
+  } catch {
+    // The native host disconnected after the command completed. Its reconnect
+    // listener owns recovery, so do not turn this into an unhandled rejection.
   }
 }
 
@@ -522,12 +539,12 @@ async function setWindowState(params) {
     throw new Error("state must be one of: normal, minimized, maximized, fullscreen");
   }
   await chrome.windows.update(windowId, { state });
-  return windowInfo(await chrome.windows.get(windowId));
+  return windowInfo(await chrome.windows.get(windowId, { populate: true }));
 }
 
 async function getWindowState(params) {
   const windowId = requireWindowId(params);
-  return windowInfo(await chrome.windows.get(windowId));
+  return windowInfo(await chrome.windows.get(windowId, { populate: true }));
 }
 
 async function createWindow(params) {
@@ -1367,16 +1384,15 @@ async function setFaviconBadge(params) {
 }
 
 async function ensureConsoleLogDebugger(tabId) {
-  if (consoleLogAttached.has(tabId)) return { tabId, attached: true, alreadyAttached: true };
   const target = { tabId };
   return withDebuggerLock(debuggerKey(target), async () => {
-    if (consoleLogAttached.has(tabId)) return { tabId, attached: true, alreadyAttached: true };
+    const alreadyAttached = consoleLogAttached.has(tabId);
     if (!isPersistentDebuggerAttached(tabId)) {
       await chrome.debugger.attach(target, DEBUGGER_VERSION);
     }
     await enableCdpDomains(target, ["Console", "Log", "Runtime"]);
     consoleLogAttached.add(tabId);
-    return { tabId, attached: true, alreadyAttached: false };
+    return { tabId, attached: true, alreadyAttached };
   });
 }
 
@@ -1479,10 +1495,11 @@ async function enableCdpDomains(target, domains) {
     if (!/^[A-Za-z][A-Za-z0-9]*$/u.test(domain) || enabled.has(domain)) continue;
     try {
       await chrome.debugger.sendCommand(target, `${domain}.enable`, {});
+      enabled.add(domain);
     } catch {
-      // Some CDP domains do not expose an enable command; subscriptions may still be valid.
+      // Some domains do not expose an enable command. Do not mark failures as
+      // enabled so transient target errors can be retried on the next request.
     }
-    enabled.add(domain);
   }
   if (Number.isInteger(tabId)) cdpEnabledDomains.set(tabId, enabled);
 }

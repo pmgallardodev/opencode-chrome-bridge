@@ -172,6 +172,13 @@ if (!window.__opencodeOverlayInstalled) {
   function showAt(x, y) {
     ensureOverlay();
     clearHideTimer();
+    if (currentState === "hidden") {
+      cursorEl.style.left = `${x}px`;
+      cursorEl.style.top = `${y}px`;
+      cursorEl.classList.remove("oc-visible");
+      hideBadge();
+      return;
+    }
     const from = currentPos();
     if (from && (Math.abs(from.x - x) > 3 || Math.abs(from.y - y) > 3)) {
       animateBezier(from.x, from.y, x, y, BEZIER_DURATION_MS);
@@ -185,6 +192,7 @@ if (!window.__opencodeOverlayInstalled) {
 
   function animateClick(x, y) {
     showAt(x, y);
+    if (currentState === "hidden") return;
     cursorEl.classList.add("oc-clicking");
     const ripple = document.createElement("div");
     ripple.className = "oc-ripple";
@@ -200,6 +208,7 @@ if (!window.__opencodeOverlayInstalled) {
 
   function showBadge() {
     ensureOverlay();
+    if (currentState === "hidden") return;
     faviconBadge.classList.add("oc-badge-visible");
   }
 
