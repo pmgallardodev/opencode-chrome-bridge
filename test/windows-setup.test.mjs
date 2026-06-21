@@ -251,7 +251,14 @@ test("package exposes the Windows guided setup", async () => {
 
 test("production dependency is pinned and installs are reproducible", async () => {
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
-  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.8");
+  const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
+  const declared = packageJson.dependencies?.["@opencode-ai/plugin"];
+  const locked = packageLock.packages?.[""]?.dependencies?.["@opencode-ai/plugin"];
+  assert.ok(
+    typeof declared === "string" && /^\d+\.\d+\.\d+$/u.test(declared),
+    `@opencode-ai/plugin must be pinned to an exact version, got ${declared}`
+  );
+  assert.equal(declared, locked, "package.json and package-lock.json must agree on @opencode-ai/plugin");
 });
 
 test("Windows setup does not pass arguments through shell true", async () => {

@@ -129,7 +129,16 @@ async function handleHttp(req, res) {
 function isAuthorized(req) {
   const supplied = Buffer.from(String(req.headers.authorization ?? ""), "utf8");
   const expected = Buffer.from(`Bearer ${token}`, "utf8");
-  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  // timingSafeEqual requires equal-length buffers. Pad the shorter one so the
+  // comparison does not leak which side mismatched, then verify the lengths
+  // matched independently. The padding value does not affect the result.
+  const maxLen = Math.max(supplied.length, expected.length);
+  const suppliedPadded = Buffer.alloc(maxLen);
+  const expectedPadded = Buffer.alloc(maxLen);
+  supplied.copy(suppliedPadded);
+  expected.copy(expectedPadded);
+  const matches = timingSafeEqual(suppliedPadded, expectedPadded);
+  return supplied.length === expected.length && matches;
 }
 
 function requireJsonRequest(req) {
