@@ -133,6 +133,14 @@ test("background uses CDP Emulation.setDeviceMetricsOverride for viewport emulat
   assert.match(background, /Emulation\.clearDeviceMetricsOverride/u, "resetViewport must clear CDP emulation");
 });
 
+test("viewport tool descriptions match CDP emulation behavior", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  assert.match(plugin.tool.chrome_set_viewport.description, /emulat/iu);
+  assert.doesNotMatch(plugin.tool.chrome_set_viewport.description, /resize the Chrome window/iu);
+  assert.match(plugin.tool.chrome_reset_viewport.description, /clear.*emulat|emulat.*clear/iu);
+});
+
 test("background moveSequence interpolates a drag path with press and release", async () => {
   const background = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
 

@@ -333,24 +333,118 @@ test("click and keypress retry release events after a partial input failure", as
   assert.equal(keyUpAttempts, 2);
 });
 
+test("oversized command results are rejected before native messaging", async () => {
+  const oversizedResult = "x".repeat(16 * 1024 * 1024);
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Runtime.evaluate"
+      ? { result: { type: "string", value: oversizedResult } }
+      : {}
+  });
+
+  await harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "large-response",
+    method: "evaluate",
+    params: { tabId: 7, expression: "largeValue" }
+  });
+
+  assert.equal(harness.calls.nativeMessages.length, 1);
+  assert.equal(harness.calls.nativeMessages[0].ok, false);
+  assert.match(harness.calls.nativeMessages[0].error, /too large/u);
+});
+
+test("window state reports the populated tab count", async () => {
+  const getCalls = [];
+  const harness = createBackgroundHarness({
+    windowsGet: async (windowId, getInfo) => {
+      getCalls.push({ windowId, getInfo });
+      return {
+        id: windowId,
+        focused: true,
+        tabs: getInfo?.populate ? [{ id: 1 }, { id: 2 }] : undefined
+      };
+    }
+  });
+
+  const result = await harness.execute("getWindowState", { windowId: 3 });
+
+  assert.equal(result.tabsCount, 2);
+  assert.equal(getCalls.length, 1);
+  assert.equal(getCalls[0].windowId, 3);
+  assert.equal(getCalls[0].getInfo?.populate, true);
+});
+
+test("setting window state returns the populated tab count", async () => {
+  const harness = createBackgroundHarness({
+    windowsGet: async (windowId, getInfo) => ({
+      id: windowId,
+      state: "maximized",
+      tabs: getInfo?.populate ? [{ id: 1 }, { id: 2 }, { id: 3 }] : undefined
+    })
+  });
+
+  const result = await harness.execute("setWindowState", { windowId: 4, state: "maximized" });
+
+  assert.equal(result.tabsCount, 3);
+});
+
+test("failed CDP domain enables are retried on the next console request", async () => {
+  let consoleEnableAttempts = 0;
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Console.enable") {
+        consoleEnableAttempts += 1;
+        if (consoleEnableAttempts === 1) throw new Error("target was temporarily unavailable");
+      }
+      return {};
+    }
+  });
+
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+
+  assert.equal(consoleEnableAttempts, 2);
+});
+
+test("a native disconnect while replying does not create an unhandled command rejection", async () => {
+  const harness = createBackgroundHarness({
+    nativePostMessage: () => {
+      throw new Error("native port disconnected");
+    }
+  });
+
+  await assert.doesNotReject(() => harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "disconnect-race",
+    method: "status",
+    params: {}
+  }));
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
   debuggerSendCommand = async () => ({}),
   consoleError = () => {},
-  tabsRemove = async () => {}
+  nativePostMessage = null,
+  tabsRemove = async () => {},
+  windowsGet = async (windowId) => ({ id: windowId })
 } = {}) {
   const calls = { executeScript: 0, nativeMessages: [], sendMessage: 0 };
   const events = {
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent(),
+    nativeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnReplaced: createEvent()
   };
   const nativePort = {
     onDisconnect: createEvent(),
-    onMessage: createEvent(),
-    postMessage(message) { calls.nativeMessages.push(message); }
+    onMessage: events.nativeOnMessage,
+    postMessage(message) {
+      if (nativePostMessage) return nativePostMessage(message);
+      calls.nativeMessages.push(message);
+    }
   };
   const chrome = {
     alarms: {
@@ -401,6 +495,7 @@ function createBackgroundHarness({
       update: async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 })
     },
     windows: {
+      get: windowsGet,
       getCurrent: async () => ({ id: 1 }),
       onFocusChanged: createEvent(),
       update: async (windowId) => ({ id: windowId })
@@ -414,6 +509,7 @@ function createBackgroundHarness({
     navigator: { platform: "MacIntel" },
     setTimeout,
     clearTimeout,
+    TextEncoder,
     URL
   });
   vm.runInContext(backgroundSource, context, { filename: "extension/background.js" });
