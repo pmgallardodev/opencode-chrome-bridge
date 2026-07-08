@@ -1,6 +1,6 @@
 {
   "name": "opencode-chrome-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "OpenCode plugin and local native bridge for controlling Google Chrome.",
   "type": "module",
