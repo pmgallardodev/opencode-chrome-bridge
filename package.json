@@ -1,6 +1,6 @@
 {
   "name": "opencode-chrome-bridge",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
   "description": "OpenCode plugin and local native bridge for controlling Google Chrome.",
   "type": "module",
@@ -21,7 +21,7 @@
     "smoke:native": "node scripts/smoke-native-host.mjs"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.13"
+    "@opencode-ai/plugin": "1.17.20"
   },
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"

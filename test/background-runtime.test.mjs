@@ -421,13 +421,54 @@ test("a native disconnect while replying does not create an unhandled command re
   }));
 });
 
+test("showDownload opens the default folder when downloadId is omitted", async () => {
+  let defaultFolderCalls = 0;
+  const harness = createBackgroundHarness({
+    downloadsShowDefaultFolder: async () => { defaultFolderCalls += 1; }
+  });
+
+  const result = await harness.execute("showDownload", {});
+
+  assert.equal(result.showed, "defaultFolder");
+  assert.equal(defaultFolderCalls, 1);
+});
+
+test("tab creation rejects partial lease identifiers before opening a tab", async () => {
+  let createCalls = 0;
+  const harness = createBackgroundHarness({
+    tabsCreate: async () => { createCalls += 1; return { id: 8 }; }
+  });
+
+  await assert.rejects(
+    harness.execute("createTab", { url: "about:blank", sessionId: "session-a" }),
+    /sessionId and turnId must be provided together/u
+  );
+  assert.equal(createCalls, 0);
+});
+
+test("window creation rejects empty lease identifiers before opening a window", async () => {
+  let createCalls = 0;
+  const harness = createBackgroundHarness({
+    windowsCreate: async () => { createCalls += 1; return { id: 2, tabs: [] }; }
+  });
+
+  await assert.rejects(
+    harness.execute("createWindow", { sessionId: "", turnId: "turn-a" }),
+    /sessionId must be a non-empty string/u
+  );
+  assert.equal(createCalls, 0);
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
   debuggerSendCommand = async () => ({}),
   consoleError = () => {},
+  downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
+  tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsRemove = async () => {},
+  windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId })
 } = {}) {
   const calls = { executeScript: 0, nativeMessages: [], sendMessage: 0 };
@@ -464,7 +505,8 @@ function createBackgroundHarness({
     downloads: {
       onChanged: createEvent(),
       onCreated: createEvent(),
-      search: async () => []
+      search: async () => [],
+      showDefaultFolder: downloadsShowDefaultFolder
     },
     history: { search: async () => [] },
     runtime: {
@@ -483,6 +525,7 @@ function createBackgroundHarness({
     },
     tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
     tabs: {
+      create: tabsCreate,
       get: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
       onActivated: createEvent(),
       onCreated: createEvent(),
@@ -495,6 +538,7 @@ function createBackgroundHarness({
       update: async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 })
     },
     windows: {
+      create: windowsCreate,
       get: windowsGet,
       getCurrent: async () => ({ id: 1 }),
       onFocusChanged: createEvent(),

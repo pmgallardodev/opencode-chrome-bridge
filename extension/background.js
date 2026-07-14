@@ -129,6 +129,7 @@ async function executeCommand(method, params) {
     case "getTab":
       return tabInfo(await chrome.tabs.get(requireTabId(params)));
     case "createTab": {
+      validateOptionalLeaseParams(params);
       const createUrl = params.url ?? "about:blank";
       if (params.url != null) validateNavigationUrl(params.url);
       const tab = await chrome.tabs.create({ active: params.active !== false, url: createUrl });
@@ -548,6 +549,7 @@ async function getWindowState(params) {
 }
 
 async function createWindow(params) {
+  validateOptionalLeaseParams(params);
   const createArgs = {};
   if (typeof params.url === "string" && params.url.length > 0) {
     validateNavigationUrl(params.url);
@@ -622,6 +624,18 @@ function assertClaimableTab(tab) {
 async function maybeClaimTabFromParams(tabId, params, origin) {
   if (!Number.isInteger(tabId) || typeof params.sessionId !== "string" || typeof params.turnId !== "string") return;
   await claimTab({ tabId, sessionId: params.sessionId, turnId: params.turnId, origin });
+}
+
+function validateOptionalLeaseParams(params) {
+  const hasSessionId = params.sessionId != null;
+  const hasTurnId = params.turnId != null;
+  if (hasSessionId !== hasTurnId) {
+    throw new Error("sessionId and turnId must be provided together");
+  }
+  if (hasSessionId) {
+    requireNonEmptyString(params.sessionId, "sessionId");
+    requireNonEmptyString(params.turnId, "turnId");
+  }
 }
 
 async function finalizeTabs(params) {
@@ -914,7 +928,7 @@ async function resumeDownload(params) {
 }
 
 async function showDownload(params) {
-  if (params.showDefaultFolder === true) {
+  if (params.showDefaultFolder === true || params.downloadId == null) {
     await chrome.downloads.showDefaultFolder();
     return { showed: "defaultFolder" };
   }
