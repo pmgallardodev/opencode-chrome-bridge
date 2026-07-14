@@ -281,7 +281,7 @@ test("clickElement locates the reference and clicks its center through CDP", asy
     },
     scriptingExecuteScript: async (injection) => injection.files
       ? []
-      : [{ result: { found: true, visible: true, x: 40, y: 60, role: "button", name: "Go" } }]
+      : [{ result: { found: true, visible: true, x: 40, y: 60, width: 120, height: 32, role: "button", name: "Go" } }]
   });
 
   const result = await harness.execute("clickElement", { tabId: 7, ref: "e1" });
@@ -300,6 +300,41 @@ test("clickElement rejects stale element references", async () => {
   await assert.rejects(
     harness.execute("clickElement", { tabId: 7, ref: "e99" }),
     /was not found/u
+  );
+});
+
+test("clickElement rejects hidden or zero-size elements", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, visible: false, x: 0, y: 0, width: 0, height: 0 } }]
+  });
+
+  await assert.rejects(
+    harness.execute("clickElement", { tabId: 7, ref: "e2" }),
+    /is not visible/u
+  );
+});
+
+test("fillElement rejects non-editable or unfocusable elements", async () => {
+  const nonEditable = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, editable: false, focused: false } }]
+  });
+  await assert.rejects(
+    nonEditable.execute("fillElement", { tabId: 7, ref: "e2", text: "x" }),
+    /not an editable field/u
+  );
+
+  const unfocusable = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, editable: true, focused: false } }]
+  });
+  await assert.rejects(
+    unfocusable.execute("fillElement", { tabId: 7, ref: "e2", text: "x" }),
+    /could not be focused/u
   );
 });
 

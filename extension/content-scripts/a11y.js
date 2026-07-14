@@ -252,7 +252,13 @@ if (!window.__opencodeA11yInstalled) {
   window.__opencodeA11yLocate = function (ref) {
     const element = derefElement(ref);
     if (!element) return { found: false };
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    try {
+      // "instant" avoids smooth-scroll animations skewing the rect below, but
+      // older Chrome releases reject it as an invalid enum value.
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch {
+      element.scrollIntoView({ block: "center", inline: "center" });
+    }
     const rect = element.getBoundingClientRect();
     return {
       found: true,
@@ -285,7 +291,11 @@ if (!window.__opencodeA11yInstalled) {
         }
       } catch {}
     }
-    return { found: true, editable, focused: element.ownerDocument.activeElement === element };
+    // getRootNode() keeps the check correct for elements inside shadow roots,
+    // where document.activeElement only reports the shadow host.
+    const root = element.getRootNode();
+    const active = root && "activeElement" in root ? root.activeElement : element.ownerDocument.activeElement;
+    return { found: true, editable, focused: active === element };
   };
 
   function clampInt(value, min, max, fallback) {

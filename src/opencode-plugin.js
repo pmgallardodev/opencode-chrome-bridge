@@ -275,6 +275,9 @@ export default async function OpenCodeChromeBridgePlugin() {
           deltaY: schema.number().optional().describe("Vertical scroll amount in pixels (positive = down). At least one of deltaX or deltaY is required and must be non-zero.")
         },
         async execute(args) {
+          if ((args.deltaX ?? 0) === 0 && (args.deltaY ?? 0) === 0) {
+            throw new Error("chrome_scroll requires a non-zero deltaX or deltaY");
+          }
           return JSON.stringify(await bridgeCommand("scroll", args), null, 2);
         }
       }),

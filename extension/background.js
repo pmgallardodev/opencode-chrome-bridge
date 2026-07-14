@@ -1585,6 +1585,9 @@ async function locateElement(tabId, ref) {
   if (location.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
+  if (location.visible !== true || !(location.width > 0) || !(location.height > 0)) {
+    throw new Error(`Element ${ref} is not visible; capture a fresh accessibilityTree`);
+  }
   if (!Number.isFinite(location.x) || !Number.isFinite(location.y)) {
     throw new Error(`Element ${ref} has no usable position`);
   }
@@ -1620,10 +1623,16 @@ async function fillElement(params) {
   if (focusResult.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
+  if (focusResult.editable !== true) {
+    throw new Error(`Element ${ref} is not an editable field (input, textarea, or contenteditable)`);
+  }
+  if (focusResult.focused !== true) {
+    throw new Error(`Element ${ref} could not be focused; it may be disabled or covered`);
+  }
   await withDebugger(tabId, async (target) => {
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
-  return { filled: true, ref, tabId, cleared: clear && focusResult.editable === true };
+  return { filled: true, ref, tabId, cleared: clear };
 }
 
 async function loadBlockedUrlPatterns() {
