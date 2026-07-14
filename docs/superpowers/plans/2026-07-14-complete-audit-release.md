@@ -279,18 +279,17 @@ git diff --check origin/main...HEAD
 
 Expected: zero failures, vulnerabilities, Semgrep findings, secret findings, or whitespace errors.
 
-- [ ] **Step 2: Reinstall the branch version and verify local wiring**
+- [ ] **Step 2: Verify the existing installed baseline without registering a temporary path**
 
-Run the supported Node executable explicitly:
+Run the installation checks from the permanent main checkout:
 
 ```bash
-npm run install:native -- --node=/Users/pablomiguelgallardo/.local/share/fnm/node-versions/v26.3.1/installation/bin/node
-npm run install:opencode
-npm run verify
-npm run check:chrome-extension
+cd /Users/pablomiguelgallardo/Desktop/Opencode
+/Users/pablomiguelgallardo/.local/share/fnm/node-versions/v26.3.1/installation/bin/node scripts/verify.mjs
+/Users/pablomiguelgallardo/.local/share/fnm/node-versions/v26.3.1/installation/bin/node scripts/check-chrome-extension.mjs
 ```
 
-Expected: the launcher points to Node 26.3.1 and the extension is enabled from this branch worktree.
+Expected: the permanent checkout remains registered with a Node 26.3.1 launcher and the extension is enabled. Do not add the temporary worktree to the global OpenCode config; branch code is covered by the Node/VM/native smoke gates until it is integrated.
 
 - [ ] **Step 3: Run a temporary real-Chrome lifecycle**
 
@@ -346,11 +345,21 @@ git merge --ff-only origin/main
 
 Expected: local `main`/integration target contains every audited commit. If review policy rejects self-merge, stop without tagging until the required approval is present.
 
-- [ ] **Step 4: Repeat the complete release gate on the integrated commit**
+- [ ] **Step 4: Reinstall and repeat the complete release gate on the integrated commit**
 
-Repeat Task 4 Steps 1 and 3 against the integrated commit.
+From `/Users/pablomiguelgallardo/Desktop/Opencode` on integrated `main`, run:
 
-Expected: identical green evidence after integration.
+```bash
+npm ci
+npm run install:native -- --node=/Users/pablomiguelgallardo/.local/share/fnm/node-versions/v26.3.1/installation/bin/node
+npm run install:opencode
+npm run verify
+npm run check:chrome-extension
+```
+
+Reload the unpacked extension so Chrome reads manifest/background version 1.0.2, then repeat Task 4 Steps 1 and 3 against the integrated commit.
+
+Expected: the permanent launcher/config/extension path all resolve to integrated `main`, the extension reports version 1.0.2, and the complete static/native/real-Chrome evidence remains green.
 
 - [ ] **Step 5: Create and verify the release**
 
