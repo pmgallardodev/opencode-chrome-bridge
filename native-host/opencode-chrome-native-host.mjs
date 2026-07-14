@@ -52,6 +52,12 @@ server.listen(0, "127.0.0.1", async () => {
   }
   await writeState(address.port);
   log(`listening on 127.0.0.1:${address.port}`);
+  // Announce readiness so the extension can distinguish a live host from a
+  // connectNative call that will fail asynchronously.
+  writeNativeMessage({
+    type: "event",
+    event: { category: "bridge", type: "bridgeReady", pid: process.pid }
+  }).catch((error) => log(`could not announce readiness: ${error?.message ?? error}`));
 });
 
 function onNativeData(chunk) {

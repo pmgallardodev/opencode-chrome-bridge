@@ -28,8 +28,8 @@ export default async function OpenCodeChromeBridgePlugin() {
         args: {
           url: schema.string().describe("URL to open or navigate to."),
           tabId: schema.number().int().optional().describe("Existing Chrome tab id to navigate."),
-          sessionId: schema.string().optional().describe("Optional browser-control session id to claim newly-created tabs."),
-          turnId: schema.string().optional().describe("Optional browser-control turn id to claim newly-created tabs.")
+          sessionId: schema.string().optional().describe("Optional browser-control session id to claim the created or navigated tab."),
+          turnId: schema.string().optional().describe("Optional browser-control turn id to claim the created or navigated tab.")
         },
         async execute(args) {
           const result = args.tabId == null
@@ -39,7 +39,12 @@ export default async function OpenCodeChromeBridgePlugin() {
               sessionId: args.sessionId,
               turnId: args.turnId
             })
-            : await bridgeCommand("navigate", { tabId: args.tabId, url: args.url });
+            : await bridgeCommand("navigate", {
+              tabId: args.tabId,
+              url: args.url,
+              sessionId: args.sessionId,
+              turnId: args.turnId
+            });
           return JSON.stringify(result, null, 2);
         }
       }),
@@ -266,8 +271,8 @@ export default async function OpenCodeChromeBridgePlugin() {
           tabId: schema.number().int().describe("Chrome tab id."),
           x: schema.number().describe("Viewport x coordinate to scroll at."),
           y: schema.number().describe("Viewport y coordinate to scroll at."),
-          deltaX: schema.number().default(0).describe("Horizontal scroll amount in pixels (positive = right)."),
-          deltaY: schema.number().default(0).describe("Vertical scroll amount in pixels (positive = down).")
+          deltaX: schema.number().optional().describe("Horizontal scroll amount in pixels (positive = right). At least one of deltaX or deltaY is required and must be non-zero."),
+          deltaY: schema.number().optional().describe("Vertical scroll amount in pixels (positive = down). At least one of deltaX or deltaY is required and must be non-zero.")
         },
         async execute(args) {
           return JSON.stringify(await bridgeCommand("scroll", args), null, 2);

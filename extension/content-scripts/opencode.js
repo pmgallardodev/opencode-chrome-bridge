@@ -13,11 +13,11 @@ if (!window.__opencodeOverlayInstalled) {
   const BEZIER_DURATION_MS = 220;
 
   const STATE_COLORS = {
-    active: { fill: "rgba(99, 102, 241, 0.92)", ring: "rgba(99,102,241,0.55)", glow: "rgba(99,102,241,0.35)" },
-    handoff: { fill: "rgba(245, 158, 11, 0.92)", ring: "rgba(245,158,11,0.55)", glow: "rgba(245,158,11,0.35)" },
-    deliverable: { fill: "rgba(34, 197, 94, 0.92)", ring: "rgba(34,197,94,0.55)", glow: "rgba(34,197,94,0.35)" },
-    abort: { fill: "rgba(239, 68, 68, 0.92)", ring: "rgba(239,68,68,0.55)", glow: "rgba(239,68,68,0.35)" },
-    hidden: { fill: "rgba(99, 102, 241, 0.92)", ring: "rgba(99,102,241,0.55)", glow: "rgba(99,102,241,0.35)" }
+    active: { ring: "rgba(99,102,241,0.55)" },
+    handoff: { ring: "rgba(245,158,11,0.55)" },
+    deliverable: { ring: "rgba(34,197,94,0.55)" },
+    abort: { ring: "rgba(239,68,68,0.55)" },
+    hidden: { ring: "rgba(99,102,241,0.55)" }
   };
 
   let shadowRoot = null;
@@ -27,6 +27,8 @@ if (!window.__opencodeOverlayInstalled) {
   let currentRaf = null;
   let currentState = "active";
   let faviconRecords = [];
+  let iconDataUrlPromise = null;
+  let faviconUpdateSeq = 0;
 
   function ensureOverlay() {
     if (shadowRoot) return;
@@ -216,11 +218,36 @@ if (!window.__opencodeOverlayInstalled) {
     if (faviconBadge) faviconBadge.classList.remove("oc-badge-visible");
   }
 
-  function setDocumentFaviconBadge(state) {
+  // SVG rendered as an image (which favicons are) blocks all external resource
+  // loads, including chrome-extension:// URLs. Inline the icon as a data: URI —
+  // the only kind of reference an SVG image is allowed to load.
+  function fetchIconDataUrl() {
+    if (!iconDataUrlPromise) {
+      iconDataUrlPromise = (async () => {
+        try {
+          const response = await fetch(chrome.runtime.getURL("images/cursor-chat.png"));
+          const blob = await response.blob();
+          return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+          });
+        } catch {
+          return null;
+        }
+      })();
+    }
+    return iconDataUrlPromise;
+  }
+
+  async function setDocumentFaviconBadge(state) {
+    const seq = ++faviconUpdateSeq;
     clearDocumentFaviconBadge();
     if (!state || !["active", "handoff", "deliverable"].includes(state)) return;
 
-    const iconHref = chrome.runtime.getURL("images/cursor-chat.png");
+    const iconHref = await fetchIconDataUrl();
+    if (seq !== faviconUpdateSeq) return;
     const badgedHref = makeFaviconBadgeDataUrl(state, iconHref);
     const links = [...document.querySelectorAll(FAVICON_LINK_SELECTOR)];
     const targets = links.length > 0 ? links : [createFaviconLink()];
@@ -266,7 +293,8 @@ if (!window.__opencodeOverlayInstalled) {
   function makeFaviconBadgeDataUrl(state, iconHref) {
     const badge = state === "deliverable" ? "#22c55e" : state === "handoff" ? "#f59e0b" : "#111827";
     const opacity = state === "active" ? ' opacity="0.35"' : "";
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><image href="${escapeSvg(iconHref)}" width="32" height="32"${opacity}/><circle cx="24" cy="24" r="7" fill="${badge}" stroke="white" stroke-width="2"/></svg>`;
+    const icon = iconHref ? `<image href="${escapeSvg(iconHref)}" width="32" height="32"${opacity}/>` : "";
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">${icon}<circle cx="24" cy="24" r="7" fill="${badge}" stroke="white" stroke-width="2"/></svg>`;
     return `data:image/svg+xml,${encodeURIComponent(svg)}`;
   }
 
@@ -302,7 +330,7 @@ if (!window.__opencodeOverlayInstalled) {
         break;
       case "cursor-state":
         applyState(message.state);
-        setDocumentFaviconBadge(message.state === "hidden" || message.state === "abort" ? null : message.state);
+        setDocumentFaviconBadge(message.state === "hidden" || message.state === "abort" ? null : message.state).catch(() => {});
         if (message.state === "hidden") {
           clearHideTimer();
           if (cursorEl) cursorEl.classList.remove("oc-visible");
@@ -310,7 +338,7 @@ if (!window.__opencodeOverlayInstalled) {
         }
         break;
       case "favicon-badge":
-        setDocumentFaviconBadge(message.badge);
+        setDocumentFaviconBadge(message.badge).catch(() => {});
         break;
       case "cursor-arrived":
         ensureOverlay();

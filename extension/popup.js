@@ -13,10 +13,13 @@ learnMore?.addEventListener("click", openDocs);
 settingsButton?.addEventListener("click", openDocs);
 copyrightLink?.addEventListener("click", () => openUrl(COPYRIGHT_URL));
 
+const MAX_REFRESH_ATTEMPTS = 4;
+const REFRESH_RETRY_DELAY_MS = 500;
+
 setVersion();
 refresh();
 
-async function refresh() {
+async function refresh(attempt = 1) {
   try {
     if (!globalThis.chrome?.runtime?.sendMessage) {
       setStatus(true, "Connected", "Preview mode outside Chrome extension runtime");
@@ -30,6 +33,11 @@ async function refresh() {
       connected ? "Connected" : "Disconnected",
       connected ? "Ready for OpenCode browser tools" : "Reload the extension or reinstall the native host"
     );
+    // The native host announces itself shortly after the service worker
+    // connects; re-check briefly before settling on a disconnected verdict.
+    if (!connected && attempt < MAX_REFRESH_ATTEMPTS) {
+      setTimeout(() => refresh(attempt + 1), REFRESH_RETRY_DELAY_MS);
+    }
   } catch (error) {
     setStatus(false, "Unavailable", error?.message ?? String(error));
   }

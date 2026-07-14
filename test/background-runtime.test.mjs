@@ -151,6 +151,104 @@ test("finalizeTabs does not report or release an agent tab that Chrome failed to
   );
 });
 
+test("keypress resolves text and virtual key codes so default actions fire", async () => {
+  const keyEvents = [];
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchKeyEvent") keyEvents.push(params);
+      return {};
+    }
+  });
+
+  await harness.execute("keypress", { tabId: 7, key: "Enter" });
+  assert.equal(keyEvents[0].type, "keyDown");
+  assert.equal(keyEvents[0].text, "\r");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 13);
+  assert.equal(keyEvents[1].type, "keyUp");
+  assert.equal(keyEvents[1].text, undefined);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "Shift" });
+  assert.equal(keyEvents[0].type, "rawKeyDown");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 16);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "KeyA" });
+  assert.equal(keyEvents[0].type, "keyDown");
+  assert.equal(keyEvents[0].key, "a");
+  assert.equal(keyEvents[0].text, "a");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 65);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "UnknownNamedKey" });
+  assert.equal(keyEvents[0].type, "rawKeyDown");
+  assert.equal(keyEvents[0].key, "UnknownNamedKey");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, undefined);
+});
+
+test("bridge status reports connected only after the native host sends a message", async () => {
+  const harness = createBackgroundHarness();
+
+  assert.equal(await harness.bridgeStatus(), false);
+  await harness.events.nativeOnMessage.emit({ type: "event", event: { category: "bridge", type: "bridgeReady" } });
+  assert.equal(await harness.bridgeStatus(), true);
+});
+
+test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {
+  let tabGone = false;
+  const harness = createBackgroundHarness({
+    tabsRemove: async () => {
+      tabGone = true;
+      throw new Error("No tab with id: 7.");
+    },
+    tabsGet: async (tabId) => {
+      if (tabGone && tabId === 7) throw new Error("No tab with id: 7.");
+      return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    }
+  });
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "agent" });
+
+  const result = await harness.execute("finalizeTabs", { sessionId: "session-a", keep: [] });
+  assert.equal(JSON.stringify(result.closedTabIds), JSON.stringify([7]));
+
+  // The stale lease must not block a future claim of the reused tab id.
+  tabGone = false;
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user" });
+});
+
+test("navigate claims the tab when lease identifiers are provided", async () => {
+  const harness = createBackgroundHarness();
+
+  await harness.execute("navigate", {
+    tabId: 7,
+    url: "https://example.com/next",
+    sessionId: "session-a",
+    turnId: "turn-a"
+  });
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user" }),
+    /already part of browser session session-a/u
+  );
+});
+
+test("cdpCommand Target.getTargets returns CDP-shaped target infos", async () => {
+  const harness = createBackgroundHarness();
+  harness.setDebuggerTargets([
+    { attached: true, id: "target-1", tabId: 7, title: "Example", type: "page", url: "https://example.com" }
+  ]);
+
+  const result = await harness.execute("cdpCommand", { method: "Target.getTargets" });
+
+  assert.equal(JSON.stringify(result.targetInfos), JSON.stringify([{
+    attached: true,
+    canAccessOpener: false,
+    targetId: "target-1",
+    title: "Example",
+    type: "page",
+    url: "https://example.com"
+  }]));
+});
+
 test("unsubscribing CDP events preserves persistent console collection", async () => {
   const harness = createBackgroundHarness();
 
@@ -467,15 +565,18 @@ function createBackgroundHarness({
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
+  tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
   windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId })
 } = {}) {
   const calls = { executeScript: 0, nativeMessages: [], sendMessage: 0 };
+  let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent(),
     nativeOnMessage: createEvent(),
+    runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnReplaced: createEvent()
   };
@@ -497,7 +598,7 @@ function createBackgroundHarness({
     debugger: {
       attach: async () => {},
       detach: async () => {},
-      getTargets: async () => [],
+      getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
       onEvent: events.debuggerOnEvent,
       sendCommand: debuggerSendCommand
@@ -513,7 +614,7 @@ function createBackgroundHarness({
       connectNative: () => nativePort,
       id: "test-extension",
       onInstalled: createEvent(),
-      onMessage: createEvent(),
+      onMessage: events.runtimeOnMessage,
       onStartup: createEvent()
     },
     scripting: { executeScript: async () => { calls.executeScript += 1; return []; } },
@@ -526,7 +627,7 @@ function createBackgroundHarness({
     tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
     tabs: {
       create: tabsCreate,
-      get: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
+      get: tabsGet,
       onActivated: createEvent(),
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
@@ -561,6 +662,14 @@ function createBackgroundHarness({
   return {
     calls,
     events,
+    setDebuggerTargets(targets) {
+      debuggerTargets = targets;
+    },
+    async bridgeStatus() {
+      let response;
+      await events.runtimeOnMessage.emit({ type: "GET_BRIDGE_STATUS" }, {}, (value) => { response = value; });
+      return response?.connected === true;
+    },
     execute(method, params) {
       context.__testMethod = method;
       context.__testParams = params;

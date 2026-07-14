@@ -21,6 +21,11 @@ const readNativeMessage = createNativeMessageReader(child.stdout);
 
 try {
   const state = await waitForState(stateDir, child, () => childStderr);
+
+  const readyFrame = await readNativeMessage();
+  if (readyFrame.type !== "event" || readyFrame.event?.type !== "bridgeReady") {
+    throw new Error(`Expected a bridgeReady announcement first, got: ${JSON.stringify(readyFrame)}`);
+  }
   if (process.platform !== "win32") {
     const stateDirMode = (await stat(stateDir)).mode & 0o777;
     if (stateDirMode !== 0o700) throw new Error(`Expected state directory mode 0700, got ${stateDirMode.toString(8)}`);

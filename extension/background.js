@@ -25,6 +25,7 @@ const MAX_CDP_METHODS = 100;
 const MAX_QUERY_CHARS = 1000;
 
 let nativePort = null;
+let nativeHostReady = false;
 let reconnecting = false;
 let tabLeasesLoaded = false;
 let tabLeasesLoadPromise = null;
@@ -54,7 +55,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
-    sendResponse({ connected: nativePort !== null });
+    // connectNative "succeeds" even when the native host is not installed, so a
+    // non-null port alone is a false positive until the host announces itself
+    // (bridgeReady event) or sends any other message.
+    sendResponse({ connected: nativePort !== null && nativeHostReady });
   }
   return false;
 });
@@ -67,10 +71,12 @@ function connectNativeHost() {
   if (nativePort || reconnecting) return;
   reconnecting = true;
   try {
+    nativeHostReady = false;
     nativePort = chrome.runtime.connectNative(HOST_NAME);
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(() => {
       nativePort = null;
+      nativeHostReady = false;
       scheduleReconnect();
     });
     chrome.alarms.clear(RECONNECT_ALARM).catch(() => {});
@@ -91,6 +97,8 @@ function scheduleReconnect() {
 }
 
 async function handleNativeMessage(message) {
+  // Any message proves a live native host on the other end of the port.
+  nativeHostReady = true;
   if (message?.type !== "command" || typeof message.id !== "string") return;
   try {
     const result = await executeCommand(message.method, message.params ?? {});
@@ -263,7 +271,19 @@ async function navigateTab(params) {
   const tabId = requireTabId(params);
   if (typeof params.url !== "string" || params.url.length === 0) throw new Error("url must be a non-empty string");
   validateNavigationUrl(params.url);
+  validateOptionalLeaseParams(params);
+  // Claim before navigating so a tab owned by another session is left untouched.
+  await maybeClaimTabFromParams(tabId, params, "user");
   return tabInfo(await chrome.tabs.update(tabId, { url: params.url }));
+}
+
+async function tabStillExists(tabId) {
+  try {
+    await chrome.tabs.get(tabId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function captureScreenshot(params) {
@@ -282,7 +302,8 @@ async function captureScreenshot(params) {
   const captureOptions = quality === undefined ? { format } : { format, quality };
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, captureOptions);
   const separator = typeof dataUrl === "string" ? dataUrl.indexOf(",") : -1;
-  assertScreenshotPayloadSize(separator === -1 ? null : dataUrl.slice(separator + 1));
+  if (separator === -1) throw new Error("Chrome did not return a screenshot data URL");
+  assertScreenshotPayloadSize(dataUrl.slice(separator + 1));
   return { dataUrl, format };
 }
 
@@ -442,11 +463,61 @@ async function dispatchMousePressAndRelease(target, event) {
   }
 }
 
-async function dispatchKeyDownAndUp(target, event) {
+// CDP treats a keyDown without text as rawKeyDown, which never triggers default
+// actions (Enter submitting a form, character insertion). Resolve the text and
+// virtual key codes Chrome needs so keys behave like real keyboard input.
+const NAMED_KEY_DETAILS = {
+  Alt: { keyCode: 18 },
+  ArrowDown: { keyCode: 40 },
+  ArrowLeft: { keyCode: 37 },
+  ArrowRight: { keyCode: 39 },
+  ArrowUp: { keyCode: 38 },
+  Backspace: { keyCode: 8 },
+  Control: { keyCode: 17 },
+  Delete: { keyCode: 46 },
+  End: { keyCode: 35 },
+  Enter: { keyCode: 13, text: "\r" },
+  Escape: { keyCode: 27 },
+  Home: { keyCode: 36 },
+  Insert: { keyCode: 45 },
+  Meta: { keyCode: 91 },
+  PageDown: { keyCode: 34 },
+  PageUp: { keyCode: 33 },
+  Shift: { keyCode: 16 },
+  Space: { key: " ", keyCode: 32, text: " " },
+  Tab: { keyCode: 9 }
+};
+
+function keyEventDetails(rawKey) {
+  const codeMatch = /^Key([A-Z])$/u.exec(rawKey);
+  const digitMatch = /^Digit([0-9])$/u.exec(rawKey);
+  const key = codeMatch ? codeMatch[1].toLowerCase() : digitMatch ? digitMatch[1] : rawKey;
+  const named = NAMED_KEY_DETAILS[key];
+  if (named) return { key: named.key ?? key, keyCode: named.keyCode, text: named.text };
+  const functionKey = /^F(1[0-2]|[1-9])$/u.exec(key);
+  if (functionKey) return { key, keyCode: 111 + Number(functionKey[1]) };
+  if (key.length === 1) {
+    const upper = key.toUpperCase();
+    const keyCode = /^[A-Z0-9]$/u.test(upper) ? upper.charCodeAt(0) : key === " " ? 32 : undefined;
+    return { key, keyCode, text: key };
+  }
+  return { key };
+}
+
+async function dispatchKeyDownAndUp(target, { key, modifiers }) {
+  const details = keyEventDetails(key);
+  const event = { key: details.key, modifiers };
+  if (details.keyCode !== undefined) {
+    event.windowsVirtualKeyCode = details.keyCode;
+    event.nativeVirtualKeyCode = details.keyCode;
+  }
+  const keyDownEvent = details.text === undefined
+    ? { ...event, type: "rawKeyDown" }
+    : { ...event, text: details.text, type: "keyDown" };
   let keyDown = false;
   let operationError = null;
   try {
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyDown" });
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyDownEvent);
     keyDown = true;
     await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyUp" });
     keyDown = false;
@@ -665,8 +736,14 @@ async function finalizeTabs(params) {
           await chrome.tabs.remove(lease.tabId);
           closeIds.push(lease.tabId);
         } catch (error) {
-          closeFailures.push({ error, tabId: lease.tabId });
-          continue;
+          // Only keep the lease when the tab genuinely still exists. If it was
+          // already closed in a race, releasing the lease here prevents a stale
+          // entry from blocking future claims of the reused tab id.
+          if (await tabStillExists(lease.tabId)) {
+            closeFailures.push({ error, tabId: lease.tabId });
+            continue;
+          }
+          closeIds.push(lease.tabId);
         }
       }
       nextLeases.delete(lease.tabId);
@@ -1075,7 +1152,18 @@ async function cdpCommand(params) {
     throw new Error("method must be a CDP method string in 'Domain.method' format");
   }
   if (params.method === "Target.getTargets") {
-    return { targetInfos: await cdpTargets() };
+    // Return real CDP TargetInfo objects (targetId, not the extension's id/tabId
+    // shape) so callers expecting protocol output are not surprised.
+    return {
+      targetInfos: (await chrome.debugger.getTargets()).map((target) => ({
+        attached: target.attached === true,
+        canAccessOpener: false,
+        targetId: target.id,
+        title: target.title ?? "",
+        type: target.type,
+        url: target.url ?? ""
+      }))
+    };
   }
   const target = debuggerTarget(params);
   const commandParams = params.commandParams ?? {};
