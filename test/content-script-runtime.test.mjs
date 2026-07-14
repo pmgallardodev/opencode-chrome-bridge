@@ -38,6 +38,22 @@ test("active cursor state shows the agent border and stop button, hidden removes
   assert.equal(stop.classList.contains("oc-visible"), false);
 });
 
+test("agent input pass-through keeps the Stop control from intercepting synthetic clicks", () => {
+  const harness = createContentScriptHarness();
+
+  harness.send({ source: "opencode-bridge", type: "cursor-state", state: "active" });
+  harness.send({ source: "opencode-bridge", type: "agent-input-start" });
+  harness.send({ source: "opencode-bridge", type: "agent-input-start" });
+
+  assert.equal(harness.stop.classList.contains("oc-input-pass-through"), true);
+
+  harness.send({ source: "opencode-bridge", type: "agent-input-end" });
+  assert.equal(harness.stop.classList.contains("oc-input-pass-through"), true);
+
+  harness.send({ source: "opencode-bridge", type: "agent-input-end" });
+  assert.equal(harness.stop.classList.contains("oc-input-pass-through"), false);
+});
+
 function createContentScriptHarness() {
   const elements = [];
   const listeners = [];
@@ -83,6 +99,9 @@ function createContentScriptHarness() {
     },
     get badge() {
       return elements.find((element) => element.classList.contains("oc-favicon-badge"));
+    },
+    get stop() {
+      return elements.find((element) => element.classList.contains("oc-stop"));
     },
     send(message) {
       for (const listener of listeners) listener(message, { id: chrome.runtime.id });

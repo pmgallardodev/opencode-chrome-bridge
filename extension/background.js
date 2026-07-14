@@ -64,7 +64,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     pingNativeHost().then((pong) => {
-      sendResponse({ connected: pong || nativeHostReady });
+      sendResponse({ connected: pong });
     });
     return true;
   }
@@ -419,10 +419,11 @@ async function dispatchClick(params) {
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
-  await notifyOverlay(tabId, "cursor-click", { x, y });
-  await withDebugger(tabId, async (target) => {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
-    await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
+  await withOverlayInputPassThrough(tabId, { x, y }, async () => {
+    await withDebugger(tabId, async (target) => {
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
+    });
   });
   return { clicked: true };
 }
@@ -433,12 +434,13 @@ async function dispatchDoubleClick(params) {
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
-  await notifyOverlay(tabId, "cursor-click", { x, y });
-  await withDebugger(tabId, async (target) => {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
-    for (const clickCount of [1, 2]) {
-      await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y });
-    }
+  await withOverlayInputPassThrough(tabId, { x, y }, async () => {
+    await withDebugger(tabId, async (target) => {
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      for (const clickCount of [1, 2]) {
+        await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y });
+      }
+    });
   });
   return { doubleClicked: true };
 }
@@ -542,24 +544,30 @@ const NAMED_KEY_DETAILS = {
   Tab: { keyCode: 9 }
 };
 
-function keyEventDetails(rawKey) {
+function keyEventDetails(rawKey, modifiers) {
+  const shifted = (modifiers & 8) !== 0;
+  const shortcut = (modifiers & 7) !== 0;
   const codeMatch = /^Key([A-Z])$/u.exec(rawKey);
   const digitMatch = /^Digit([0-9])$/u.exec(rawKey);
-  const key = codeMatch ? codeMatch[1].toLowerCase() : digitMatch ? digitMatch[1] : rawKey;
+  const codeKey = codeMatch ? (shifted ? codeMatch[1] : codeMatch[1].toLowerCase()) : null;
+  const key = codeKey ?? (digitMatch ? digitMatch[1] : rawKey);
   const named = NAMED_KEY_DETAILS[key];
-  if (named) return { key: named.key ?? key, keyCode: named.keyCode, text: named.text };
+  if (named) {
+    return { key: named.key ?? key, keyCode: named.keyCode, text: shortcut ? undefined : named.text };
+  }
   const functionKey = /^F(1[0-2]|[1-9])$/u.exec(key);
   if (functionKey) return { key, keyCode: 111 + Number(functionKey[1]) };
   if (key.length === 1) {
-    const upper = key.toUpperCase();
+    const printableKey = shifted && /^[a-z]$/u.test(key) ? key.toUpperCase() : key;
+    const upper = printableKey.toUpperCase();
     const keyCode = /^[A-Z0-9]$/u.test(upper) ? upper.charCodeAt(0) : key === " " ? 32 : undefined;
-    return { key, keyCode, text: key };
+    return { key: printableKey, keyCode, text: shortcut ? undefined : printableKey };
   }
   return { key };
 }
 
 async function dispatchKeyDownAndUp(target, { key, modifiers }) {
-  const details = keyEventDetails(key);
+  const details = keyEventDetails(key, modifiers);
   const event = { key: details.key, modifiers };
   if (details.keyCode !== undefined) {
     event.windowsVirtualKeyCode = details.keyCode;
@@ -1334,6 +1342,19 @@ async function notifyOverlay(tabId, type, data) {
   await sendOverlayMessage(tabId, type, data);
 }
 
+async function withOverlayInputPassThrough(tabId, point, operation) {
+  const overlayInjected = await injectOverlay(tabId);
+  if (overlayInjected) {
+    await sendOverlayMessage(tabId, "agent-input-start", {});
+    await sendOverlayMessage(tabId, "cursor-click", point);
+  }
+  try {
+    return await operation();
+  } finally {
+    if (overlayInjected) await sendOverlayMessage(tabId, "agent-input-end", {});
+  }
+}
+
 async function injectOverlay(tabId) {
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ["content-scripts/opencode.js"] });
@@ -1632,32 +1653,70 @@ async function fillElement(params) {
   await withDebugger(tabId, async (target) => {
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
+  const verifyResult = await runInA11yWorld(
+    tabId,
+    (elementRef, text, selectedAll) => window.__opencodeA11yVerifyFill
+      ? window.__opencodeA11yVerifyFill(elementRef, text, selectedAll)
+      : null,
+    [ref, params.text, clear]
+  );
+  if (verifyResult.found !== true) {
+    throw new Error(`Element ${ref} was replaced while filling; capture a fresh accessibilityTree`);
+  }
+  if (verifyResult.verified !== true) {
+    throw new Error(`Filling element ${ref} did not update the field to the requested value`);
+  }
   return { filled: true, ref, tabId, cleared: clear };
 }
 
 async function loadBlockedUrlPatterns() {
   const patterns = [];
   for (const areaName of ["managed", "local"]) {
+    const area = chrome.storage?.[areaName];
+    if (typeof area?.get !== "function") continue;
+    let stored;
     try {
-      const area = chrome.storage?.[areaName];
-      if (typeof area?.get !== "function") continue;
-      const stored = await area.get("blockedUrlPatterns");
-      const list = stored?.blockedUrlPatterns;
-      if (!Array.isArray(list)) continue;
-      for (const entry of list) {
-        if (typeof entry === "string" && entry.length > 0 && entry.length <= MAX_BLOCKED_URL_PATTERN_CHARS) {
-          patterns.push(entry);
-        }
+      stored = await area.get("blockedUrlPatterns");
+    } catch (error) {
+      throw new Error(`Could not read blockedUrlPatterns from ${areaName} storage: ${error?.message || error}`);
+    }
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
+      throw new Error(`${areaName} storage returned an invalid blockedUrlPatterns result`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(stored, "blockedUrlPatterns")) continue;
+    const list = stored.blockedUrlPatterns;
+    if (!Array.isArray(list)) {
+      throw new Error(`blockedUrlPatterns in ${areaName} storage must be an array`);
+    }
+    if (list.length > MAX_BLOCKED_URL_PATTERNS) {
+      throw new Error(`blockedUrlPatterns in ${areaName} storage exceeds the limit of ${MAX_BLOCKED_URL_PATTERNS}`);
+    }
+    for (const entry of list) {
+      if (
+        typeof entry !== "string"
+        || entry.trim().length === 0
+        || entry.length > MAX_BLOCKED_URL_PATTERN_CHARS
+        || normalizeBlockPattern(entry) === null
+      ) {
+        throw new Error(`blockedUrlPatterns in ${areaName} storage contains an invalid pattern`);
       }
-    } catch {
-      // storage.managed is unavailable outside enterprise-managed browsers.
+      patterns.push(entry.trim());
     }
   }
-  return [...new Set(patterns)].slice(0, MAX_BLOCKED_URL_PATTERNS);
+  const uniquePatterns = [...new Set(patterns)];
+  if (uniquePatterns.length > MAX_BLOCKED_URL_PATTERNS) {
+    throw new Error(`blockedUrlPatterns exceeds the combined limit of ${MAX_BLOCKED_URL_PATTERNS}`);
+  }
+  return uniquePatterns;
 }
 
 function normalizeBlockPattern(pattern) {
-  const normalized = pattern.trim().toLowerCase().replace(/^https?:\/\//u, "").replace(/^www\./u, "");
+  const normalized = pattern
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//u, "")
+    .replace(/^www\./u, "")
+    .replace(/\/+$/u, "");
   if (normalized.length === 0) return null;
   return normalized.includes("/") ? normalized : `${normalized}/*`;
 }
@@ -1666,16 +1725,43 @@ function urlMatchesBlockPattern(parsedUrl, pattern) {
   const normalized = normalizeBlockPattern(pattern);
   if (normalized === null) return false;
   const host = parsedUrl.hostname.toLowerCase().replace(/^www\./u, "");
-  const subject = `${host}${parsedUrl.pathname.toLowerCase()}`;
-  const body = normalized.split("*").map(escapeRegExp).join(".*");
-  const regex = normalized.endsWith("*")
-    ? new RegExp(`^${body}$`, "u")
-    : new RegExp(`^${body}(?:/.*)?$`, "u");
-  return regex.test(subject);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(parsedUrl.pathname).toLowerCase();
+  } catch {
+    throw new Error("Navigation URL contains invalid percent-encoding");
+  }
+  const subject = `${host}${pathname}`;
+  if (wildcardMatch(subject, normalized)) return true;
+  return !normalized.endsWith("*") && wildcardMatch(subject, `${normalized}/*`);
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+function wildcardMatch(subject, pattern) {
+  if (!pattern.includes("*")) return subject === pattern;
+  const startsWithWildcard = pattern.startsWith("*");
+  const endsWithWildcard = pattern.endsWith("*");
+  const parts = pattern.split("*").filter(Boolean);
+  if (parts.length === 0) return true;
+
+  let cursor = 0;
+  let firstPart = 0;
+  let lastPart = parts.length;
+  if (!startsWithWildcard) {
+    if (!subject.startsWith(parts[0])) return false;
+    cursor = parts[0].length;
+    firstPart = 1;
+  }
+  if (!endsWithWildcard) lastPart -= 1;
+  for (let index = firstPart; index < lastPart; index += 1) {
+    const foundAt = subject.indexOf(parts[index], cursor);
+    if (foundAt === -1) return false;
+    cursor = foundAt + parts[index].length;
+  }
+  if (endsWithWildcard) return true;
+
+  const finalPart = parts.at(-1);
+  const finalStart = subject.length - finalPart.length;
+  return finalStart >= cursor && subject.endsWith(finalPart);
 }
 
 async function assertNavigationAllowed(url) {

@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## v1.1.0 — 2026-07-14
+## v1.1.0 — 2026-07-15
 
 ### Added
 
@@ -23,6 +23,20 @@ All notable changes to this project are documented in this file.
   trip, so the popup can distinguish a healthy host from a present-but-wedged one.
 - `minimum_chrome_version: 116` is now declared in the extension manifest.
 
+### Fixed
+
+- Synthetic clicks temporarily make the in-page **Stop OpenCode** control transparent
+  to pointer input, so it cannot intercept clicks aimed at page controls underneath it.
+- `chrome_fill_element` accepts only writable text fields and verifies the resulting
+  value before reporting success.
+- Navigation policy reads and validates configured storage fail closed, canonicalizes
+  trailing slashes, and decodes percent-encoded paths before matching.
+- Native-host status requires the current ping to receive its matching pong.
+- Accessibility snapshots redact every standard `cc-*` autocomplete field, including
+  cardholder names, plus password, one-time-code, and transaction fields.
+- `chrome_keypress` applies Shift to printable letters and suppresses text insertion for
+  Control, Alt, and Meta shortcuts.
+
 ### Fixed (carried from the v1.0.2 review)
 
 - `chrome_keypress` now resolves `text` and virtual key codes, so Enter submits forms
@@ -36,7 +50,7 @@ All notable changes to this project are documented in this file.
 - `chrome_scroll` no longer defaults both deltas to 0.
 - Windows setup rejects `%` in `cmd /c` tokens instead of corrupting paths.
 
-## v1.0.2 — 2026-07-06
+## v1.0.2 — 2026-07-14
 
 Baseline audited release: tab leases, session lifecycle, downloads, tab groups,
 CDP subscriptions, console log capture, and Windows guided setup.

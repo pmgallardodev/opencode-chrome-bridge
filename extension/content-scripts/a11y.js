@@ -10,6 +10,7 @@ if (!window.__opencodeA11yInstalled) {
 
   const elementByRef = new Map();
   const refByElement = new WeakMap();
+  const pendingFills = new Map();
   let refCounter = 0;
 
   const ROLE_BY_TAG = {
@@ -40,16 +41,17 @@ if (!window.__opencodeA11yInstalled) {
     ul: "list"
   };
 
-  const SENSITIVE_AUTOCOMPLETE = [
+  const SENSITIVE_AUTOCOMPLETE = new Set([
     "current-password",
     "new-password",
     "one-time-code",
-    "cc-number",
-    "cc-csc",
-    "cc-exp",
-    "cc-exp-month",
-    "cc-exp-year"
-  ];
+    "transaction-amount",
+    "transaction-currency"
+  ]);
+
+  const WRITABLE_INPUT_TYPES = new Set([
+    "email", "number", "password", "search", "tel", "text", "url"
+  ]);
 
   const INTERACTIVE_ROLES = new Set([
     "button", "checkbox", "combobox", "link", "listbox", "menuitem",
@@ -79,8 +81,12 @@ if (!window.__opencodeA11yInstalled) {
   function isSensitiveField(element) {
     const type = (element.getAttribute("type") || "").toLowerCase();
     if (type === "password" || type === "hidden") return true;
-    const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
-    return SENSITIVE_AUTOCOMPLETE.some((token) => autocomplete.includes(token));
+    const autocompleteTokens = (element.getAttribute("autocomplete") || "")
+      .toLowerCase()
+      .trim()
+      .split(/\s+/u)
+      .filter(Boolean);
+    return autocompleteTokens.some((token) => token.startsWith("cc-") || SENSITIVE_AUTOCOMPLETE.has(token));
   }
 
   function isVisible(element) {
@@ -145,7 +151,7 @@ if (!window.__opencodeA11yInstalled) {
   function fieldValue(element) {
     const tag = element.tagName.toLowerCase();
     if (tag !== "input" && tag !== "textarea") return null;
-    if (isSensitiveField(element)) return element.value ? "[redacted]" : "";
+    if (isSensitiveField(element)) return "[redacted]";
     return typeof element.value === "string" && element.value ? truncate(element.value, 80) : null;
   }
 
@@ -275,9 +281,18 @@ if (!window.__opencodeA11yInstalled) {
   window.__opencodeA11yFocus = function (ref, selectAll) {
     const element = derefElement(ref);
     if (!element) return { found: false };
-    element.focus();
     const tag = element.tagName.toLowerCase();
-    const editable = tag === "input" || tag === "textarea" || element.isContentEditable === true;
+    const readOnly = element.readOnly === true || element.getAttribute("aria-readonly") === "true";
+    const editable = !isDisabled(element) && !readOnly && (
+      (tag === "input" && WRITABLE_INPUT_TYPES.has((element.getAttribute("type") || "text").toLowerCase()))
+      || tag === "textarea"
+      || element.isContentEditable === true
+    );
+    if (!editable) {
+      pendingFills.delete(String(ref));
+      return { found: true, editable: false, focused: false };
+    }
+    element.focus();
     if (selectAll && editable) {
       try {
         if (typeof element.select === "function") {
@@ -295,7 +310,39 @@ if (!window.__opencodeA11yInstalled) {
     // where document.activeElement only reports the shadow host.
     const root = element.getRootNode();
     const active = root && "activeElement" in root ? root.activeElement : element.ownerDocument.activeElement;
-    return { found: true, editable, focused: active === element };
+    const focused = active === element;
+    if (focused) {
+      const usesValue = tag === "input" || tag === "textarea";
+      pendingFills.set(String(ref), {
+        before: usesValue ? String(element.value ?? "") : String(element.textContent ?? ""),
+        element,
+        selectionEnd: usesValue && Number.isInteger(element.selectionEnd) ? element.selectionEnd : null,
+        selectionStart: usesValue && Number.isInteger(element.selectionStart) ? element.selectionStart : null,
+        usesValue
+      });
+    } else {
+      pendingFills.delete(String(ref));
+    }
+    return { found: true, editable, focused };
+  };
+
+  window.__opencodeA11yVerifyFill = function (ref, text, selectedAll) {
+    const refKey = String(ref);
+    const element = derefElement(refKey);
+    const pending = pendingFills.get(refKey);
+    pendingFills.delete(refKey);
+    if (!element || !pending || pending.element !== element) return { found: element !== null, verified: false };
+
+    const current = pending.usesValue ? String(element.value ?? "") : String(element.textContent ?? "");
+    if (pending.usesValue) {
+      const start = selectedAll ? 0 : (pending.selectionStart ?? pending.before.length);
+      const end = selectedAll ? pending.before.length : (pending.selectionEnd ?? start);
+      const expected = `${pending.before.slice(0, start)}${text}${pending.before.slice(end)}`;
+      return { found: true, verified: current === expected };
+    }
+    if (selectedAll) return { found: true, verified: current === text };
+    if (text.length === 0) return { found: true, verified: current === pending.before };
+    return { found: true, verified: current !== pending.before && current.includes(text) };
   };
 
   function clampInt(value, min, max, fallback) {

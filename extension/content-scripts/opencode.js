@@ -31,6 +31,7 @@ if (!window.__opencodeOverlayInstalled) {
   let faviconRecords = [];
   let iconDataUrlPromise = null;
   let faviconUpdateSeq = 0;
+  let agentInputDepth = 0;
 
   function ensureOverlay() {
     if (shadowRoot) return;
@@ -154,6 +155,7 @@ if (!window.__opencodeOverlayInstalled) {
         opacity: 1;
         pointer-events: auto;
       }
+      .oc-stop.oc-visible.oc-input-pass-through { pointer-events: none; }
       @media (prefers-reduced-motion: reduce) {
         .oc-border-inner { animation: none; }
         .oc-favicon-badge { animation: none; }
@@ -202,6 +204,17 @@ if (!window.__opencodeOverlayInstalled) {
   function hideAgentChrome() {
     if (borderEl) borderEl.classList.remove("oc-visible");
     if (stopButton) stopButton.classList.remove("oc-visible");
+  }
+
+  function beginAgentInput() {
+    ensureOverlay();
+    agentInputDepth += 1;
+    stopButton.classList.add("oc-input-pass-through");
+  }
+
+  function endAgentInput() {
+    agentInputDepth = Math.max(0, agentInputDepth - 1);
+    if (agentInputDepth === 0 && stopButton) stopButton.classList.remove("oc-input-pass-through");
   }
 
   function applyState(state) {
@@ -411,6 +424,12 @@ if (!window.__opencodeOverlayInstalled) {
         break;
       case "cursor-click":
         animateClick(message.x, message.y);
+        break;
+      case "agent-input-start":
+        beginAgentInput();
+        break;
+      case "agent-input-end":
+        endAgentInput();
         break;
       case "cursor-state":
         applyState(message.state);
