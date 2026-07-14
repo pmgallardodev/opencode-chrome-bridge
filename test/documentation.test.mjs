@@ -99,6 +99,10 @@ test("release metadata is synchronized for v1.0.2", async () => {
   assert.match(popupJs, /"v1\.0\.2"/u);
   assert.match(readme, /Version-v1\.0\.2-/u);
   assert.match(readme, /alt="Version v1\.0\.2"/u);
+  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
+  assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.17.20");
 });
 
 test("public repository includes governance and security documents", async () => {
