@@ -13,20 +13,25 @@ if (!window.__opencodeOverlayInstalled) {
   const BEZIER_DURATION_MS = 220;
 
   const STATE_COLORS = {
-    active: { fill: "rgba(99, 102, 241, 0.92)", ring: "rgba(99,102,241,0.55)", glow: "rgba(99,102,241,0.35)" },
-    handoff: { fill: "rgba(245, 158, 11, 0.92)", ring: "rgba(245,158,11,0.55)", glow: "rgba(245,158,11,0.35)" },
-    deliverable: { fill: "rgba(34, 197, 94, 0.92)", ring: "rgba(34,197,94,0.55)", glow: "rgba(34,197,94,0.35)" },
-    abort: { fill: "rgba(239, 68, 68, 0.92)", ring: "rgba(239,68,68,0.55)", glow: "rgba(239,68,68,0.35)" },
-    hidden: { fill: "rgba(99, 102, 241, 0.92)", ring: "rgba(99,102,241,0.55)", glow: "rgba(99,102,241,0.35)" }
+    active: { ring: "rgba(99,102,241,0.55)" },
+    handoff: { ring: "rgba(245,158,11,0.55)" },
+    deliverable: { ring: "rgba(34,197,94,0.55)" },
+    abort: { ring: "rgba(239,68,68,0.55)" },
+    hidden: { ring: "rgba(99,102,241,0.55)" }
   };
 
   let shadowRoot = null;
   let cursorEl = null;
   let faviconBadge = null;
+  let borderEl = null;
+  let stopButton = null;
   let hideTimer = null;
   let currentRaf = null;
   let currentState = "active";
   let faviconRecords = [];
+  let iconDataUrlPromise = null;
+  let faviconUpdateSeq = 0;
+  let agentInputDepth = 0;
 
   function ensureOverlay() {
     if (shadowRoot) return;
@@ -106,6 +111,55 @@ if (!window.__opencodeOverlayInstalled) {
         0%, 100% { transform: scale(1); }
         50% { transform: scale(1.18); }
       }
+      .oc-border {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .oc-border-inner {
+        position: absolute;
+        inset: 0;
+        box-shadow:
+          inset 0 0 15px rgba(99, 102, 241, 0.55),
+          inset 0 0 30px rgba(99, 102, 241, 0.25);
+        animation: oc-border-pulse 2s ease-in-out infinite;
+      }
+      .oc-border.oc-visible { opacity: 1; }
+      @keyframes oc-border-pulse {
+        0%, 100% { opacity: 0.6; }
+        50% { opacity: 1; }
+      }
+      .oc-stop {
+        position: fixed;
+        bottom: 16px;
+        left: 50%;
+        transform: translateX(-50%) translateY(80px);
+        padding: 10px 16px;
+        background: #171717;
+        color: #e8e8e8;
+        border: 1px solid rgba(99, 102, 241, 0.6);
+        border-radius: 10px;
+        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+        box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+        opacity: 0;
+        pointer-events: none;
+        transition: transform 0.3s ease, opacity 0.3s ease;
+        user-select: none;
+        white-space: nowrap;
+      }
+      .oc-stop.oc-visible {
+        transform: translateX(-50%) translateY(0);
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .oc-stop.oc-visible.oc-input-pass-through { pointer-events: none; }
+      @media (prefers-reduced-motion: reduce) {
+        .oc-border-inner { animation: none; }
+        .oc-favicon-badge { animation: none; }
+      }
     `;
     shadowRoot.appendChild(style);
 
@@ -117,7 +171,50 @@ if (!window.__opencodeOverlayInstalled) {
     faviconBadge.className = "oc-favicon-badge";
     shadowRoot.appendChild(faviconBadge);
 
+    borderEl = document.createElement("div");
+    borderEl.className = "oc-border";
+    const borderInner = document.createElement("div");
+    borderInner.className = "oc-border-inner";
+    borderEl.appendChild(borderInner);
+    shadowRoot.appendChild(borderEl);
+
+    stopButton = document.createElement("button");
+    stopButton.className = "oc-stop";
+    stopButton.type = "button";
+    stopButton.textContent = "Stop OpenCode";
+    stopButton.addEventListener("click", () => {
+      // Let the user halt the agent from the controlled page itself. The
+      // background forwards this as a stopRequested bridge event.
+      try {
+        chrome.runtime.sendMessage({ type: "STOP_AGENT_REQUEST" });
+      } catch {}
+      hideAgentChrome();
+    });
+    shadowRoot.appendChild(stopButton);
+
     document.documentElement.appendChild(host);
+  }
+
+  function showAgentChrome() {
+    ensureOverlay();
+    borderEl.classList.add("oc-visible");
+    stopButton.classList.add("oc-visible");
+  }
+
+  function hideAgentChrome() {
+    if (borderEl) borderEl.classList.remove("oc-visible");
+    if (stopButton) stopButton.classList.remove("oc-visible");
+  }
+
+  function beginAgentInput() {
+    ensureOverlay();
+    agentInputDepth += 1;
+    stopButton.classList.add("oc-input-pass-through");
+  }
+
+  function endAgentInput() {
+    agentInputDepth = Math.max(0, agentInputDepth - 1);
+    if (agentInputDepth === 0 && stopButton) stopButton.classList.remove("oc-input-pass-through");
   }
 
   function applyState(state) {
@@ -130,6 +227,8 @@ if (!window.__opencodeOverlayInstalled) {
       cursorEl.classList.add(`oc-state-${state}`);
       faviconBadge.classList.add(`oc-state-${state}`);
     }
+    if (state === "active") showAgentChrome();
+    else hideAgentChrome();
   }
 
   function animateBezier(fromX, fromY, toX, toY, duration, onDone) {
@@ -216,11 +315,36 @@ if (!window.__opencodeOverlayInstalled) {
     if (faviconBadge) faviconBadge.classList.remove("oc-badge-visible");
   }
 
-  function setDocumentFaviconBadge(state) {
+  // SVG rendered as an image (which favicons are) blocks all external resource
+  // loads, including chrome-extension:// URLs. Inline the icon as a data: URI —
+  // the only kind of reference an SVG image is allowed to load.
+  function fetchIconDataUrl() {
+    if (!iconDataUrlPromise) {
+      iconDataUrlPromise = (async () => {
+        try {
+          const response = await fetch(chrome.runtime.getURL("images/cursor-chat.png"));
+          const blob = await response.blob();
+          return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+          });
+        } catch {
+          return null;
+        }
+      })();
+    }
+    return iconDataUrlPromise;
+  }
+
+  async function setDocumentFaviconBadge(state) {
+    const seq = ++faviconUpdateSeq;
     clearDocumentFaviconBadge();
     if (!state || !["active", "handoff", "deliverable"].includes(state)) return;
 
-    const iconHref = chrome.runtime.getURL("images/cursor-chat.png");
+    const iconHref = await fetchIconDataUrl();
+    if (seq !== faviconUpdateSeq) return;
     const badgedHref = makeFaviconBadgeDataUrl(state, iconHref);
     const links = [...document.querySelectorAll(FAVICON_LINK_SELECTOR)];
     const targets = links.length > 0 ? links : [createFaviconLink()];
@@ -266,7 +390,8 @@ if (!window.__opencodeOverlayInstalled) {
   function makeFaviconBadgeDataUrl(state, iconHref) {
     const badge = state === "deliverable" ? "#22c55e" : state === "handoff" ? "#f59e0b" : "#111827";
     const opacity = state === "active" ? ' opacity="0.35"' : "";
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><image href="${escapeSvg(iconHref)}" width="32" height="32"${opacity}/><circle cx="24" cy="24" r="7" fill="${badge}" stroke="white" stroke-width="2"/></svg>`;
+    const icon = iconHref ? `<image href="${escapeSvg(iconHref)}" width="32" height="32"${opacity}/>` : "";
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">${icon}<circle cx="24" cy="24" r="7" fill="${badge}" stroke="white" stroke-width="2"/></svg>`;
     return `data:image/svg+xml,${encodeURIComponent(svg)}`;
   }
 
@@ -300,9 +425,15 @@ if (!window.__opencodeOverlayInstalled) {
       case "cursor-click":
         animateClick(message.x, message.y);
         break;
+      case "agent-input-start":
+        beginAgentInput();
+        break;
+      case "agent-input-end":
+        endAgentInput();
+        break;
       case "cursor-state":
         applyState(message.state);
-        setDocumentFaviconBadge(message.state === "hidden" || message.state === "abort" ? null : message.state);
+        setDocumentFaviconBadge(message.state === "hidden" || message.state === "abort" ? null : message.state).catch(() => {});
         if (message.state === "hidden") {
           clearHideTimer();
           if (cursorEl) cursorEl.classList.remove("oc-visible");
@@ -310,7 +441,7 @@ if (!window.__opencodeOverlayInstalled) {
         }
         break;
       case "favicon-badge":
-        setDocumentFaviconBadge(message.badge);
+        setDocumentFaviconBadge(message.badge).catch(() => {});
         break;
       case "cursor-arrived":
         ensureOverlay();

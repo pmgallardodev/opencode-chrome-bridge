@@ -104,6 +104,10 @@ function createCmdInvocation(command, commandArgs) {
 
 function quoteCmdToken(value) {
   const token = String(value);
-  if (/[\r\n"]/u.test(token)) throw new Error("Windows command paths and arguments cannot contain quotes or line breaks");
-  return `"${token.replaceAll("%", "%%")}"`;
+  // %% only un-escapes inside batch files, not on cmd /c command lines, and cmd
+  // offers no reliable escape for % there — reject rather than corrupt the path.
+  if (/[\r\n"%]/u.test(token)) {
+    throw new Error("Windows command paths and arguments cannot contain quotes, percent signs, or line breaks");
+  }
+  return `"${token}"`;
 }

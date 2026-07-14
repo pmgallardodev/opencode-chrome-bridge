@@ -25,6 +25,7 @@ const MAX_CDP_METHODS = 100;
 const MAX_QUERY_CHARS = 1000;
 
 let nativePort = null;
+let nativeHostReady = false;
 let reconnecting = false;
 let tabLeasesLoaded = false;
 let tabLeasesLoadPromise = null;
@@ -52,9 +53,26 @@ chrome.runtime.onStartup.addListener(connectNativeHost);
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === RECONNECT_ALARM) connectNativeHost();
 });
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
-    sendResponse({ connected: nativePort !== null });
+    // connectNative "succeeds" even when the native host is not installed, so a
+    // non-null port alone is a false positive until the host announces itself
+    // (bridgeReady event) or sends any other message. Once ready, an active
+    // ping/pong round trip also detects a host that is present but wedged.
+    if (nativePort === null || !nativeHostReady) {
+      sendResponse({ connected: false });
+      return false;
+    }
+    pingNativeHost().then((pong) => {
+      sendResponse({ connected: pong });
+    });
+    return true;
+  }
+  if (message?.type === "STOP_AGENT_REQUEST" && Number.isInteger(sender?.tab?.id)) {
+    // The in-page Stop button asks the user's agent to halt. Forward it to the
+    // native host so OpenCode clients see it through event polling.
+    sendEvent({ category: "bridge", type: "stopRequested", tabId: sender.tab.id });
+    sendResponse({ ok: true });
   }
   return false;
 });
@@ -67,10 +85,12 @@ function connectNativeHost() {
   if (nativePort || reconnecting) return;
   reconnecting = true;
   try {
+    nativeHostReady = false;
     nativePort = chrome.runtime.connectNative(HOST_NAME);
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(() => {
       nativePort = null;
+      nativeHostReady = false;
       scheduleReconnect();
     });
     chrome.alarms.clear(RECONNECT_ALARM).catch(() => {});
@@ -82,6 +102,29 @@ function connectNativeHost() {
   }
 }
 
+const pendingPings = new Map();
+let pingSeq = 1;
+
+function pingNativeHost(timeoutMs = 1000) {
+  const port = nativePort;
+  if (!port) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const id = `ping:${pingSeq++}`;
+    const timer = setTimeout(() => {
+      pendingPings.delete(id);
+      resolve(false);
+    }, timeoutMs);
+    pendingPings.set(id, { resolve, timer });
+    try {
+      port.postMessage({ type: "ping", id });
+    } catch {
+      pendingPings.delete(id);
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
+}
+
 function scheduleReconnect() {
   // Chrome MV3 silently clamps alarm periods to a minimum of 1 minute in
   // production builds (smaller values only work in unpacked developer mode).
@@ -91,6 +134,17 @@ function scheduleReconnect() {
 }
 
 async function handleNativeMessage(message) {
+  // Any message proves a live native host on the other end of the port.
+  nativeHostReady = true;
+  if (message?.type === "pong" && typeof message.id === "string") {
+    const pending = pendingPings.get(message.id);
+    if (pending) {
+      pendingPings.delete(message.id);
+      clearTimeout(pending.timer);
+      pending.resolve(true);
+    }
+    return;
+  }
   if (message?.type !== "command" || typeof message.id !== "string") return;
   try {
     const result = await executeCommand(message.method, message.params ?? {});
@@ -131,7 +185,7 @@ async function executeCommand(method, params) {
     case "createTab": {
       validateOptionalLeaseParams(params);
       const createUrl = params.url ?? "about:blank";
-      if (params.url != null) validateNavigationUrl(params.url);
+      if (params.url != null) await assertNavigationAllowed(params.url);
       const tab = await chrome.tabs.create({ active: params.active !== false, url: createUrl });
       await maybeClaimTabFromParams(tab.id, params, "agent");
       return tabInfo(tab);
@@ -232,6 +286,14 @@ async function executeCommand(method, params) {
       return setCursorState(params);
     case "setFaviconBadge":
       return setFaviconBadge(params);
+    case "accessibilityTree":
+      return accessibilityTree(params);
+    case "clickElement":
+      return clickElement(params);
+    case "fillElement":
+      return fillElement(params);
+    case "getBlockedUrlPatterns":
+      return { patterns: await loadBlockedUrlPatterns() };
     default:
       throw new Error(`Unsupported command: ${method}`);
   }
@@ -262,8 +324,20 @@ async function activateTab(tabId) {
 async function navigateTab(params) {
   const tabId = requireTabId(params);
   if (typeof params.url !== "string" || params.url.length === 0) throw new Error("url must be a non-empty string");
-  validateNavigationUrl(params.url);
+  await assertNavigationAllowed(params.url);
+  validateOptionalLeaseParams(params);
+  // Claim before navigating so a tab owned by another session is left untouched.
+  await maybeClaimTabFromParams(tabId, params, "user");
   return tabInfo(await chrome.tabs.update(tabId, { url: params.url }));
+}
+
+async function tabStillExists(tabId) {
+  try {
+    await chrome.tabs.get(tabId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function captureScreenshot(params) {
@@ -282,7 +356,8 @@ async function captureScreenshot(params) {
   const captureOptions = quality === undefined ? { format } : { format, quality };
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, captureOptions);
   const separator = typeof dataUrl === "string" ? dataUrl.indexOf(",") : -1;
-  assertScreenshotPayloadSize(separator === -1 ? null : dataUrl.slice(separator + 1));
+  if (separator === -1) throw new Error("Chrome did not return a screenshot data URL");
+  assertScreenshotPayloadSize(dataUrl.slice(separator + 1));
   return { dataUrl, format };
 }
 
@@ -344,10 +419,11 @@ async function dispatchClick(params) {
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
-  await notifyOverlay(tabId, "cursor-click", { x, y });
-  await withDebugger(tabId, async (target) => {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
-    await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
+  await withOverlayInputPassThrough(tabId, { x, y }, async () => {
+    await withDebugger(tabId, async (target) => {
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
+    });
   });
   return { clicked: true };
 }
@@ -358,12 +434,13 @@ async function dispatchDoubleClick(params) {
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
-  await notifyOverlay(tabId, "cursor-click", { x, y });
-  await withDebugger(tabId, async (target) => {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
-    for (const clickCount of [1, 2]) {
-      await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y });
-    }
+  await withOverlayInputPassThrough(tabId, { x, y }, async () => {
+    await withDebugger(tabId, async (target) => {
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      for (const clickCount of [1, 2]) {
+        await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y });
+      }
+    });
   });
   return { doubleClicked: true };
 }
@@ -442,11 +519,67 @@ async function dispatchMousePressAndRelease(target, event) {
   }
 }
 
-async function dispatchKeyDownAndUp(target, event) {
+// CDP treats a keyDown without text as rawKeyDown, which never triggers default
+// actions (Enter submitting a form, character insertion). Resolve the text and
+// virtual key codes Chrome needs so keys behave like real keyboard input.
+const NAMED_KEY_DETAILS = {
+  Alt: { keyCode: 18 },
+  ArrowDown: { keyCode: 40 },
+  ArrowLeft: { keyCode: 37 },
+  ArrowRight: { keyCode: 39 },
+  ArrowUp: { keyCode: 38 },
+  Backspace: { keyCode: 8 },
+  Control: { keyCode: 17 },
+  Delete: { keyCode: 46 },
+  End: { keyCode: 35 },
+  Enter: { keyCode: 13, text: "\r" },
+  Escape: { keyCode: 27 },
+  Home: { keyCode: 36 },
+  Insert: { keyCode: 45 },
+  Meta: { keyCode: 91 },
+  PageDown: { keyCode: 34 },
+  PageUp: { keyCode: 33 },
+  Shift: { keyCode: 16 },
+  Space: { key: " ", keyCode: 32, text: " " },
+  Tab: { keyCode: 9 }
+};
+
+function keyEventDetails(rawKey, modifiers) {
+  const shifted = (modifiers & 8) !== 0;
+  const shortcut = (modifiers & 7) !== 0;
+  const codeMatch = /^Key([A-Z])$/u.exec(rawKey);
+  const digitMatch = /^Digit([0-9])$/u.exec(rawKey);
+  const codeKey = codeMatch ? (shifted ? codeMatch[1] : codeMatch[1].toLowerCase()) : null;
+  const key = codeKey ?? (digitMatch ? digitMatch[1] : rawKey);
+  const named = NAMED_KEY_DETAILS[key];
+  if (named) {
+    return { key: named.key ?? key, keyCode: named.keyCode, text: shortcut ? undefined : named.text };
+  }
+  const functionKey = /^F(1[0-2]|[1-9])$/u.exec(key);
+  if (functionKey) return { key, keyCode: 111 + Number(functionKey[1]) };
+  if (key.length === 1) {
+    const printableKey = shifted && /^[a-z]$/u.test(key) ? key.toUpperCase() : key;
+    const upper = printableKey.toUpperCase();
+    const keyCode = /^[A-Z0-9]$/u.test(upper) ? upper.charCodeAt(0) : key === " " ? 32 : undefined;
+    return { key: printableKey, keyCode, text: shortcut ? undefined : printableKey };
+  }
+  return { key };
+}
+
+async function dispatchKeyDownAndUp(target, { key, modifiers }) {
+  const details = keyEventDetails(key, modifiers);
+  const event = { key: details.key, modifiers };
+  if (details.keyCode !== undefined) {
+    event.windowsVirtualKeyCode = details.keyCode;
+    event.nativeVirtualKeyCode = details.keyCode;
+  }
+  const keyDownEvent = details.text === undefined
+    ? { ...event, type: "rawKeyDown" }
+    : { ...event, text: details.text, type: "keyDown" };
   let keyDown = false;
   let operationError = null;
   try {
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyDown" });
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyDownEvent);
     keyDown = true;
     await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyUp" });
     keyDown = false;
@@ -552,7 +685,7 @@ async function createWindow(params) {
   validateOptionalLeaseParams(params);
   const createArgs = {};
   if (typeof params.url === "string" && params.url.length > 0) {
-    validateNavigationUrl(params.url);
+    await assertNavigationAllowed(params.url);
     createArgs.url = params.url;
   }
   if (params.type === "popup" || params.type === "panel") createArgs.type = params.type;
@@ -665,8 +798,14 @@ async function finalizeTabs(params) {
           await chrome.tabs.remove(lease.tabId);
           closeIds.push(lease.tabId);
         } catch (error) {
-          closeFailures.push({ error, tabId: lease.tabId });
-          continue;
+          // Only keep the lease when the tab genuinely still exists. If it was
+          // already closed in a race, releasing the lease here prevents a stale
+          // entry from blocking future claims of the reused tab id.
+          if (await tabStillExists(lease.tabId)) {
+            closeFailures.push({ error, tabId: lease.tabId });
+            continue;
+          }
+          closeIds.push(lease.tabId);
         }
       }
       nextLeases.delete(lease.tabId);
@@ -1075,7 +1214,18 @@ async function cdpCommand(params) {
     throw new Error("method must be a CDP method string in 'Domain.method' format");
   }
   if (params.method === "Target.getTargets") {
-    return { targetInfos: await cdpTargets() };
+    // Return real CDP TargetInfo objects (targetId, not the extension's id/tabId
+    // shape) so callers expecting protocol output are not surprised.
+    return {
+      targetInfos: (await chrome.debugger.getTargets()).map((target) => ({
+        attached: target.attached === true,
+        canAccessOpener: false,
+        targetId: target.id,
+        title: target.title ?? "",
+        type: target.type,
+        url: target.url ?? ""
+      }))
+    };
   }
   const target = debuggerTarget(params);
   const commandParams = params.commandParams ?? {};
@@ -1190,6 +1340,19 @@ async function releaseDebuggers(params = {}) {
 async function notifyOverlay(tabId, type, data) {
   if (!await injectOverlay(tabId)) return;
   await sendOverlayMessage(tabId, type, data);
+}
+
+async function withOverlayInputPassThrough(tabId, point, operation) {
+  const overlayInjected = await injectOverlay(tabId);
+  if (overlayInjected) {
+    await sendOverlayMessage(tabId, "agent-input-start", {});
+    await sendOverlayMessage(tabId, "cursor-click", point);
+  }
+  try {
+    return await operation();
+  } finally {
+    if (overlayInjected) await sendOverlayMessage(tabId, "agent-input-end", {});
+  }
 }
 
 async function injectOverlay(tabId) {
@@ -1395,6 +1558,226 @@ async function setFaviconBadge(params) {
   }
   await notifyOverlay(tabId, "favicon-badge", { badge });
   return { tabId, badge };
+}
+
+const MAX_A11Y_REF_CHARS = 50;
+const MAX_BLOCKED_URL_PATTERNS = 500;
+const MAX_BLOCKED_URL_PATTERN_CHARS = 500;
+
+async function injectA11yScript(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content-scripts/a11y.js"] });
+}
+
+async function runInA11yWorld(tabId, func, args) {
+  const results = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+  const result = results?.[0]?.result;
+  if (result == null) throw new Error("Accessibility script did not return a result");
+  return result;
+}
+
+async function accessibilityTree(params) {
+  const tabId = requireTabId(params);
+  const maxNodes = clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes");
+  const maxChars = clampInteger(params.maxChars, 100, 200000, 50000, "maxChars");
+  const interactiveOnly = params.interactiveOnly === true;
+  await injectA11yScript(tabId);
+  const result = await runInA11yWorld(
+    tabId,
+    (options) => window.__opencodeA11yGenerate ? window.__opencodeA11yGenerate(options) : null,
+    [{ maxNodes, maxChars, interactiveOnly }]
+  );
+  return { tabId, ...result };
+}
+
+function requireElementRef(params) {
+  if (typeof params.ref !== "string" || params.ref.length === 0 || params.ref.length > MAX_A11Y_REF_CHARS) {
+    throw new Error("ref must be a non-empty element reference string from accessibilityTree");
+  }
+  return params.ref;
+}
+
+async function locateElement(tabId, ref) {
+  await injectA11yScript(tabId);
+  const location = await runInA11yWorld(
+    tabId,
+    (elementRef) => window.__opencodeA11yLocate ? window.__opencodeA11yLocate(elementRef) : null,
+    [ref]
+  );
+  if (location.found !== true) {
+    throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
+  }
+  if (location.visible !== true || !(location.width > 0) || !(location.height > 0)) {
+    throw new Error(`Element ${ref} is not visible; capture a fresh accessibilityTree`);
+  }
+  if (!Number.isFinite(location.x) || !Number.isFinite(location.y)) {
+    throw new Error(`Element ${ref} has no usable position`);
+  }
+  return location;
+}
+
+async function clickElement(params) {
+  const tabId = requireTabId(params);
+  const ref = requireElementRef(params);
+  const location = await locateElement(tabId, ref);
+  await dispatchClick({
+    tabId,
+    x: location.x,
+    y: location.y,
+    button: params.button,
+    modifiers: params.modifiers
+  });
+  return { clicked: true, ref, x: location.x, y: location.y, role: location.role, name: location.name };
+}
+
+async function fillElement(params) {
+  const tabId = requireTabId(params);
+  const ref = requireElementRef(params);
+  if (typeof params.text !== "string") throw new Error("text must be a string");
+  if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
+  const clear = params.clear !== false;
+  await injectA11yScript(tabId);
+  const focusResult = await runInA11yWorld(
+    tabId,
+    (elementRef, selectAll) => window.__opencodeA11yFocus ? window.__opencodeA11yFocus(elementRef, selectAll) : null,
+    [ref, clear]
+  );
+  if (focusResult.found !== true) {
+    throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
+  }
+  if (focusResult.editable !== true) {
+    throw new Error(`Element ${ref} is not an editable field (input, textarea, or contenteditable)`);
+  }
+  if (focusResult.focused !== true) {
+    throw new Error(`Element ${ref} could not be focused; it may be disabled or covered`);
+  }
+  await withDebugger(tabId, async (target) => {
+    await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
+  });
+  const verifyResult = await runInA11yWorld(
+    tabId,
+    (elementRef, text, selectedAll) => window.__opencodeA11yVerifyFill
+      ? window.__opencodeA11yVerifyFill(elementRef, text, selectedAll)
+      : null,
+    [ref, params.text, clear]
+  );
+  if (verifyResult.found !== true) {
+    throw new Error(`Element ${ref} was replaced while filling; capture a fresh accessibilityTree`);
+  }
+  if (verifyResult.verified !== true) {
+    throw new Error(`Filling element ${ref} did not update the field to the requested value`);
+  }
+  return { filled: true, ref, tabId, cleared: clear };
+}
+
+async function loadBlockedUrlPatterns() {
+  const patterns = [];
+  for (const areaName of ["managed", "local"]) {
+    const area = chrome.storage?.[areaName];
+    if (typeof area?.get !== "function") continue;
+    let stored;
+    try {
+      stored = await area.get("blockedUrlPatterns");
+    } catch (error) {
+      throw new Error(`Could not read blockedUrlPatterns from ${areaName} storage: ${error?.message || error}`);
+    }
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
+      throw new Error(`${areaName} storage returned an invalid blockedUrlPatterns result`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(stored, "blockedUrlPatterns")) continue;
+    const list = stored.blockedUrlPatterns;
+    if (!Array.isArray(list)) {
+      throw new Error(`blockedUrlPatterns in ${areaName} storage must be an array`);
+    }
+    if (list.length > MAX_BLOCKED_URL_PATTERNS) {
+      throw new Error(`blockedUrlPatterns in ${areaName} storage exceeds the limit of ${MAX_BLOCKED_URL_PATTERNS}`);
+    }
+    for (const entry of list) {
+      if (
+        typeof entry !== "string"
+        || entry.trim().length === 0
+        || entry.length > MAX_BLOCKED_URL_PATTERN_CHARS
+        || normalizeBlockPattern(entry) === null
+      ) {
+        throw new Error(`blockedUrlPatterns in ${areaName} storage contains an invalid pattern`);
+      }
+      patterns.push(entry.trim());
+    }
+  }
+  const uniquePatterns = [...new Set(patterns)];
+  if (uniquePatterns.length > MAX_BLOCKED_URL_PATTERNS) {
+    throw new Error(`blockedUrlPatterns exceeds the combined limit of ${MAX_BLOCKED_URL_PATTERNS}`);
+  }
+  return uniquePatterns;
+}
+
+function normalizeBlockPattern(pattern) {
+  const normalized = pattern
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//u, "")
+    .replace(/^www\./u, "")
+    .replace(/\/+$/u, "");
+  if (normalized.length === 0) return null;
+  return normalized.includes("/") ? normalized : `${normalized}/*`;
+}
+
+function urlMatchesBlockPattern(parsedUrl, pattern) {
+  const normalized = normalizeBlockPattern(pattern);
+  if (normalized === null) return false;
+  const host = parsedUrl.hostname.toLowerCase().replace(/^www\./u, "");
+  let pathname;
+  try {
+    pathname = decodeURIComponent(parsedUrl.pathname).toLowerCase();
+  } catch {
+    throw new Error("Navigation URL contains invalid percent-encoding");
+  }
+  const subject = `${host}${pathname}`;
+  if (wildcardMatch(subject, normalized)) return true;
+  return !normalized.endsWith("*") && wildcardMatch(subject, `${normalized}/*`);
+}
+
+function wildcardMatch(subject, pattern) {
+  if (!pattern.includes("*")) return subject === pattern;
+  const startsWithWildcard = pattern.startsWith("*");
+  const endsWithWildcard = pattern.endsWith("*");
+  const parts = pattern.split("*").filter(Boolean);
+  if (parts.length === 0) return true;
+
+  let cursor = 0;
+  let firstPart = 0;
+  let lastPart = parts.length;
+  if (!startsWithWildcard) {
+    if (!subject.startsWith(parts[0])) return false;
+    cursor = parts[0].length;
+    firstPart = 1;
+  }
+  if (!endsWithWildcard) lastPart -= 1;
+  for (let index = firstPart; index < lastPart; index += 1) {
+    const foundAt = subject.indexOf(parts[index], cursor);
+    if (foundAt === -1) return false;
+    cursor = foundAt + parts[index].length;
+  }
+  if (endsWithWildcard) return true;
+
+  const finalPart = parts.at(-1);
+  const finalStart = subject.length - finalPart.length;
+  return finalStart >= cursor && subject.endsWith(finalPart);
+}
+
+async function assertNavigationAllowed(url) {
+  validateNavigationUrl(url);
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+  for (const pattern of await loadBlockedUrlPatterns()) {
+    if (urlMatchesBlockPattern(parsed, pattern)) {
+      throw new Error(`Navigation blocked by policy pattern: ${pattern}`);
+    }
+  }
 }
 
 async function ensureConsoleLogDebugger(tabId) {

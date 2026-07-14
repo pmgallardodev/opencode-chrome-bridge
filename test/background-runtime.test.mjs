@@ -151,6 +151,391 @@ test("finalizeTabs does not report or release an agent tab that Chrome failed to
   );
 });
 
+test("keypress resolves text and virtual key codes so default actions fire", async () => {
+  const keyEvents = [];
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchKeyEvent") keyEvents.push(params);
+      return {};
+    }
+  });
+
+  await harness.execute("keypress", { tabId: 7, key: "Enter" });
+  assert.equal(keyEvents[0].type, "keyDown");
+  assert.equal(keyEvents[0].text, "\r");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 13);
+  assert.equal(keyEvents[1].type, "keyUp");
+  assert.equal(keyEvents[1].text, undefined);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "Shift" });
+  assert.equal(keyEvents[0].type, "rawKeyDown");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 16);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "KeyA" });
+  assert.equal(keyEvents[0].type, "keyDown");
+  assert.equal(keyEvents[0].key, "a");
+  assert.equal(keyEvents[0].text, "a");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, 65);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "KeyA", modifiers: ["Shift"] });
+  assert.equal(keyEvents[0].type, "keyDown");
+  assert.equal(keyEvents[0].key, "A");
+  assert.equal(keyEvents[0].text, "A");
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "KeyC", modifiers: ["Control"] });
+  assert.equal(keyEvents[0].type, "rawKeyDown");
+  assert.equal(keyEvents[0].key, "c");
+  assert.equal(keyEvents[0].text, undefined);
+
+  keyEvents.length = 0;
+  await harness.execute("keypress", { tabId: 7, key: "UnknownNamedKey" });
+  assert.equal(keyEvents[0].type, "rawKeyDown");
+  assert.equal(keyEvents[0].key, "UnknownNamedKey");
+  assert.equal(keyEvents[0].windowsVirtualKeyCode, undefined);
+});
+
+test("bridge status reports connected only after the native host sends a message", async () => {
+  const harness = createBackgroundHarness();
+
+  assert.equal(await harness.bridgeStatus(), false);
+  await harness.events.nativeOnMessage.emit({ type: "event", event: { category: "bridge", type: "bridgeReady" } });
+  assert.equal(await harness.bridgeStatus(), true);
+});
+
+test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {
+  let tabGone = false;
+  const harness = createBackgroundHarness({
+    tabsRemove: async () => {
+      tabGone = true;
+      throw new Error("No tab with id: 7.");
+    },
+    tabsGet: async (tabId) => {
+      if (tabGone && tabId === 7) throw new Error("No tab with id: 7.");
+      return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    }
+  });
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "agent" });
+
+  const result = await harness.execute("finalizeTabs", { sessionId: "session-a", keep: [] });
+  assert.equal(JSON.stringify(result.closedTabIds), JSON.stringify([7]));
+
+  // The stale lease must not block a future claim of the reused tab id.
+  tabGone = false;
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user" });
+});
+
+test("navigate claims the tab when lease identifiers are provided", async () => {
+  const harness = createBackgroundHarness();
+
+  await harness.execute("navigate", {
+    tabId: 7,
+    url: "https://example.com/next",
+    sessionId: "session-a",
+    turnId: "turn-a"
+  });
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user" }),
+    /already part of browser session session-a/u
+  );
+});
+
+test("cdpCommand Target.getTargets returns CDP-shaped target infos", async () => {
+  const harness = createBackgroundHarness();
+  harness.setDebuggerTargets([
+    { attached: true, id: "target-1", tabId: 7, title: "Example", type: "page", url: "https://example.com" }
+  ]);
+
+  const result = await harness.execute("cdpCommand", { method: "Target.getTargets" });
+
+  assert.equal(JSON.stringify(result.targetInfos), JSON.stringify([{
+    attached: true,
+    canAccessOpener: false,
+    targetId: "target-1",
+    title: "Example",
+    type: "page",
+    url: "https://example.com"
+  }]));
+});
+
+test("accessibilityTree injects the snapshot script and returns its result", async () => {
+  const injections = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      if (injection.files) return [];
+      return [{
+        result: { title: "Example", url: "https://example.com/", nodeCount: 2, truncated: false, tree: '[e1] button "Go"' }
+      }];
+    }
+  });
+
+  const result = await harness.execute("accessibilityTree", { tabId: 7 });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.nodeCount, 2);
+  assert.match(result.tree, /\[e1\] button/u);
+  assert.ok(injections.some((injection) => Array.isArray(injection.files) && injection.target?.tabId === 7));
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.equal(funcCall.args[0].maxNodes, 800);
+  assert.equal(funcCall.args[0].interactiveOnly, false);
+});
+
+test("clickElement locates the reference and clicks its center through CDP", async () => {
+  const mouseEvents = [];
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent") mouseEvents.push(params);
+      return {};
+    },
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, visible: true, x: 40, y: 60, width: 120, height: 32, role: "button", name: "Go" } }]
+  });
+
+  const result = await harness.execute("clickElement", { tabId: 7, ref: "e1" });
+
+  assert.equal(result.clicked, true);
+  assert.equal(result.ref, "e1");
+  assert.equal(result.role, "button");
+  assert.ok(mouseEvents.some((event) => event.type === "mousePressed" && event.x === 40 && event.y === 60));
+});
+
+test("clickElement rejects stale element references", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { found: false } }]
+  });
+
+  await assert.rejects(
+    harness.execute("clickElement", { tabId: 7, ref: "e99" }),
+    /was not found/u
+  );
+});
+
+test("clickElement rejects hidden or zero-size elements", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, visible: false, x: 0, y: 0, width: 0, height: 0 } }]
+  });
+
+  await assert.rejects(
+    harness.execute("clickElement", { tabId: 7, ref: "e2" }),
+    /is not visible/u
+  );
+});
+
+test("fillElement rejects non-editable or unfocusable elements", async () => {
+  const nonEditable = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, editable: false, focused: false } }]
+  });
+  await assert.rejects(
+    nonEditable.execute("fillElement", { tabId: 7, ref: "e2", text: "x" }),
+    /not an editable field/u
+  );
+
+  const unfocusable = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, editable: true, focused: false } }]
+  });
+  await assert.rejects(
+    unfocusable.execute("fillElement", { tabId: 7, ref: "e2", text: "x" }),
+    /could not be focused/u
+  );
+});
+
+test("fillElement focuses the reference and inserts the text", async () => {
+  const inserted = [];
+  let scriptCalls = 0;
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.insertText") inserted.push(params.text);
+      return {};
+    },
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      scriptCalls += 1;
+      return scriptCalls === 1
+        ? [{ result: { found: true, editable: true, focused: true } }]
+        : [{ result: { found: true, verified: true } }];
+    }
+  });
+
+  const result = await harness.execute("fillElement", { tabId: 7, ref: "e3", text: "hello world" });
+
+  assert.equal(result.filled, true);
+  assert.equal(result.cleared, true);
+  assert.equal(JSON.stringify(inserted), JSON.stringify(["hello world"]));
+});
+
+test("fillElement fails instead of reporting success when the value did not change", async () => {
+  let scriptCalls = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      scriptCalls += 1;
+      return scriptCalls === 1
+        ? [{ result: { found: true, editable: true, focused: true } }]
+        : [{ result: { found: true, verified: false } }];
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("fillElement", { tabId: 7, ref: "e3", text: "hello world" }),
+    /did not update the field/u
+  );
+});
+
+test("navigation respects blockedUrlPatterns from extension storage", async () => {
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: ["example.com/admin/*", "blocked.test"] })
+  });
+
+  await assert.rejects(
+    harness.execute("navigate", { tabId: 7, url: "https://www.example.com/Admin/settings" }),
+    /blocked by policy/u
+  );
+  await assert.rejects(
+    harness.execute("createTab", { url: "https://blocked.test/anything" }),
+    /blocked by policy/u
+  );
+  const allowed = await harness.execute("navigate", { tabId: 7, url: "https://example.com/public" });
+  assert.equal(allowed.url, "https://example.com/public");
+
+  const patterns = await harness.execute("getBlockedUrlPatterns", {});
+  assert.equal(JSON.stringify(patterns.patterns), JSON.stringify(["example.com/admin/*", "blocked.test"]));
+});
+
+test("navigation policy fails closed when configured storage cannot be read", async () => {
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => { throw new Error("local storage unavailable"); }
+  });
+
+  await assert.rejects(
+    harness.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
+    /Could not read blockedUrlPatterns from local storage/u
+  );
+});
+
+test("navigation policy fails closed when configured storage is malformed", async () => {
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: "example.com/admin" })
+  });
+
+  await assert.rejects(
+    harness.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
+    /blockedUrlPatterns in local storage must be an array/u
+  );
+});
+
+test("navigation policy rejects null and empty normalized patterns", async () => {
+  const nullPolicy = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: null })
+  });
+  await assert.rejects(
+    nullPolicy.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
+    /blockedUrlPatterns in local storage must be an array/u
+  );
+
+  const emptyPattern = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: ["https://"] })
+  });
+  await assert.rejects(
+    emptyPattern.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
+    /contains an invalid pattern/u
+  );
+});
+
+test("navigation policy reads managed storage fail closed", async () => {
+  const harness = createBackgroundHarness({
+    storageManagedGet: async () => { throw new Error("managed policy unavailable"); }
+  });
+
+  await assert.rejects(
+    harness.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
+    /Could not read blockedUrlPatterns from managed storage/u
+  );
+});
+
+test("navigation patterns canonicalize trailing slashes and encoded paths", async () => {
+  const trailingSlash = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: ["example.com/admin/"] })
+  });
+  await assert.rejects(
+    trailingSlash.execute("navigate", { tabId: 7, url: "https://example.com/admin/settings" }),
+    /blocked by policy/u
+  );
+
+  const encodedPath = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: ["example.com/admin"] })
+  });
+  await assert.rejects(
+    encodedPath.execute("navigate", { tabId: 7, url: "https://example.com/%61dmin/settings" }),
+    /blocked by policy/u
+  );
+});
+
+test("click makes overlay controls transparent until input cleanup completes", async () => {
+  const harness = createBackgroundHarness();
+
+  await harness.execute("click", { tabId: 7, x: 20, y: 30 });
+
+  assert.equal(
+    JSON.stringify(harness.calls.overlayMessages.map((message) => message.type)),
+    JSON.stringify(["agent-input-start", "cursor-click", "agent-input-end"])
+  );
+});
+
+test("click restores overlay input handling after a CDP failure", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        throw new Error("click failed");
+      }
+      return {};
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("click", { tabId: 7, x: 20, y: 30 }),
+    /click failed/u
+  );
+  assert.equal(harness.calls.overlayMessages.at(-1)?.type, "agent-input-end");
+});
+
+test("stop requests from the page are forwarded as bridge events", async () => {
+  const harness = createBackgroundHarness();
+  let response;
+
+  await harness.events.runtimeOnMessage.emit({ type: "STOP_AGENT_REQUEST" }, { tab: { id: 7 } }, (value) => { response = value; });
+
+  assert.equal(response?.ok, true);
+  assert.ok(harness.calls.nativeMessages.some(
+    (message) => message.type === "event" && message.event?.type === "stopRequested" && message.event.tabId === 7
+  ));
+});
+
+test("bridge status verifies a ready host with a ping round trip", async () => {
+  const harness = createBackgroundHarness();
+  await harness.events.nativeOnMessage.emit({ type: "event", event: { type: "bridgeReady" } });
+
+  assert.equal(await harness.bridgeStatus(), true);
+  assert.ok(harness.calls.nativeMessages.some((message) => message.type === "ping"));
+});
+
+test("bridge status reports disconnected when a ready native host does not answer ping", async () => {
+  const harness = createBackgroundHarness();
+  await harness.events.nativeOnMessage.emit({ type: "event", event: { type: "bridgeReady" } });
+
+  assert.equal(await harness.bridgeStatus({ answerPing: false }), false);
+});
+
 test("unsubscribing CDP events preserves persistent console collection", async () => {
   const harness = createBackgroundHarness();
 
@@ -466,16 +851,22 @@ function createBackgroundHarness({
   consoleError = () => {},
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
+  scriptingExecuteScript = null,
+  storageLocalGet = async () => ({}),
+  storageManagedGet = null,
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
+  tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
   windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId })
 } = {}) {
-  const calls = { executeScript: 0, nativeMessages: [], sendMessage: 0 };
+  const calls = { executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
+  let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent(),
     nativeOnMessage: createEvent(),
+    runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnReplaced: createEvent()
   };
@@ -487,6 +878,14 @@ function createBackgroundHarness({
       calls.nativeMessages.push(message);
     }
   };
+  const storage = {
+    local: { get: storageLocalGet },
+    session: {
+      get: storageGet,
+      set: storageSet
+    }
+  };
+  if (storageManagedGet) storage.managed = { get: storageManagedGet };
   const chrome = {
     alarms: {
       clear: async () => true,
@@ -497,7 +896,7 @@ function createBackgroundHarness({
     debugger: {
       attach: async () => {},
       detach: async () => {},
-      getTargets: async () => [],
+      getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
       onEvent: events.debuggerOnEvent,
       sendCommand: debuggerSendCommand
@@ -513,20 +912,20 @@ function createBackgroundHarness({
       connectNative: () => nativePort,
       id: "test-extension",
       onInstalled: createEvent(),
-      onMessage: createEvent(),
+      onMessage: events.runtimeOnMessage,
       onStartup: createEvent()
     },
-    scripting: { executeScript: async () => { calls.executeScript += 1; return []; } },
-    storage: {
-      session: {
-        get: storageGet,
-        set: storageSet
+    scripting: {
+      executeScript: async (injection) => {
+        calls.executeScript += 1;
+        return scriptingExecuteScript ? scriptingExecuteScript(injection) : [];
       }
     },
+    storage,
     tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
     tabs: {
       create: tabsCreate,
-      get: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
+      get: tabsGet,
       onActivated: createEvent(),
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
@@ -534,7 +933,10 @@ function createBackgroundHarness({
       onUpdated: createEvent(),
       query: async () => [],
       remove: tabsRemove,
-      sendMessage: async () => { calls.sendMessage += 1; },
+      sendMessage: async (_tabId, message) => {
+        calls.sendMessage += 1;
+        calls.overlayMessages.push(message);
+      },
       update: async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 })
     },
     windows: {
@@ -561,6 +963,27 @@ function createBackgroundHarness({
   return {
     calls,
     events,
+    setDebuggerTargets(targets) {
+      debuggerTargets = targets;
+    },
+    async bridgeStatus({ answerPing = true } = {}) {
+      let response;
+      const answeredPings = new Set();
+      await events.runtimeOnMessage.emit({ type: "GET_BRIDGE_STATUS" }, {}, (value) => { response = value; });
+      // Ready hosts are verified with a ping round trip; answer it so the
+      // asynchronous sendResponse can settle.
+      for (let attempt = 0; attempt < 50 && response === undefined; attempt += 1) {
+        if (answerPing) {
+          const ping = [...calls.nativeMessages].reverse().find((message) => message.type === "ping");
+          if (ping && !answeredPings.has(ping.id)) {
+            answeredPings.add(ping.id);
+            await events.nativeOnMessage.emit({ type: "pong", id: ping.id });
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return response?.connected === true;
+    },
     execute(method, params) {
       context.__testMethod = method;
       context.__testParams = params;
