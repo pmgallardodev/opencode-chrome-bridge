@@ -249,6 +249,119 @@ test("cdpCommand Target.getTargets returns CDP-shaped target infos", async () =>
   }]));
 });
 
+test("accessibilityTree injects the snapshot script and returns its result", async () => {
+  const injections = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      if (injection.files) return [];
+      return [{
+        result: { title: "Example", url: "https://example.com/", nodeCount: 2, truncated: false, tree: '[e1] button "Go"' }
+      }];
+    }
+  });
+
+  const result = await harness.execute("accessibilityTree", { tabId: 7 });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.nodeCount, 2);
+  assert.match(result.tree, /\[e1\] button/u);
+  assert.ok(injections.some((injection) => Array.isArray(injection.files) && injection.target?.tabId === 7));
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.equal(funcCall.args[0].maxNodes, 800);
+  assert.equal(funcCall.args[0].interactiveOnly, false);
+});
+
+test("clickElement locates the reference and clicks its center through CDP", async () => {
+  const mouseEvents = [];
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent") mouseEvents.push(params);
+      return {};
+    },
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, visible: true, x: 40, y: 60, role: "button", name: "Go" } }]
+  });
+
+  const result = await harness.execute("clickElement", { tabId: 7, ref: "e1" });
+
+  assert.equal(result.clicked, true);
+  assert.equal(result.ref, "e1");
+  assert.equal(result.role, "button");
+  assert.ok(mouseEvents.some((event) => event.type === "mousePressed" && event.x === 40 && event.y === 60));
+});
+
+test("clickElement rejects stale element references", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { found: false } }]
+  });
+
+  await assert.rejects(
+    harness.execute("clickElement", { tabId: 7, ref: "e99" }),
+    /was not found/u
+  );
+});
+
+test("fillElement focuses the reference and inserts the text", async () => {
+  const inserted = [];
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.insertText") inserted.push(params.text);
+      return {};
+    },
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { found: true, editable: true, focused: true } }]
+  });
+
+  const result = await harness.execute("fillElement", { tabId: 7, ref: "e3", text: "hello world" });
+
+  assert.equal(result.filled, true);
+  assert.equal(result.cleared, true);
+  assert.equal(JSON.stringify(inserted), JSON.stringify(["hello world"]));
+});
+
+test("navigation respects blockedUrlPatterns from extension storage", async () => {
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => ({ blockedUrlPatterns: ["example.com/admin/*", "blocked.test"] })
+  });
+
+  await assert.rejects(
+    harness.execute("navigate", { tabId: 7, url: "https://www.example.com/Admin/settings" }),
+    /blocked by policy/u
+  );
+  await assert.rejects(
+    harness.execute("createTab", { url: "https://blocked.test/anything" }),
+    /blocked by policy/u
+  );
+  const allowed = await harness.execute("navigate", { tabId: 7, url: "https://example.com/public" });
+  assert.equal(allowed.url, "https://example.com/public");
+
+  const patterns = await harness.execute("getBlockedUrlPatterns", {});
+  assert.equal(JSON.stringify(patterns.patterns), JSON.stringify(["example.com/admin/*", "blocked.test"]));
+});
+
+test("stop requests from the page are forwarded as bridge events", async () => {
+  const harness = createBackgroundHarness();
+  let response;
+
+  await harness.events.runtimeOnMessage.emit({ type: "STOP_AGENT_REQUEST" }, { tab: { id: 7 } }, (value) => { response = value; });
+
+  assert.equal(response?.ok, true);
+  assert.ok(harness.calls.nativeMessages.some(
+    (message) => message.type === "event" && message.event?.type === "stopRequested" && message.event.tabId === 7
+  ));
+});
+
+test("bridge status verifies a ready host with a ping round trip", async () => {
+  const harness = createBackgroundHarness();
+  await harness.events.nativeOnMessage.emit({ type: "event", event: { type: "bridgeReady" } });
+
+  assert.equal(await harness.bridgeStatus(), true);
+  assert.ok(harness.calls.nativeMessages.some((message) => message.type === "ping"));
+});
+
 test("unsubscribing CDP events preserves persistent console collection", async () => {
   const harness = createBackgroundHarness();
 
@@ -564,6 +677,8 @@ function createBackgroundHarness({
   consoleError = () => {},
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
+  scriptingExecuteScript = null,
+  storageLocalGet = async () => ({}),
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
@@ -617,8 +732,14 @@ function createBackgroundHarness({
       onMessage: events.runtimeOnMessage,
       onStartup: createEvent()
     },
-    scripting: { executeScript: async () => { calls.executeScript += 1; return []; } },
+    scripting: {
+      executeScript: async (injection) => {
+        calls.executeScript += 1;
+        return scriptingExecuteScript ? scriptingExecuteScript(injection) : [];
+      }
+    },
     storage: {
+      local: { get: storageLocalGet },
       session: {
         get: storageGet,
         set: storageSet
@@ -665,9 +786,22 @@ function createBackgroundHarness({
     setDebuggerTargets(targets) {
       debuggerTargets = targets;
     },
-    async bridgeStatus() {
+    async bridgeStatus({ answerPing = true } = {}) {
       let response;
+      const answeredPings = new Set();
       await events.runtimeOnMessage.emit({ type: "GET_BRIDGE_STATUS" }, {}, (value) => { response = value; });
+      // Ready hosts are verified with a ping round trip; answer it so the
+      // asynchronous sendResponse can settle.
+      for (let attempt = 0; attempt < 50 && response === undefined; attempt += 1) {
+        if (answerPing) {
+          const ping = [...calls.nativeMessages].reverse().find((message) => message.type === "ping");
+          if (ping && !answeredPings.has(ping.id)) {
+            answeredPings.add(ping.id);
+            await events.nativeOnMessage.emit({ type: "pong", id: ping.id });
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       return response?.connected === true;
     },
     execute(method, params) {

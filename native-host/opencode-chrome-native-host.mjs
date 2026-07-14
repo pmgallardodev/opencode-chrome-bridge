@@ -97,6 +97,15 @@ function handleNativeMessage(payload) {
     broadcastEvent(message.event ?? message);
     return;
   }
+  if (message?.type === "ping") {
+    // Liveness probe from the extension: reply so the popup can distinguish a
+    // healthy host from a present-but-wedged one.
+    const id = typeof message.id === "string" ? message.id : null;
+    writeNativeMessage({ type: "pong", id }).catch((error) => {
+      log(`could not answer ping: ${error?.message ?? error}`);
+    });
+    return;
+  }
 }
 
 async function handleHttp(req, res) {

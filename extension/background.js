@@ -53,12 +53,26 @@ chrome.runtime.onStartup.addListener(connectNativeHost);
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === RECONNECT_ALARM) connectNativeHost();
 });
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
     // connectNative "succeeds" even when the native host is not installed, so a
     // non-null port alone is a false positive until the host announces itself
-    // (bridgeReady event) or sends any other message.
-    sendResponse({ connected: nativePort !== null && nativeHostReady });
+    // (bridgeReady event) or sends any other message. Once ready, an active
+    // ping/pong round trip also detects a host that is present but wedged.
+    if (nativePort === null || !nativeHostReady) {
+      sendResponse({ connected: false });
+      return false;
+    }
+    pingNativeHost().then((pong) => {
+      sendResponse({ connected: pong || nativeHostReady });
+    });
+    return true;
+  }
+  if (message?.type === "STOP_AGENT_REQUEST" && Number.isInteger(sender?.tab?.id)) {
+    // The in-page Stop button asks the user's agent to halt. Forward it to the
+    // native host so OpenCode clients see it through event polling.
+    sendEvent({ category: "bridge", type: "stopRequested", tabId: sender.tab.id });
+    sendResponse({ ok: true });
   }
   return false;
 });
@@ -88,6 +102,29 @@ function connectNativeHost() {
   }
 }
 
+const pendingPings = new Map();
+let pingSeq = 1;
+
+function pingNativeHost(timeoutMs = 1000) {
+  const port = nativePort;
+  if (!port) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const id = `ping:${pingSeq++}`;
+    const timer = setTimeout(() => {
+      pendingPings.delete(id);
+      resolve(false);
+    }, timeoutMs);
+    pendingPings.set(id, { resolve, timer });
+    try {
+      port.postMessage({ type: "ping", id });
+    } catch {
+      pendingPings.delete(id);
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
+}
+
 function scheduleReconnect() {
   // Chrome MV3 silently clamps alarm periods to a minimum of 1 minute in
   // production builds (smaller values only work in unpacked developer mode).
@@ -99,6 +136,15 @@ function scheduleReconnect() {
 async function handleNativeMessage(message) {
   // Any message proves a live native host on the other end of the port.
   nativeHostReady = true;
+  if (message?.type === "pong" && typeof message.id === "string") {
+    const pending = pendingPings.get(message.id);
+    if (pending) {
+      pendingPings.delete(message.id);
+      clearTimeout(pending.timer);
+      pending.resolve(true);
+    }
+    return;
+  }
   if (message?.type !== "command" || typeof message.id !== "string") return;
   try {
     const result = await executeCommand(message.method, message.params ?? {});
@@ -139,7 +185,7 @@ async function executeCommand(method, params) {
     case "createTab": {
       validateOptionalLeaseParams(params);
       const createUrl = params.url ?? "about:blank";
-      if (params.url != null) validateNavigationUrl(params.url);
+      if (params.url != null) await assertNavigationAllowed(params.url);
       const tab = await chrome.tabs.create({ active: params.active !== false, url: createUrl });
       await maybeClaimTabFromParams(tab.id, params, "agent");
       return tabInfo(tab);
@@ -240,6 +286,14 @@ async function executeCommand(method, params) {
       return setCursorState(params);
     case "setFaviconBadge":
       return setFaviconBadge(params);
+    case "accessibilityTree":
+      return accessibilityTree(params);
+    case "clickElement":
+      return clickElement(params);
+    case "fillElement":
+      return fillElement(params);
+    case "getBlockedUrlPatterns":
+      return { patterns: await loadBlockedUrlPatterns() };
     default:
       throw new Error(`Unsupported command: ${method}`);
   }
@@ -270,7 +324,7 @@ async function activateTab(tabId) {
 async function navigateTab(params) {
   const tabId = requireTabId(params);
   if (typeof params.url !== "string" || params.url.length === 0) throw new Error("url must be a non-empty string");
-  validateNavigationUrl(params.url);
+  await assertNavigationAllowed(params.url);
   validateOptionalLeaseParams(params);
   // Claim before navigating so a tab owned by another session is left untouched.
   await maybeClaimTabFromParams(tabId, params, "user");
@@ -623,7 +677,7 @@ async function createWindow(params) {
   validateOptionalLeaseParams(params);
   const createArgs = {};
   if (typeof params.url === "string" && params.url.length > 0) {
-    validateNavigationUrl(params.url);
+    await assertNavigationAllowed(params.url);
     createArgs.url = params.url;
   }
   if (params.type === "popup" || params.type === "panel") createArgs.type = params.type;
@@ -1483,6 +1537,152 @@ async function setFaviconBadge(params) {
   }
   await notifyOverlay(tabId, "favicon-badge", { badge });
   return { tabId, badge };
+}
+
+const MAX_A11Y_REF_CHARS = 50;
+const MAX_BLOCKED_URL_PATTERNS = 500;
+const MAX_BLOCKED_URL_PATTERN_CHARS = 500;
+
+async function injectA11yScript(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content-scripts/a11y.js"] });
+}
+
+async function runInA11yWorld(tabId, func, args) {
+  const results = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+  const result = results?.[0]?.result;
+  if (result == null) throw new Error("Accessibility script did not return a result");
+  return result;
+}
+
+async function accessibilityTree(params) {
+  const tabId = requireTabId(params);
+  const maxNodes = clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes");
+  const maxChars = clampInteger(params.maxChars, 100, 200000, 50000, "maxChars");
+  const interactiveOnly = params.interactiveOnly === true;
+  await injectA11yScript(tabId);
+  const result = await runInA11yWorld(
+    tabId,
+    (options) => window.__opencodeA11yGenerate ? window.__opencodeA11yGenerate(options) : null,
+    [{ maxNodes, maxChars, interactiveOnly }]
+  );
+  return { tabId, ...result };
+}
+
+function requireElementRef(params) {
+  if (typeof params.ref !== "string" || params.ref.length === 0 || params.ref.length > MAX_A11Y_REF_CHARS) {
+    throw new Error("ref must be a non-empty element reference string from accessibilityTree");
+  }
+  return params.ref;
+}
+
+async function locateElement(tabId, ref) {
+  await injectA11yScript(tabId);
+  const location = await runInA11yWorld(
+    tabId,
+    (elementRef) => window.__opencodeA11yLocate ? window.__opencodeA11yLocate(elementRef) : null,
+    [ref]
+  );
+  if (location.found !== true) {
+    throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
+  }
+  if (!Number.isFinite(location.x) || !Number.isFinite(location.y)) {
+    throw new Error(`Element ${ref} has no usable position`);
+  }
+  return location;
+}
+
+async function clickElement(params) {
+  const tabId = requireTabId(params);
+  const ref = requireElementRef(params);
+  const location = await locateElement(tabId, ref);
+  await dispatchClick({
+    tabId,
+    x: location.x,
+    y: location.y,
+    button: params.button,
+    modifiers: params.modifiers
+  });
+  return { clicked: true, ref, x: location.x, y: location.y, role: location.role, name: location.name };
+}
+
+async function fillElement(params) {
+  const tabId = requireTabId(params);
+  const ref = requireElementRef(params);
+  if (typeof params.text !== "string") throw new Error("text must be a string");
+  if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
+  const clear = params.clear !== false;
+  await injectA11yScript(tabId);
+  const focusResult = await runInA11yWorld(
+    tabId,
+    (elementRef, selectAll) => window.__opencodeA11yFocus ? window.__opencodeA11yFocus(elementRef, selectAll) : null,
+    [ref, clear]
+  );
+  if (focusResult.found !== true) {
+    throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
+  }
+  await withDebugger(tabId, async (target) => {
+    await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
+  });
+  return { filled: true, ref, tabId, cleared: clear && focusResult.editable === true };
+}
+
+async function loadBlockedUrlPatterns() {
+  const patterns = [];
+  for (const areaName of ["managed", "local"]) {
+    try {
+      const area = chrome.storage?.[areaName];
+      if (typeof area?.get !== "function") continue;
+      const stored = await area.get("blockedUrlPatterns");
+      const list = stored?.blockedUrlPatterns;
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) {
+        if (typeof entry === "string" && entry.length > 0 && entry.length <= MAX_BLOCKED_URL_PATTERN_CHARS) {
+          patterns.push(entry);
+        }
+      }
+    } catch {
+      // storage.managed is unavailable outside enterprise-managed browsers.
+    }
+  }
+  return [...new Set(patterns)].slice(0, MAX_BLOCKED_URL_PATTERNS);
+}
+
+function normalizeBlockPattern(pattern) {
+  const normalized = pattern.trim().toLowerCase().replace(/^https?:\/\//u, "").replace(/^www\./u, "");
+  if (normalized.length === 0) return null;
+  return normalized.includes("/") ? normalized : `${normalized}/*`;
+}
+
+function urlMatchesBlockPattern(parsedUrl, pattern) {
+  const normalized = normalizeBlockPattern(pattern);
+  if (normalized === null) return false;
+  const host = parsedUrl.hostname.toLowerCase().replace(/^www\./u, "");
+  const subject = `${host}${parsedUrl.pathname.toLowerCase()}`;
+  const body = normalized.split("*").map(escapeRegExp).join(".*");
+  const regex = normalized.endsWith("*")
+    ? new RegExp(`^${body}$`, "u")
+    : new RegExp(`^${body}(?:/.*)?$`, "u");
+  return regex.test(subject);
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+async function assertNavigationAllowed(url) {
+  validateNavigationUrl(url);
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+  for (const pattern of await loadBlockedUrlPatterns()) {
+    if (urlMatchesBlockPattern(parsed, pattern)) {
+      throw new Error(`Navigation blocked by policy pattern: ${pattern}`);
+    }
+  }
 }
 
 async function ensureConsoleLogDebugger(tabId) {

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.0.2-0f766e?style=flat-square" alt="Version v1.0.2" />
+  <img src="https://img.shields.io/badge/Version-v1.1.0-0f766e?style=flat-square" alt="Version v1.1.0" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -252,7 +252,17 @@ chrome_cdp_targets
 | `chrome_screenshot` | Capture a tab viewport to a PNG or JPEG file |
 | `chrome_screenshot_region` | Capture a CSS-pixel rectangle of a page (defaults to JPEG, can extend beyond the viewport) |
 
-### Interaction
+### Element-based interaction
+
+| Tool | Description |
+| --- | --- |
+| `chrome_accessibility_tree` | Capture a compact accessibility tree with stable element references (`e1`, `e2`, ...); sensitive fields are always redacted |
+| `chrome_click_element` | Click an element by accessibility-tree reference (scrolls it into view first) |
+| `chrome_fill_element` | Focus an element by reference and type text, replacing existing content by default |
+
+Element references survive page mutations but are invalidated by navigation — capture a fresh tree after navigating. Passwords, hidden inputs, and payment autocomplete fields (`cc-number`, `current-password`, `one-time-code`, ...) are reported as `[redacted]` and never leave the page.
+
+### Coordinate interaction
 
 | Tool | Description |
 | --- | --- |
@@ -326,6 +336,16 @@ chrome_cdp_targets
 | `chrome_cursor_state` | Update the visible browser-control cursor state |
 | `chrome_favicon_badge` | Set or clear the browser-control favicon badge |
 
+While the cursor state is `active`, the controlled page shows a pulsing viewport border and a **Stop OpenCode** button. Pressing it emits a `stopRequested` bridge event (visible through `chrome_events`) so the driving agent can halt the turn.
+
+### Navigation policy
+
+| Tool | Description |
+| --- | --- |
+| `chrome_blocked_urls` | List the effective blocked URL patterns enforced on navigation |
+
+Navigation commands (`chrome_open`, `chrome_open_window`) refuse URLs matching `blockedUrlPatterns`, read from enterprise managed storage (see `extension/managed_schema.json`) and from the extension's local storage. Patterns match hostname + path with `*` wildcards; a bare domain blocks the whole domain.
+
 ## Scripts reference
 
 | Script | Command | Description |
@@ -355,7 +375,9 @@ opencode-chrome-bridge/
 |   |   `-- opencode-favicon.ico
 |   |-- background.js
 |   |-- content-scripts/
+|   |   |-- a11y.js
 |   |   `-- opencode.js
+|   |-- managed_schema.json
 |   |-- manifest.json
 |   |-- popup.html
 |   `-- popup.js
@@ -381,9 +403,11 @@ opencode-chrome-bridge/
 |-- test/
 |   |-- background-runtime.test.mjs
 |   |-- bridge-capabilities.test.mjs
+|   |-- content-script-runtime.test.mjs
 |   |-- documentation.test.mjs
 |   |-- platform-support.test.mjs
 |   `-- windows-setup.test.mjs
+|-- CHANGELOG.md
 |-- .github/
 |   |-- ISSUE_TEMPLATE/
 |   |-- workflows/

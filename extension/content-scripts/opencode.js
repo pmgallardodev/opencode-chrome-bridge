@@ -23,6 +23,8 @@ if (!window.__opencodeOverlayInstalled) {
   let shadowRoot = null;
   let cursorEl = null;
   let faviconBadge = null;
+  let borderEl = null;
+  let stopButton = null;
   let hideTimer = null;
   let currentRaf = null;
   let currentState = "active";
@@ -108,6 +110,54 @@ if (!window.__opencodeOverlayInstalled) {
         0%, 100% { transform: scale(1); }
         50% { transform: scale(1.18); }
       }
+      .oc-border {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .oc-border-inner {
+        position: absolute;
+        inset: 0;
+        box-shadow:
+          inset 0 0 15px rgba(99, 102, 241, 0.55),
+          inset 0 0 30px rgba(99, 102, 241, 0.25);
+        animation: oc-border-pulse 2s ease-in-out infinite;
+      }
+      .oc-border.oc-visible { opacity: 1; }
+      @keyframes oc-border-pulse {
+        0%, 100% { opacity: 0.6; }
+        50% { opacity: 1; }
+      }
+      .oc-stop {
+        position: fixed;
+        bottom: 16px;
+        left: 50%;
+        transform: translateX(-50%) translateY(80px);
+        padding: 10px 16px;
+        background: #171717;
+        color: #e8e8e8;
+        border: 1px solid rgba(99, 102, 241, 0.6);
+        border-radius: 10px;
+        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+        box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+        opacity: 0;
+        pointer-events: none;
+        transition: transform 0.3s ease, opacity 0.3s ease;
+        user-select: none;
+        white-space: nowrap;
+      }
+      .oc-stop.oc-visible {
+        transform: translateX(-50%) translateY(0);
+        opacity: 1;
+        pointer-events: auto;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .oc-border-inner { animation: none; }
+        .oc-favicon-badge { animation: none; }
+      }
     `;
     shadowRoot.appendChild(style);
 
@@ -119,7 +169,39 @@ if (!window.__opencodeOverlayInstalled) {
     faviconBadge.className = "oc-favicon-badge";
     shadowRoot.appendChild(faviconBadge);
 
+    borderEl = document.createElement("div");
+    borderEl.className = "oc-border";
+    const borderInner = document.createElement("div");
+    borderInner.className = "oc-border-inner";
+    borderEl.appendChild(borderInner);
+    shadowRoot.appendChild(borderEl);
+
+    stopButton = document.createElement("button");
+    stopButton.className = "oc-stop";
+    stopButton.type = "button";
+    stopButton.textContent = "Stop OpenCode";
+    stopButton.addEventListener("click", () => {
+      // Let the user halt the agent from the controlled page itself. The
+      // background forwards this as a stopRequested bridge event.
+      try {
+        chrome.runtime.sendMessage({ type: "STOP_AGENT_REQUEST" });
+      } catch {}
+      hideAgentChrome();
+    });
+    shadowRoot.appendChild(stopButton);
+
     document.documentElement.appendChild(host);
+  }
+
+  function showAgentChrome() {
+    ensureOverlay();
+    borderEl.classList.add("oc-visible");
+    stopButton.classList.add("oc-visible");
+  }
+
+  function hideAgentChrome() {
+    if (borderEl) borderEl.classList.remove("oc-visible");
+    if (stopButton) stopButton.classList.remove("oc-visible");
   }
 
   function applyState(state) {
@@ -132,6 +214,8 @@ if (!window.__opencodeOverlayInstalled) {
       cursorEl.classList.add(`oc-state-${state}`);
       faviconBadge.classList.add(`oc-state-${state}`);
     }
+    if (state === "active") showAgentChrome();
+    else hideAgentChrome();
   }
 
   function animateBezier(fromX, fromY, toX, toY, duration, onDone) {

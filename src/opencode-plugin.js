@@ -624,6 +624,49 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("setFaviconBadge", { tabId: args.tabId, badge: args.badge ?? null }), null, 2);
         }
       }),
+      chrome_accessibility_tree: tool({
+        description: "Capture a compact accessibility tree of a Chrome tab with stable element references (e1, e2, ...). Use the refs with chrome_click_element and chrome_fill_element to act on elements without pixel coordinates. Sensitive fields (passwords, payment autocomplete) are always redacted. Refs are valid until the tab navigates.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          interactiveOnly: schema.boolean().optional().describe("If true, only include interactive elements (buttons, links, inputs)."),
+          maxNodes: schema.number().int().min(1).max(2000).default(800).describe("Maximum elements to include."),
+          maxChars: schema.number().int().min(100).max(200000).default(50000).describe("Maximum characters of tree text to return.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("accessibilityTree", args), null, 2);
+        }
+      }),
+      chrome_click_element: tool({
+        description: "Click an element in a Chrome tab by its accessibility-tree reference. Scrolls the element into view and clicks its center through CDP. Capture chrome_accessibility_tree first to obtain refs.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          ref: schema.string().describe("Element reference from chrome_accessibility_tree, e.g. e12."),
+          button: schema.enum(["left", "middle", "right"]).default("left").describe("Mouse button to use."),
+          modifiers: schema.array(schema.enum(["Alt", "Control", "ControlOrMeta", "Meta", "Shift"])).optional().describe("Modifier keys to hold during click.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("clickElement", args), null, 2);
+        }
+      }),
+      chrome_fill_element: tool({
+        description: "Focus an input, textarea, or contenteditable element by accessibility-tree reference and type text into it. By default the existing content is selected first, so the new text replaces it.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          ref: schema.string().describe("Element reference from chrome_accessibility_tree, e.g. e12."),
+          text: schema.string().describe("Text to type into the element."),
+          clear: schema.boolean().default(true).describe("Select existing content first so the text replaces it. Set false to append at the current caret.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("fillElement", args), null, 2);
+        }
+      }),
+      chrome_blocked_urls: tool({
+        description: "List the effective blocked URL patterns the bridge enforces on navigation. Patterns come from enterprise managed storage and the extension's local storage key blockedUrlPatterns.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("getBlockedUrlPatterns"), null, 2);
+        }
+      }),
       chrome_subscribe_cdp: tool({
         description: "Subscribe to Chrome DevTools Protocol events for a tab. Emitted events appear via chrome_events with category 'cdp'.",
         args: {
@@ -672,6 +715,9 @@ const APPROVAL_METADATA = {
   chrome_history: (args) => ({ action: "Search the user's browsing history", query: args.query }),
   chrome_bookmarks: (args) => ({ action: "Search the user's bookmarks", query: args.query }),
   chrome_page_text: (args) => ({ action: "Read the page text", tabId: args.tabId }),
+  chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
+  chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
+  chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),

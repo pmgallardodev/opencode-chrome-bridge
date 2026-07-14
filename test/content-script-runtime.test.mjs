@@ -22,6 +22,22 @@ test("hidden cursor state remains hidden during later browser actions", () => {
   assert.equal(harness.elements.some((element) => element.classList.contains("oc-ripple")), false);
 });
 
+test("active cursor state shows the agent border and stop button, hidden removes them", () => {
+  const harness = createContentScriptHarness();
+
+  harness.send({ source: "opencode-bridge", type: "cursor-state", state: "active" });
+  const border = harness.elements.find((element) => element.classList.contains("oc-border"));
+  const stop = harness.elements.find((element) => element.classList.contains("oc-stop"));
+  assert.ok(border, "missing agent border element");
+  assert.ok(stop, "missing stop button element");
+  assert.equal(border.classList.contains("oc-visible"), true);
+  assert.equal(stop.classList.contains("oc-visible"), true);
+
+  harness.send({ source: "opencode-bridge", type: "cursor-state", state: "hidden" });
+  assert.equal(border.classList.contains("oc-visible"), false);
+  assert.equal(stop.classList.contains("oc-visible"), false);
+});
+
 function createContentScriptHarness() {
   const elements = [];
   const listeners = [];

@@ -51,7 +51,11 @@ test("README lists every public browser lifecycle tool and current project files
     "chrome_end_turn",
     "chrome_release_debuggers",
     "chrome_cursor_state",
-    "chrome_favicon_badge"
+    "chrome_favicon_badge",
+    "chrome_accessibility_tree",
+    "chrome_click_element",
+    "chrome_fill_element",
+    "chrome_blocked_urls"
   ]) {
     assert.ok(readme.includes(`\`${name}\``), `README is missing ${name}`);
   }
@@ -82,8 +86,8 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
-test("release metadata is synchronized for v1.0.2", async () => {
-  const expectedVersion = "1.0.2";
+test("release metadata is synchronized for v1.1.0", async () => {
+  const expectedVersion = "1.1.0";
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
   const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
@@ -95,10 +99,10 @@ test("release metadata is synchronized for v1.0.2", async () => {
   assert.equal(packageLock.version, expectedVersion);
   assert.equal(packageLock.packages[""].version, expectedVersion);
   assert.equal(manifest.version, expectedVersion);
-  assert.match(popupHtml, /<span id="version">v1\.0\.2<\/span>/u);
-  assert.match(popupJs, /"v1\.0\.2"/u);
-  assert.match(readme, /Version-v1\.0\.2-/u);
-  assert.match(readme, /alt="Version v1\.0\.2"/u);
+  assert.match(popupHtml, /<span id="version">v1\.1\.0<\/span>/u);
+  assert.match(popupJs, /"v1\.1\.0"/u);
+  assert.match(readme, /Version-v1\.1\.0-/u);
+  assert.match(readme, /alt="Version v1\.1\.0"/u);
   assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");

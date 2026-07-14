@@ -37,6 +37,8 @@ const manifest = await checkJson("extension/manifest.json");
 await access(path.join(repoRoot, "extension", "background.js"));
 await access(path.join(repoRoot, "extension", "popup.html"));
 await access(path.join(repoRoot, "extension", "content-scripts", "opencode.js"));
+await access(path.join(repoRoot, "extension", "content-scripts", "a11y.js"));
+await access(path.join(repoRoot, "extension", "managed_schema.json"));
 await access(path.join(repoRoot, "extension", "images", "cursor-chat.png"));
 await access(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"));
 await access(path.join(repoRoot, "src", "opencode-plugin.js"));

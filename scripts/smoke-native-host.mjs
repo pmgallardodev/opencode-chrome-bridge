@@ -26,6 +26,12 @@ try {
   if (readyFrame.type !== "event" || readyFrame.event?.type !== "bridgeReady") {
     throw new Error(`Expected a bridgeReady announcement first, got: ${JSON.stringify(readyFrame)}`);
   }
+
+  await writeNativeMessage(child.stdin, { type: "ping", id: "smoke-ping-1" });
+  const pongFrame = await readNativeMessage();
+  if (pongFrame.type !== "pong" || pongFrame.id !== "smoke-ping-1") {
+    throw new Error(`Expected a pong reply to the liveness ping, got: ${JSON.stringify(pongFrame)}`);
+  }
   if (process.platform !== "win32") {
     const stateDirMode = (await stat(stateDir)).mode & 0o777;
     if (stateDirMode !== 0o700) throw new Error(`Expected state directory mode 0700, got ${stateDirMode.toString(8)}`);
