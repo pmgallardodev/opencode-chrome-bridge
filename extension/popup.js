@@ -45,9 +45,9 @@ function setVersion() {
   if (!version) return;
   try {
     const manifestVersion = globalThis.chrome?.runtime?.getManifest ? chrome.runtime.getManifest().version : null;
-    version.textContent = manifestVersion ? `v${manifestVersion}` : "v1.0.0";
+    version.textContent = manifestVersion ? `v${manifestVersion}` : "v1.0.2";
   } catch {
-    version.textContent = "v1.0.0";
+    version.textContent = "v1.0.2";
   }
 }
 

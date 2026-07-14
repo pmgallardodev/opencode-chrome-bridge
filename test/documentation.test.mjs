@@ -82,6 +82,25 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
+test("release metadata is synchronized for v1.0.2", async () => {
+  const expectedVersion = "1.0.2";
+  const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
+  const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
+  const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
+  const popupHtml = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
+  const popupJs = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+
+  assert.equal(packageJson.version, expectedVersion);
+  assert.equal(packageLock.version, expectedVersion);
+  assert.equal(packageLock.packages[""].version, expectedVersion);
+  assert.equal(manifest.version, expectedVersion);
+  assert.match(popupHtml, /<span id="version">v1\.0\.2<\/span>/u);
+  assert.match(popupJs, /"v1\.0\.2"/u);
+  assert.match(readme, /Version-v1\.0\.2-/u);
+  assert.match(readme, /alt="Version v1\.0\.2"/u);
+});
+
 test("public repository includes governance and security documents", async () => {
   for (const file of [
     "SECURITY.md",
