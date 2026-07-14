@@ -17,6 +17,7 @@ screenshots/
 .agents/
 .claude/
 .opencode/
+docs/superpowers/
 
 # Local configuration and credentials
 .env
