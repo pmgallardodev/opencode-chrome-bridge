@@ -70,6 +70,11 @@ const SENSITIVE_QUERY_KEYS = new Set([
   "refreshtoken", "relaystate", "samlrequest", "samlresponse", "secret", "session", "sig",
   "signature", "ticket", "token"
 ]);
+const SENSITIVE_QUERY_KEY_FRAGMENTS = Object.freeze([
+  "access", "assertion", "auth", "bearer", "code", "cookie", "credential", "idtoken", "jwt",
+  "key", "nonce", "oauth", "pass", "refresh", "relaystate", "samlrequest", "samlresponse",
+  "secret", "securitytoken", "session", "sig", "ticket", "token"
+]);
 const MAX_BATCH_ACTIONS = 25;
 const MAX_BATCH_PAYLOAD_BYTES = 100_000;
 const MIN_BATCH_TIMEOUT_MS = 50;
@@ -1733,9 +1738,27 @@ async function cdpCommand(params) {
   if (typeof commandParams !== "object" || commandParams === null || Array.isArray(commandParams)) {
     throw new Error("commandParams must be an object when provided");
   }
-  return withDebuggerTarget(target, async (attachedTarget) => {
-    return chrome.debugger.sendCommand(attachedTarget, params.method, commandParams);
+  return withDebuggerTarget(target, async (attachedTarget, { reused }) => {
+    const result = await chrome.debugger.sendCommand(attachedTarget, params.method, commandParams);
+    if (reused && Number.isInteger(attachedTarget.tabId)) {
+      syncRawCdpDomainState(attachedTarget.tabId, params.method);
+    }
+    return result;
   });
+}
+
+function syncRawCdpDomainState(tabId, method) {
+  const match = /^([A-Za-z][A-Za-z0-9]*)\.(enable|disable)$/u.exec(method);
+  if (!match) return;
+  const [, domain, operation] = match;
+  const enabled = cdpEnabledDomains.get(tabId) ?? new Set();
+  if (operation === "enable") {
+    enabled.add(domain);
+    cdpEnabledDomains.set(tabId, enabled);
+    return;
+  }
+  enabled.delete(domain);
+  if (enabled.size === 0) cdpEnabledDomains.delete(tabId);
 }
 
 async function searchHistory(params) {
@@ -1785,7 +1808,7 @@ async function withDebuggerTarget(debugTarget, callback) {
         await chrome.debugger.attach(debugTarget, DEBUGGER_VERSION);
         attached = true;
       }
-      return await callback(debugTarget);
+      return await callback(debugTarget, { reused });
     } finally {
       if (attached) await chrome.debugger.detach(debugTarget).catch(() => {});
     }
@@ -3085,7 +3108,8 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
   const target = { tabId };
   return withDebuggerLock(debuggerKey(target), async () => {
     throwIfAborted(signal);
-    if (networkCaptureAttached.has(tabId)) {
+    const hadNetworkCapture = networkCaptureAttached.has(tabId);
+    if (hadNetworkCapture && cdpEnabledDomains.get(tabId)?.has("Network") === true) {
       throwIfAborted(signal);
       return { attached: true, alreadyAttached: true, tabId };
     }
@@ -3109,7 +3133,7 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
       throwIfAborted(signal);
       return { attached: true, alreadyAttached: false, tabId };
     } catch (error) {
-      networkCaptureAttached.delete(tabId);
+      if (!hadNetworkCapture) networkCaptureAttached.delete(tabId);
       if (!hadNetworkTracker) networkTrackerAttached.delete(tabId);
       if (!hadNetworkState) networkRequestStates.delete(tabId);
       const enabled = cdpEnabledDomains.get(tabId);
@@ -3247,7 +3271,8 @@ function redactNetworkUrl(value) {
 function isSensitiveQueryKey(key) {
   if (typeof key !== "string") return false;
   const normalized = key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/gu, "");
-  return SENSITIVE_QUERY_KEYS.has(normalized);
+  return normalized.length > 0 && (SENSITIVE_QUERY_KEYS.has(normalized)
+    || SENSITIVE_QUERY_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment)));
 }
 
 function sanitizeNetworkToken(value, maxChars, fallback) {

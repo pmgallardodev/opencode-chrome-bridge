@@ -1502,7 +1502,9 @@ test("network URL redaction normalizes encoded sensitive query names", async () 
   const sensitiveKeys = [
     "%53AML_Response", "saml-request", "Assertion", "JWT", "Bearer", "ticket",
     "Relay-State", "oauth", "access_token", "refresh-token", "id.token",
-    "authorization%5Fcode", "client_secret", "api-key"
+    "authorization%5Fcode", "client_secret", "api-key", "session_id", "x-api-key",
+    "X-Amz-Credential", "X-Amz-Signature", "X-Amz-Security-Token",
+    "X-Goog-Credential", "X-Goog-Signature", "client_assertion"
   ];
   for (const [index, key] of sensitiveKeys.entries()) {
     await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
@@ -1518,6 +1520,60 @@ test("network URL redaction normalizes encoded sensitive query names", async () 
     assert.equal(entry.url.includes(`query=visible-${index}`), true, "benign query values must remain useful");
     assert.equal(entry.url.includes("%5BREDACTED%5D"), true);
   }
+});
+
+test("raw Network.enable remains shared when a network summary request is cancelled", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+  await harness.execute("cdpCommand", { tabId: 7, method: "Network.enable", commandParams: {} });
+  assert.equal(
+    harness.calls.debuggerCommands.filter((entry) => entry.method === "Network.enable").length,
+    1
+  );
+
+  const controller = new AbortController();
+  controller.abort(new Error("cancel shared capture"));
+  await assert.rejects(
+    harness.execute("networkRequests", { tabId: 7 }, { signal: controller.signal }),
+    /cancel|cancelled/u
+  );
+  assert.equal(
+    harness.calls.debuggerCommands.some((entry) => entry.method === "Network.disable"),
+    false,
+    "cancelled capture must not disable a raw CDP Network consumer"
+  );
+
+  await harness.execute("networkRequests", { tabId: 7 });
+  assert.equal(
+    harness.calls.debuggerCommands.filter((entry) => entry.method === "Network.enable").length,
+    1,
+    "network capture must reuse the raw enabled domain instead of claiming exclusive ownership"
+  );
+});
+
+test("temporary raw Network.enable is forgotten after its debugger detaches", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("cdpCommand", { tabId: 7, method: "Network.enable", commandParams: {} });
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  await harness.execute("networkRequests", { tabId: 7 });
+  assert.equal(
+    harness.calls.debuggerCommands.filter((entry) => entry.method === "Network.enable").length,
+    2,
+    "a new persistent attachment must re-enable Network after the temporary raw attachment detached"
+  );
+});
+
+test("raw Network.disable invalidates the shared domain state for the next capture", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+  await harness.execute("networkRequests", { tabId: 7 });
+  await harness.execute("cdpCommand", { tabId: 7, method: "Network.disable", commandParams: {} });
+  await harness.execute("networkRequests", { tabId: 7 });
+  assert.equal(
+    harness.calls.debuggerCommands.filter((entry) => entry.method === "Network.enable").length,
+    2,
+    "capture must restore Network after an explicit raw disable"
+  );
 });
 
 test("network cursor pagination advances only through the last returned entry", async () => {
