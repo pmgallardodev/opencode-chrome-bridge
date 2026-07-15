@@ -228,6 +228,8 @@ test("native host validates local bridge command requests before forwarding to C
   assert.match(nativeHost, /MAX_EVENT_SUBSCRIBERS/u, "SSE subscribers must be bounded");
   assert.match(nativeHost, /if \(!subscriber\.write/u, "slow SSE subscribers must be disconnected instead of buffering indefinitely");
   assert.match(nativeHost, /server\.headersTimeout/u, "local HTTP headers must have a finite timeout");
+  assert.match(nativeHost, /type:\s*"cancel",\s*id/u, "timed-out commands must cancel extension work");
+  assert.match(nativeHost, /Math\.min\(parsed,\s*125000\)/u, "host timeout must leave five seconds for extension cleanup");
   assert.match(nativeHost, /"Cache-Control": "no-store"/u, "JSON responses containing browser data must not be cached");
   assert.match(nativeHost, /"X-Content-Type-Options": "nosniff"/u, "JSON responses must disable MIME sniffing");
 });
@@ -238,6 +240,7 @@ test("bridge client aborts stalled local HTTP requests", async () => {
   assert.match(source, /AbortController/u, "bridge client must create an AbortController for fetch");
   assert.match(source, /setTimeout/u, "bridge client must enforce a client-side timeout");
   assert.match(source, /clearTimeout/u, "bridge client must clear the timeout after fetch settles");
+  assert.match(source, /MAX_REQUEST_TIMEOUT_MS\s*=\s*126000/u, "client timeout must outlive the maximum native-host command timeout");
   assert.match(source, /await open\(STATE_PATH, "r"\)/u, "bridge client must validate the opened state file rather than a racy path");
   assert.match(source, /stateInfo\.mode & 0o077/u, "bridge client must reject a state token readable by other users");
   assert.match(source, /stateInfo\.uid !== process\.getuid\(\)/u, "bridge client must reject state owned by another user");

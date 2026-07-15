@@ -587,7 +587,7 @@ test("waitFor validates one typed condition and bounds its timing controls", asy
   );
 });
 
-test("waitFor observes URL and completed navigation deterministically", async () => {
+test("waitFor observes URL and only navigation that starts after the wait baseline", async () => {
   let urlReads = 0;
   const urlHarness = createBackgroundHarness({
     tabsGet: async (tabId) => ({
@@ -608,24 +608,65 @@ test("waitFor observes URL and completed navigation deterministically", async ()
   assert.equal(urlResult.type, "url");
   assert.match(urlResult.url, /\/ready$/u);
 
-  let navigationReads = 0;
+  const alreadyComplete = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ id: tabId, status: "complete", url: "https://example.com/ready", windowId: 1 })
+  });
+  await assert.rejects(alreadyComplete.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 50
+  }), /timed out waiting for navigation/u);
+
+  let status = "complete";
   const navigationHarness = createBackgroundHarness({
     tabsGet: async (tabId) => ({
       active: true,
       id: tabId,
-      status: ++navigationReads < 2 ? "loading" : "complete",
-      url: "https://example.com/ready",
+      status,
+      url: "https://example.com/same-url",
       windowId: 1
     })
   });
-  const navigationResult = await navigationHarness.execute("waitFor", {
+  const navigationWaiting = navigationHarness.execute("waitFor", {
     condition: { type: "navigation" },
     pollIntervalMs: 10,
     tabId: 7,
     timeoutMs: 200
   });
+  status = "loading";
+  await navigationHarness.events.tabsOnUpdated.emit(7, { status: "loading" }, {
+    id: 7, status, url: "https://example.com/same-url", windowId: 1
+  });
+  status = "complete";
+  await navigationHarness.events.tabsOnUpdated.emit(7, { status: "complete" }, {
+    id: 7, status, url: "https://example.com/same-url", windowId: 1
+  });
+  const navigationResult = await navigationWaiting;
   assert.equal(navigationResult.type, "navigation");
   assert.equal(navigationResult.status, "complete");
+  assert.equal(navigationResult.url, "https://example.com/same-url");
+});
+
+test("waitFor navigation fails promptly when its tab closes", async () => {
+  let closed = false;
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      if (closed) throw new Error(`No tab with id: ${tabId}`);
+      return { id: tabId, status: "complete", url: "https://example.com", windowId: 1 };
+    }
+  });
+
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  closed = true;
+  await harness.events.tabsOnRemoved.emit(7, { windowId: 1, isWindowClosing: false });
+
+  await assert.rejects(waiting, /tab 7 closed while waiting for navigation/iu);
 });
 
 test("waitFor checks text, live refs, and selectors only through the isolated helper", async () => {
@@ -706,6 +747,7 @@ test("network-idle waits reset on activity and preserve console debugger consume
   assert.equal(result.type, "networkIdle");
   assert.equal(result.inFlight, 0);
   assert.ok(result.idleForMs >= 40);
+  assert.ok(Number.isFinite(result.trackingSince), "network waits must disclose when request observation began");
   assert.equal(harness.calls.debuggerDetach.length, 0, "network wait cleanup must preserve the console debugger");
 
   await harness.events.debuggerOnEvent.emit(
@@ -715,6 +757,100 @@ test("network-idle waits reset on activity and preserve console debugger consume
   );
   const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(logs.logs[0].text, "still collecting");
+});
+
+test("network-idle tracks requests emitted while Network.enable is in flight", async () => {
+  let harness;
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Network.enable") {
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 },
+          "Network.requestWillBeSent",
+          { requestId: "during-enable", timestamp: 1 }
+        );
+      }
+      return {};
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "networkIdle", idleMs: 30 },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 80
+    }),
+    /timed out waiting for networkIdle after 80ms/u
+  );
+});
+
+test("network-idle request accounting is bounded and overflow fails closed", async () => {
+  const harness = createBackgroundHarness();
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 30 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 100
+  });
+  const rejection = assert.rejects(waiting, /timed out waiting for networkIdle after 100ms/u);
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  for (let index = 0; index <= 1_000; index += 1) {
+    await harness.events.debuggerOnEvent.emit(
+      { tabId: 7 },
+      "Network.requestWillBeSent",
+      { requestId: `request-${index}`, timestamp: index }
+    );
+  }
+
+  const state = harness.networkTrackerState(7);
+  assert.equal(state.inFlight, 1_000);
+  assert.equal(state.overflowed, true);
+  assert.equal(state.requestCount, 1_000);
+  await rejection;
+});
+
+test("native cancel aborts waitFor promptly, releases its debugger, and suppresses a late response", async () => {
+  const harness = createBackgroundHarness();
+  const commandHandling = harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "command-cancel-1",
+    method: "waitFor",
+    params: {
+      condition: { type: "networkIdle", idleMs: 30_000 },
+      pollIntervalMs: 1_000,
+      tabId: 7,
+      timeoutMs: 5_000
+    }
+  });
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(harness.calls.debuggerAttach.length, 1);
+
+  const cancelledAt = Date.now();
+  await harness.events.nativeOnMessage.emit({ type: "cancel", id: "command-cancel-1" });
+  await commandHandling;
+
+  assert.ok(Date.now() - cancelledAt < 200, "cancel must not wait for the next polling deadline");
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.equal(harness.activeNativeCommandCount(), 0);
+  assert.equal(
+    harness.calls.nativeMessages.some((message) => message.type === "response" && message.id === "command-cancel-1"),
+    false,
+    "a cancelled command must not post a response after the host has timed out"
+  );
+});
+
+test("native cancel ignores unknown or already completed command ids", async () => {
+  const harness = createBackgroundHarness();
+
+  await assert.doesNotReject(() => harness.events.nativeOnMessage.emit({ type: "cancel", id: "unknown-command" }));
+  await harness.events.nativeOnMessage.emit({ type: "command", id: "completed-command", method: "status", params: {} });
+  await assert.doesNotReject(() => harness.events.nativeOnMessage.emit({ type: "cancel", id: "completed-command" }));
+  assert.equal(harness.activeNativeCommandCount(), 0);
 });
 
 test("CDP unsubscription does not detach an active network-idle consumer", async () => {
@@ -1381,7 +1517,8 @@ function createBackgroundHarness({
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
-    tabsOnReplaced: createEvent()
+    tabsOnReplaced: createEvent(),
+    tabsOnUpdated: createEvent()
   };
   const nativePort = {
     onDisconnect: createEvent(),
@@ -1445,7 +1582,7 @@ function createBackgroundHarness({
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
       onReplaced: events.tabsOnReplaced,
-      onUpdated: createEvent(),
+      onUpdated: events.tabsOnUpdated,
       query: async () => [],
       remove: tabsRemove,
       sendMessage: async (_tabId, message) => {
@@ -1465,6 +1602,7 @@ function createBackgroundHarness({
   const harnessConsole = Object.create(console);
   harnessConsole.error = consoleError;
   const context = vm.createContext({
+    AbortController,
     chrome,
     console: harnessConsole,
     navigator: { platform: "MacIntel" },
@@ -1476,6 +1614,20 @@ function createBackgroundHarness({
   vm.runInContext(backgroundSource, context, { filename: "extension/background.js" });
 
   return {
+    activeNativeCommandCount() {
+      return vm.runInContext("activeNativeCommands.size", context);
+    },
+    networkTrackerState(tabId) {
+      context.__testTabId = tabId;
+      return vm.runInContext(`(() => {
+        const state = networkRequestStates.get(__testTabId);
+        return state ? {
+          inFlight: [...state.requests.values()].filter((request) => request.inFlight === true).length,
+          overflowed: state.overflowed,
+          requestCount: state.requests.size
+        } : null;
+      })()`, context);
+    },
     calls,
     events,
     setDebuggerTargets(targets) {

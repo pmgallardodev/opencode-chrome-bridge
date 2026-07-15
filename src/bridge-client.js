@@ -7,7 +7,7 @@ const STATE_DIR = process.env.OPENCODE_CHROME_BRIDGE_STATE_DIR || path.join(os.h
 const STATE_PATH = path.join(STATE_DIR, "state.json");
 const TOKEN_RE = /^[A-Za-z0-9._~+/=-]{20,256}$/u;
 const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
-const MAX_REQUEST_TIMEOUT_MS = 125000;
+const MAX_REQUEST_TIMEOUT_MS = 126000;
 const MAX_CAPABILITY_HEADER_CHARS = 10_000;
 const NATIVE_HOST_NAME = "com.opencode.chrome_bridge";
 export const BRIDGE_CLIENT_VERSION = "1.1.0";

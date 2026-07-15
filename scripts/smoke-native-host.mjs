@@ -142,6 +142,10 @@ try {
     },
     body: JSON.stringify({ method: "listTabs", params: {}, timeoutMs: 5000 })
   });
+  const cancellationFrame = await readNativeMessage();
+  if (cancellationFrame.type !== "cancel" || cancellationFrame.id !== disconnectedHandshake.id) {
+    throw new Error(`Expected the timed-out handshake to be cancelled, got: ${JSON.stringify(cancellationFrame)}`);
+  }
   const nativeCommand = await readNativeMessage();
   if (nativeCommand.type !== "command" || nativeCommand.method !== "listTabs" || typeof nativeCommand.id !== "string") {
     throw new Error(`Unexpected native command frame: ${JSON.stringify(nativeCommand)}`);

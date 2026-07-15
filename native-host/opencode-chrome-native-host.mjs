@@ -418,6 +418,9 @@ function sendCommand(method, params, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pending.delete(id);
+      writeNativeMessage({ type: "cancel", id }).catch((error) => {
+        log(`could not cancel timed-out Chrome command ${id}: ${error?.message ?? error}`);
+      });
       reject(new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
     }, clampTimeout(timeoutMs));
     pending.set(id, { resolve, reject, timeout });
@@ -528,7 +531,7 @@ function sendJson(res, statusCode, payload) {
 function clampTimeout(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 15000;
-  return Math.max(1000, Math.min(parsed, 120000));
+  return Math.max(1000, Math.min(parsed, 125000));
 }
 
 async function writeState(port) {

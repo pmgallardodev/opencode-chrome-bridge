@@ -80,6 +80,8 @@ const cdpEnabledDomains = new Map();
 const networkRequestStates = new Map();
 const networkTrackerAttached = new Set();
 const networkWaitConsumers = new Map();
+const navigationSequences = new Map();
+const activeNativeCommands = new Map();
 const tabLeases = new Map();
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
@@ -257,17 +259,27 @@ async function handleNativeMessage(message) {
     }
     return;
   }
+  if (message?.type === "cancel" && typeof message.id === "string") {
+    activeNativeCommands.get(message.id)?.abort(new Error(`Chrome command ${message.id} was cancelled`));
+    return;
+  }
   if (message?.type !== "command" || typeof message.id !== "string") return;
+  const controller = new AbortController();
+  activeNativeCommands.set(message.id, controller);
   try {
-    const result = await executeCommand(message.method, message.params ?? {});
+    const result = await executeCommand(message.method, message.params ?? {}, { signal: controller.signal });
+    if (controller.signal.aborted) return;
     postNativeResponse({ type: "response", id: message.id, ok: true, result });
   } catch (error) {
+    if (controller.signal.aborted) return;
     postNativeResponse({
       type: "response",
       id: message.id,
       ok: false,
       error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS)
     });
+  } finally {
+    if (activeNativeCommands.get(message.id) === controller) activeNativeCommands.delete(message.id);
   }
 }
 
@@ -286,7 +298,7 @@ function postNativeResponse(message) {
   }
 }
 
-async function executeCommand(method, params) {
+async function executeCommand(method, params, options = {}) {
   switch (method) {
     case "handshake":
       return createExtensionHandshake();
@@ -409,7 +421,7 @@ async function executeCommand(method, params) {
     case "findElements":
       return findElements(params);
     case "waitFor":
-      return waitFor(params);
+      return waitFor(params, options);
     case "clickElement":
       return clickElement(params);
     case "fillElement":
@@ -1545,10 +1557,14 @@ function sendEvent(event) {
 
 function registerBrowserEventListeners() {
   chrome.tabs.onCreated.addListener((tab) => sendEvent({ category: "tabs", type: "tabCreated", tab: tabInfo(tab) }));
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) =>
-    sendEvent({ category: "tabs", type: "tabUpdated", tabId, changeInfo, tab: tabInfo(tab) })
-  );
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo?.status === "loading" || typeof changeInfo?.url === "string") {
+      navigationSequences.set(tabId, (navigationSequences.get(tabId) ?? 0) + 1);
+    }
+    sendEvent({ category: "tabs", type: "tabUpdated", tabId, changeInfo, tab: tabInfo(tab) });
+  });
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    navigationSequences.delete(tabId);
     const persistence = removeClosedTabLease(tabId);
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
@@ -1558,6 +1574,7 @@ function registerBrowserEventListeners() {
     sendEvent({ category: "tabs", type: "tabActivated", tabId: activeInfo.tabId, windowId: activeInfo.windowId })
   );
   chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    navigationSequences.delete(removedTabId);
     const persistence = replaceClosedTabLease(addedTabId, removedTabId);
     persistence.catch(reportLeasePersistenceError);
     sendEvent({ category: "tabs", type: "tabReplaced", addedTabId, removedTabId });
@@ -1840,23 +1857,26 @@ function validateFindElementsResult(result) {
   }
 }
 
-async function waitFor(params) {
+async function waitFor(params, { signal } = {}) {
   const condition = validateWaitCondition(params.condition);
   const timeoutMs = clampInteger(params.timeoutMs, MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS, 10_000, "timeoutMs");
   const pollIntervalMs = clampInteger(params.pollIntervalMs, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, 100, "pollIntervalMs");
   const tabId = condition.type === "download" ? null : requireTabId(params);
+  if (condition.type === "navigation") condition.baseline = navigationSequences.get(tabId) ?? 0;
   const startedAt = Date.now();
   let networkConsumer = false;
 
-  if (["text", "ref", "selector"].includes(condition.type)) await injectA11yScript(tabId);
-  if (condition.type === "networkIdle") {
-    await acquireNetworkWaitTracker(tabId);
-    networkConsumer = true;
-  }
-
   try {
+    throwIfAborted(signal);
+    if (["text", "ref", "selector"].includes(condition.type)) await injectA11yScript(tabId);
+    if (condition.type === "networkIdle") {
+      await acquireNetworkWaitTracker(tabId);
+      networkConsumer = true;
+    }
     while (true) {
+      throwIfAborted(signal);
       const result = await checkWaitCondition(tabId, condition);
+      throwIfAborted(signal);
       if (result.matched === true) {
         return {
           ...result,
@@ -1869,11 +1889,33 @@ async function waitFor(params) {
       if (remainingMs <= 0) {
         throw new Error(`timed out waiting for ${condition.type} after ${timeoutMs}ms`);
       }
-      await sleep(Math.min(pollIntervalMs, remainingMs));
+      await abortableSleep(Math.min(pollIntervalMs, remainingMs), signal);
     }
   } finally {
     if (networkConsumer) await releaseNetworkWaitTracker(tabId);
   }
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled");
+}
+
+function abortableSleep(ms, signal) {
+  if (!signal) return sleep(ms);
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function validateWaitCondition(condition) {
@@ -1942,9 +1984,16 @@ async function checkWaitCondition(tabId, condition) {
     return { matched, url: sanitizeBrowserUrl(url) };
   }
   if (condition.type === "navigation") {
-    const tab = await chrome.tabs.get(tabId);
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      throw new Error(`tab ${tabId} closed while waiting for navigation`);
+    }
+    const sequence = navigationSequences.get(tabId) ?? 0;
     return {
-      matched: tab.status === "complete",
+      matched: sequence > condition.baseline && tab.status === "complete",
+      navigationSequence: sequence,
       status: typeof tab.status === "string" ? tab.status : "unknown",
       url: sanitizeBrowserUrl(tab.url)
     };
@@ -2249,15 +2298,20 @@ async function acquireNetworkWaitTracker(tabId) {
         await chrome.debugger.attach(target, DEBUGGER_VERSION);
         attachedHere = true;
       }
-      await enableRequiredCdpDomain(target, "Network");
+      const trackingSince = Date.now();
       networkRequestStates.set(tabId, {
-        lastActivityAt: Date.now(),
+        lastActivityAt: trackingSince,
         overflowed: false,
-        requests: new Map()
+        requests: new Map(),
+        trackingSince
       });
       networkTrackerAttached.add(tabId);
       networkWaitConsumers.set(tabId, 1);
+      await enableRequiredCdpDomain(target, "Network");
     } catch (error) {
+      networkWaitConsumers.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkRequestStates.delete(tabId);
       if (attachedHere) {
         cdpEnabledDomains.delete(tabId);
         await chrome.debugger.detach(target).catch(() => {});
@@ -2332,7 +2386,7 @@ function trackNetworkEvent(tabId, method, params) {
 
 function networkIdleSnapshot(tabId) {
   const state = networkRequestStates.get(tabId);
-  if (!state) return { idleForMs: 0, inFlight: 0, overflowed: true };
+  if (!state) return { idleForMs: 0, inFlight: 0, overflowed: true, trackingSince: null };
   let inFlight = 0;
   for (const request of state.requests.values()) {
     if (request.inFlight === true) inFlight += 1;
@@ -2340,7 +2394,8 @@ function networkIdleSnapshot(tabId) {
   return {
     idleForMs: Math.max(0, Date.now() - state.lastActivityAt),
     inFlight,
-    overflowed: state.overflowed
+    overflowed: state.overflowed,
+    trackingSince: state.trackingSince
   };
 }
 

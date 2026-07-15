@@ -420,6 +420,84 @@ test("findElements applies visibility and interactivity filters without indexing
   assert.doesNotMatch(JSON.stringify(withHidden), /secret/u);
 });
 
+test("findElements and accessibility names omit sensitive descendant text from normal ancestors", () => {
+  const sensitiveDescendant = createElement("div", {
+    attributes: { autocomplete: "cc-number" },
+    children: [createElement("span", { text: "4111 ancestor secret" })]
+  });
+  const button = createElement("button", {
+    children: [createElement("span", { text: "Public checkout" }), sensitiveDescendant]
+  });
+  button.textContent = "Public checkout4111 ancestor secret";
+  const harness = createA11yHarness([button]);
+
+  const publicResult = harness.find({ query: "public checkout", role: "button", visibleOnly: false });
+  const secretResult = harness.find({ query: "4111 ancestor secret", visibleOnly: false });
+  const snapshot = harness.generate();
+
+  assert.equal(publicResult.matches.length, 1);
+  assert.equal(publicResult.matches[0].name, "Public checkout");
+  assert.equal(publicResult.matches[0].text, "Public checkout");
+  assert.equal(secretResult.matches.length, 0);
+  assert.doesNotMatch(JSON.stringify(publicResult), /4111 ancestor secret/u);
+  assert.doesNotMatch(snapshot.tree, /4111 ancestor secret/u);
+});
+
+test("findElements resolves aria-labelledby, element.labels, explicit labels, wrapping labels, and placeholders", () => {
+  const ariaFirst = createElement("span", { attributes: { id: "billing" }, text: "Billing" });
+  const ariaSecond = createElement("span", { attributes: { id: "email" }, text: "email" });
+  const ariaInput = createElement("input", {
+    attributes: { "aria-labelledby": "billing email", type: "text" }
+  });
+  const ariaHarness = createA11yHarness([ariaFirst, ariaSecond, ariaInput]);
+  assert.equal(
+    ariaHarness.find({ query: "billing email", role: "textbox" }).matches[0]?.name,
+    "Billing email"
+  );
+
+  const associatedLabel = createElement("label", { text: "Account alias" });
+  const labelsInput = createElement("input", {
+    attributes: { type: "text" },
+    labels: [associatedLabel]
+  });
+  const labelsHarness = createA11yHarness([associatedLabel, labelsInput]);
+  assert.equal(
+    labelsHarness.find({ query: "account alias", role: "textbox" }).matches[0]?.name,
+    "Account alias"
+  );
+
+  const explicitLabel = createElement("label", {
+    attributes: { for: "customer-id" },
+    text: "Customer identifier"
+  });
+  const explicitInput = createElement("input", {
+    attributes: { id: "customer-id", type: "text" }
+  });
+  const explicitHarness = createA11yHarness([explicitLabel, explicitInput]);
+  assert.equal(
+    explicitHarness.find({ query: "customer identifier", role: "textbox" }).matches[0]?.name,
+    "Customer identifier"
+  );
+
+  const wrappedInput = createElement("input", { attributes: { type: "text" } });
+  const wrappingLabel = createElement("label", {
+    children: [createElement("span", { text: "Delivery address" }), wrappedInput]
+  });
+  const wrappingHarness = createA11yHarness([wrappingLabel]);
+  assert.equal(
+    wrappingHarness.find({ query: "delivery address", role: "textbox" }).matches[0]?.name,
+    "Delivery address"
+  );
+
+  const placeholderHarness = createA11yHarness([
+    createElement("input", { attributes: { placeholder: "Search invoices", type: "text" } })
+  ]);
+  assert.equal(
+    placeholderHarness.find({ query: "search invoices", role: "textbox" }).matches[0]?.name,
+    "Search invoices"
+  );
+});
+
 test("findElements bounds hostile nesting without overflowing the isolated world", () => {
   let nested = createElement("button", { text: "Target beyond scan bound" });
   for (let index = 0; index < 10001; index += 1) {
@@ -460,6 +538,15 @@ function createA11yHarness(elements, {
   viewportHeight = 768,
   viewportWidth = 1024
 } = {}) {
+  const allElements = [];
+  const collectStack = [...elements].reverse();
+  while (collectStack.length > 0) {
+    const element = collectStack.pop();
+    allElements.push(element);
+    for (let index = (element.children?.length ?? 0) - 1; index >= 0; index -= 1) {
+      collectStack.push(element.children[index]);
+    }
+  }
   const document = {
     activeElement,
     body: {
@@ -480,7 +567,15 @@ function createA11yHarness(elements, {
       scrollHeight: documentHeight,
       scrollWidth: documentWidth
     },
-    querySelector: (selector) => selectors[selector] ?? null,
+    getElementById: (id) => allElements.find((element) => element.id === id) ?? null,
+    querySelector: (selector) => {
+      if (selectors[selector]) return selectors[selector];
+      const labelFor = /^label\[for="(.+)"\]$/u.exec(selector);
+      if (labelFor) {
+        return allElements.find((element) => element.tagName === "LABEL" && element.getAttribute("for") === labelFor[1]) ?? null;
+      }
+      return null;
+    },
     title: "A11y test"
   };
   for (const element of elements) attachElement(element, document, null);
@@ -543,6 +638,7 @@ function createElement(tagName, {
   attributes = {},
   children = [],
   disabled = false,
+  labels = [],
   readOnly = false,
   selectionEnd = 0,
   selectionStart = 0,
@@ -556,9 +652,10 @@ function createElement(tagName, {
     childNodes: [...(textNode ? [textNode] : []), ...children],
     children,
     disabled,
-    id: "",
+    id: attributes.id ?? "",
     isConnected: true,
     isContentEditable: false,
+    labels,
     ownerDocument: null,
     readOnly,
     selectionEnd,
@@ -581,6 +678,14 @@ function createElement(tagName, {
     },
     getRootNode() {
       return this.ownerDocument;
+    },
+    closest(selector) {
+      let current = this;
+      while (current) {
+        if (selector === "label" && current.tagName === "LABEL") return current;
+        current = current.parentElement;
+      }
+      return null;
     },
     hasAttribute(name) {
       return attrs.has(name);

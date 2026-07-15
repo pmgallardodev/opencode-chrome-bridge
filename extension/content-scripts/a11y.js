@@ -111,10 +111,73 @@ if (!window.__opencodeA11yInstalled) {
     return text.trim();
   }
 
+  const CONTAINER_ROLES = new Set([
+    "main", "form", "navigation", "region", "article", "banner", "contentinfo", "table", "list", "complementary", "generic"
+  ]);
+  const MAX_SAFE_TEXT_NODES = 1000;
+  const MAX_SAFE_TEXT_DEPTH = 100;
+
+  function safeElementText(root, max = 200, includeDescendants = true) {
+    if (!root || isSensitiveField(root)) return "";
+    const parts = [];
+    const stack = [{ element: root, depth: 0 }];
+    let visited = 0;
+    let length = 0;
+    while (stack.length > 0 && visited < MAX_SAFE_TEXT_NODES && length <= max) {
+      const { element, depth } = stack.pop();
+      visited += 1;
+      if (isSensitiveField(element)) continue;
+      for (const node of element.childNodes ?? []) {
+        if (node.nodeType !== Node.TEXT_NODE) continue;
+        const value = String(node.textContent ?? "").trim();
+        if (!value) continue;
+        parts.push(value);
+        length += value.length + 1;
+        if (length > max) break;
+      }
+      if (!includeDescendants || depth >= MAX_SAFE_TEXT_DEPTH || length > max) continue;
+      const children = element.children ?? [];
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        stack.push({ element: children[index], depth: depth + 1 });
+      }
+      const shadowChildren = shadowRootOf(element)?.children ?? [];
+      for (let index = shadowChildren.length - 1; index >= 0; index -= 1) {
+        stack.push({ element: shadowChildren[index], depth: depth + 1 });
+      }
+    }
+    return truncate(parts.join(" "), max);
+  }
+
+  function ariaLabelledByText(element) {
+    const ids = (element.getAttribute("aria-labelledby") || "").trim().split(/\s+/u).filter(Boolean).slice(0, 20);
+    const parts = [];
+    for (const id of ids) {
+      if (id.length > 128) continue;
+      const labelled = element.ownerDocument.getElementById(id);
+      const text = safeElementText(labelled, 200);
+      if (text) parts.push(text);
+    }
+    return truncate(parts.join(" "), 200);
+  }
+
   function labelText(element) {
-    if (!element.id) return "";
-    const label = element.ownerDocument.querySelector(`label[for="${CSS.escape(element.id)}"]`);
-    return label ? ownText(label) || label.textContent.trim() : "";
+    const labels = [];
+    for (const label of Array.from(element.labels ?? []).slice(0, 20)) labels.push(label);
+    if (element.id) {
+      const explicit = element.ownerDocument.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+      if (explicit) labels.push(explicit);
+    }
+    const wrapping = element.closest?.("label");
+    if (wrapping) labels.push(wrapping);
+    const seen = new Set();
+    const parts = [];
+    for (const label of labels) {
+      if (!label || seen.has(label)) continue;
+      seen.add(label);
+      const text = safeElementText(label, 200);
+      if (text) parts.push(text);
+    }
+    return truncate(parts.join(" "), 200);
   }
 
   function truncate(value, max = 120) {
@@ -125,6 +188,8 @@ if (!window.__opencodeA11yInstalled) {
   function accessibleName(element, role) {
     const aria = element.getAttribute("aria-label");
     if (aria && aria.trim()) return truncate(aria);
+    const labelledBy = ariaLabelledByText(element);
+    if (labelledBy) return labelledBy;
     const tag = element.tagName.toLowerCase();
 
     if (tag === "input" || tag === "textarea" || tag === "select") {
@@ -135,7 +200,8 @@ if (!window.__opencodeA11yInstalled) {
       if (external) return truncate(external);
       if (tag === "select") {
         const selected = element.options?.[element.selectedIndex];
-        if (selected?.textContent) return truncate(selected.textContent);
+        const selectedText = safeElementText(selected);
+        if (selectedText) return selectedText;
       }
       const type = (element.getAttribute("type") || "").toLowerCase();
       if (type === "submit" && element.value) return truncate(element.value);
@@ -146,10 +212,8 @@ if (!window.__opencodeA11yInstalled) {
     const title = element.getAttribute("title");
     if (title && title.trim()) return truncate(title);
     // Structural containers would otherwise inherit the whole page text as
-    // their name; only leaf-like roles fall back to full textContent.
-    const CONTAINER_ROLES = ["main", "form", "navigation", "region", "article", "banner", "contentinfo", "table", "list", "complementary", "generic"];
-    const text = CONTAINER_ROLES.includes(role) ? ownText(element) : (ownText(element) || element.textContent || "");
-    return truncate(text);
+    // their name; only leaf-like roles include bounded descendant text.
+    return safeElementText(element, 120, !CONTAINER_ROLES.has(role));
   }
 
   function isInteractiveElement(element, role) {
@@ -160,7 +224,7 @@ if (!window.__opencodeA11yInstalled) {
     return String(value ?? "")
       .normalize("NFKD")
       .replace(/\p{M}+/gu, "")
-      .toLocaleLowerCase()
+      .toLowerCase()
       .replace(/[^\p{L}\p{N}]+/gu, " ")
       .replace(/\s+/gu, " ")
       .trim();
@@ -620,7 +684,7 @@ if (!window.__opencodeA11yInstalled) {
           const name = accessibleName(element, role);
           const label = labelText(element);
           const placeholder = element.getAttribute("placeholder") || "";
-          const text = truncate(ownText(element) || element.textContent || "", 200);
+          const text = safeElementText(element, 200, !CONTAINER_ROLES.has(role));
           const weightedFields = [
             [ref, 120],
             [role, 20],
