@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
+import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/opencode-plugin.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const backgroundSource = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
@@ -218,6 +219,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   assert.ok(result.capabilities.includes("bridge.handshake"));
   assert.equal(JSON.stringify(result.capabilities), JSON.stringify([...result.capabilities].sort()));
   assert.equal(new Set(result.capabilities).size, result.capabilities.length);
+  assert.equal(JSON.stringify(result.capabilities), JSON.stringify(ALL_TOOL_REQUIRED_CAPABILITIES));
 });
 
 test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {

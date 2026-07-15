@@ -88,7 +88,8 @@ try {
   const response = await statusRequest;
   const payload = await response.json();
   if (!response.ok || payload.ok !== true) throw new Error(`Unexpected status response: ${JSON.stringify(payload)}`);
-  if (payload.connected !== true || payload.compatible !== true || payload.extension?.extensionId !== "smoke-extension") {
+  if (payload.connected !== true || payload.compatible !== true || payload.hostReachable !== true
+    || payload.legacy !== false || payload.extension?.extensionId !== "smoke-extension") {
     throw new Error(`Bridge status did not negotiate the extension: ${JSON.stringify(payload)}`);
   }
   if (payload.host?.version !== "1.1.0" || payload.client?.version !== "1.1.0") {
@@ -128,6 +129,7 @@ try {
   }
   const disconnectedPayload = await (await disconnectedRequest).json();
   if (disconnectedPayload.connected !== false || disconnectedPayload.compatible !== false
+    || disconnectedPayload.hostReachable !== true || disconnectedPayload.legacy !== false
     || disconnectedPayload.diagnostics?.[0]?.code !== "EXTENSION_DISCONNECTED") {
     throw new Error(`Expected a disconnected extension status: ${JSON.stringify(disconnectedPayload)}`);
   }

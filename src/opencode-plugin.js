@@ -69,6 +69,10 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 });
 
+export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
+  [...new Set(Object.values(TOOL_CAPABILITY_REQUIREMENTS).flat())].sort()
+);
+
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
   const schema = tool.schema;
@@ -79,7 +83,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "Check whether the local OpenCode Chrome Bridge native host is reachable.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeStatus(), null, 2);
+          return JSON.stringify(await bridgeStatus(ALL_TOOL_REQUIRED_CAPABILITIES), null, 2);
         }
       }),
       chrome_tabs: tool({

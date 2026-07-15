@@ -19,6 +19,7 @@ const pluginModule = await import("../src/opencode-plugin.js");
 const { requireBridgeCapabilities, validateBridgeStatus } = bridgeClient;
 const OpenCodeChromeBridgePlugin = pluginModule.default;
 const TOOL_CAPABILITY_REQUIREMENTS = pluginModule.TOOL_CAPABILITY_REQUIREMENTS;
+const ALL_TOOL_REQUIRED_CAPABILITIES = pluginModule.ALL_TOOL_REQUIRED_CAPABILITIES;
 
 after(async () => {
   if (previousStateDir === undefined) delete process.env.OPENCODE_CHROME_BRIDGE_STATE_DIR;
@@ -88,6 +89,8 @@ const EXPECTED_TOOL_CAPABILITIES = {
 function compatibleStatus(overrides = {}) {
   return {
     ok: true,
+    hostReachable: true,
+    legacy: false,
     connected: true,
     compatible: true,
     host: {
@@ -152,8 +155,83 @@ test("bridge status compatibility requires an empty diagnostics list", async () 
   );
   assert.throws(
     () => validateBridgeStatus(compatibleStatus({ compatible: false })),
-    /compatibility is inconsistent/iu
+    /compatibility is inconsistent|diagnostics are required/iu
   );
+});
+
+test("disconnected and incompatible status payloads require diagnostics", () => {
+  assert.throws(
+    () => validateBridgeStatus(compatibleStatus({ connected: false, compatible: false, extension: null, diagnostics: [] })),
+    /diagnostics.*required|require.*diagnostics/iu
+  );
+  assert.throws(
+    () => validateBridgeStatus(compatibleStatus({
+      compatible: false,
+      diagnostics: [],
+      extension: { ...compatibleStatus().extension, protocolVersion: "2.0.0" }
+    })),
+    /diagnostics.*required|require.*diagnostics/iu
+  );
+});
+
+test("legacy host status is distinct from a current host with a disconnected extension", async () => {
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    { ok: true, pid: 101, pending: 0 },
+    compatibleStatus({
+      connected: false,
+      compatible: false,
+      extension: null,
+      diagnostics: [{
+        code: "EXTENSION_DISCONNECTED",
+        message: "The Chrome extension did not answer the handshake.",
+        repair: "Reload Chrome."
+      }]
+    })
+  ];
+  globalThis.fetch = async () => new Response(JSON.stringify(responses.shift()), {
+    headers: { "Content-Type": "application/json" },
+    status: 200
+  });
+  try {
+    const legacy = await bridgeClient.bridgeStatus(["bridge.handshake", "browser.tabs"]);
+    assert.equal(legacy.hostReachable, true);
+    assert.equal(legacy.legacy, true);
+    assert.equal(legacy.connected, false);
+    assert.equal(legacy.compatible, false);
+    assert.equal(legacy.diagnostics[0].code, "HOST_HANDSHAKE_MISSING");
+    assert.deepEqual(legacy.missingCapabilities, ["bridge.handshake", "browser.tabs"]);
+    await assert.rejects(
+      () => requireBridgeCapabilities(["browser.tabs"], legacy),
+      /native host.*outdated.*install:native/isu
+    );
+
+    const disconnected = await bridgeClient.bridgeStatus(["bridge.handshake", "browser.tabs"]);
+    assert.equal(disconnected.hostReachable, true);
+    assert.equal(disconnected.legacy, false);
+    assert.equal(disconnected.connected, false);
+    assert.equal(disconnected.diagnostics[0].code, "EXTENSION_DISCONNECTED");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("legacy host recognition rejects lookalike payloads with extra fields", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ok: true,
+    pending: 0,
+    pid: 101,
+    token: "must-not-be-normalized"
+  }), { headers: { "Content-Type": "application/json" }, status: 200 });
+  try {
+    await assert.rejects(
+      () => bridgeClient.bridgeStatus(["bridge.handshake"]),
+      /connected must be a boolean/u
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("required capabilities fail with sorted actionable names", async () => {
@@ -257,6 +335,34 @@ test("every public browser tool has an explicit exhaustive capability declaratio
 
   assert.deepEqual(Object.keys(TOOL_CAPABILITY_REQUIREMENTS ?? {}).sort(), publicTools);
   assert.deepEqual(TOOL_CAPABILITY_REQUIREMENTS, EXPECTED_TOOL_CAPABILITIES);
+  assert.deepEqual(
+    ALL_TOOL_REQUIRED_CAPABILITIES,
+    [...new Set(Object.values(EXPECTED_TOOL_CAPABILITIES).flat())].sort()
+  );
+});
+
+test("chrome_status requests the sorted union of every public tool capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const originalFetch = globalThis.fetch;
+  let requestedCapabilities;
+  globalThis.fetch = async (_url, options) => {
+    requestedCapabilities = options?.headers?.["X-OpenCode-Bridge-Capabilities"];
+    return new Response(JSON.stringify(compatibleStatus({
+      extension: {
+        ...compatibleStatus().extension,
+        capabilities: ALL_TOOL_REQUIRED_CAPABILITIES
+      }
+    })), {
+      headers: { "Content-Type": "application/json" },
+      status: 200
+    });
+  };
+  try {
+    await plugin.tool.chrome_status.execute({});
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requestedCapabilities, ALL_TOOL_REQUIRED_CAPABILITIES.join(","));
 });
 
 test("every browser tool fails before execution when its negotiated capability is missing", async () => {
@@ -269,9 +375,11 @@ test("every browser tool fails before execution when its negotiated capability i
   });
   const originalFetch = globalThis.fetch;
   let statusRequests = 0;
+  const requestedCapabilities = [];
   globalThis.fetch = async (_url, options) => {
     assert.equal(options?.method, "GET", "preflight must query status before a browser command");
     statusRequests += 1;
+    requestedCapabilities.push(options?.headers?.["X-OpenCode-Bridge-Capabilities"]);
     return new Response(JSON.stringify(statusWithoutToolCapabilities), {
       headers: { "Content-Type": "application/json" },
       status: 200
@@ -294,6 +402,7 @@ test("every browser tool fails before execution when its negotiated capability i
         name
       );
       assert.equal(asked, 1, `${name} must ask exactly once before capability preflight`);
+      assert.equal(requestedCapabilities.at(-1), required.join(","), `${name} must negotiate only its declared capabilities`);
     }
   } finally {
     globalThis.fetch = originalFetch;

@@ -9,6 +9,8 @@ const MAX_DATA_URL_BYTES = 10 * 1024 * 1024;
 const ALLOWED_DATA_URL_MIME_TYPES = new Set(["image/png", "image/jpeg"]);
 const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 const MAX_REQUEST_TIMEOUT_MS = 125000;
+const MAX_CAPABILITY_HEADER_CHARS = 10_000;
+const NATIVE_HOST_NAME = "com.opencode.chrome_bridge";
 export const BRIDGE_CLIENT_VERSION = "1.1.0";
 export const BRIDGE_PROTOCOL_MIN = "1.0.0";
 export const BRIDGE_PROTOCOL_MAX = "1.0.0";
@@ -42,14 +44,19 @@ export async function readBridgeState() {
   return state;
 }
 
-export async function bridgeStatus() {
+export async function bridgeStatus(requiredCapabilities = DEFAULT_REQUIRED_CAPABILITIES) {
+  const required = validateCapabilityList(requiredCapabilities, "required capabilities");
+  const capabilityHeader = required.join(",");
+  if (capabilityHeader.length > MAX_CAPABILITY_HEADER_CHARS) {
+    throw new Error("Bridge required capabilities are too large");
+  }
   const payload = await request("GET", "/status", undefined, {
-    "X-OpenCode-Bridge-Capabilities": DEFAULT_REQUIRED_CAPABILITIES.join(","),
+    "X-OpenCode-Bridge-Capabilities": capabilityHeader,
     "X-OpenCode-Bridge-Client-Version": BRIDGE_CLIENT_VERSION,
     "X-OpenCode-Bridge-Protocol-Max": BRIDGE_PROTOCOL_MAX,
     "X-OpenCode-Bridge-Protocol-Min": BRIDGE_PROTOCOL_MIN
   });
-  return validateBridgeStatus(payload);
+  return validateBridgeStatus(normalizeBridgeStatus(payload, required));
 }
 
 export function validateBridgeStatus(payload) {
@@ -59,11 +66,25 @@ export function validateBridgeStatus(payload) {
   if (payload.ok !== true) throw new Error("Bridge status did not report success");
   if (typeof payload.connected !== "boolean") throw new Error("Bridge status connected must be a boolean");
   if (typeof payload.compatible !== "boolean") throw new Error("Bridge status compatible must be a boolean");
+  const hostReachable = payload.hostReachable ?? true;
+  const legacy = payload.legacy ?? false;
+  if (typeof hostReachable !== "boolean") throw new Error("Bridge status hostReachable must be a boolean");
+  if (typeof legacy !== "boolean") throw new Error("Bridge status legacy must be a boolean");
   const host = validatePeer(payload.host, "host");
   const client = validatePeer(payload.client, "client");
   const extension = payload.extension === null ? null : validateExtension(payload.extension);
   const missingCapabilities = validateCapabilityList(payload.missingCapabilities, "missing capabilities");
   const diagnostics = validateDiagnostics(payload.diagnostics);
+
+  if ((!payload.connected || !payload.compatible) && diagnostics.length === 0) {
+    throw new Error("Bridge status diagnostics are required when disconnected or incompatible");
+  }
+  if (legacy && (!hostReachable || payload.connected || payload.compatible || extension !== null)) {
+    throw new Error("Legacy bridge status invariants are invalid");
+  }
+  if (legacy && !diagnostics.some((diagnostic) => diagnostic.code === "HOST_HANDSHAKE_MISSING")) {
+    throw new Error("Legacy bridge status must include HOST_HANDSHAKE_MISSING diagnostics");
+  }
 
   if (payload.connected && extension === null) {
     throw new Error("Connected bridge status must include the extension handshake");
@@ -91,21 +112,26 @@ export function validateBridgeStatus(payload) {
     diagnostics,
     extension,
     host,
+    hostReachable,
+    legacy,
     missingCapabilities
   };
 }
 
 export async function requireBridgeCapabilities(requiredCapabilities, suppliedStatus) {
   const required = validateCapabilityList(requiredCapabilities, "required capabilities");
-  const status = validateBridgeStatus(suppliedStatus ?? await bridgeStatus());
+  const status = validateBridgeStatus(suppliedStatus ?? await bridgeStatus(required));
   const repair = status.diagnostics
     .map((diagnostic) => diagnostic.repair)
     .filter(Boolean)
     .join(" ");
+  if (status.legacy) {
+    throw new Error(`OpenCode Chrome Bridge native host is outdated and does not support capability negotiation. ${repair || "Run npm run install:native to update it."}`);
+  }
   if (!status.connected) {
     throw new Error(`OpenCode Chrome Bridge is not connected. ${repair || "Reload Chrome or reinstall the native host."}`);
   }
-  const available = new Set(status.extension.capabilities);
+  const available = new Set(status.extension?.capabilities ?? []);
   const missing = [...new Set([
     ...status.missingCapabilities,
     ...required.filter((capability) => !available.has(capability))
@@ -115,6 +141,52 @@ export async function requireBridgeCapabilities(requiredCapabilities, suppliedSt
     throw new Error(`OpenCode Chrome Bridge is incompatible.${detail} ${repair || "Update the extension and native host together."}`);
   }
   return status;
+}
+
+function normalizeBridgeStatus(payload, requiredCapabilities) {
+  if (!isLegacyBridgeStatus(payload)) return payload;
+  return {
+    client: {
+      name: "opencode-plugin",
+      protocolMax: BRIDGE_PROTOCOL_MAX,
+      protocolMin: BRIDGE_PROTOCOL_MIN,
+      version: BRIDGE_CLIENT_VERSION
+    },
+    compatible: false,
+    connected: false,
+    diagnostics: [{
+      code: "HOST_HANDSHAKE_MISSING",
+      message: "The reachable native host predates bridge capability negotiation.",
+      repair: "Run npm run install:native from the current OpenCode Chrome Bridge checkout."
+    }],
+    extension: null,
+    host: {
+      name: NATIVE_HOST_NAME,
+      protocolMax: "0.0.0",
+      protocolMin: "0.0.0",
+      version: "0.0.0"
+    },
+    hostReachable: true,
+    legacy: true,
+    missingCapabilities: [...requiredCapabilities],
+    ok: true,
+    pending: payload.pending,
+    pid: payload.pid
+  };
+}
+
+function isLegacyBridgeStatus(payload) {
+  return payload !== null
+    && typeof payload === "object"
+    && !Array.isArray(payload)
+    && JSON.stringify(Object.keys(payload).sort()) === JSON.stringify(["ok", "pending", "pid"])
+    && payload.ok === true
+    && payload.connected === undefined
+    && payload.compatible === undefined
+    && Number.isInteger(payload.pid)
+    && payload.pid >= 0
+    && Number.isInteger(payload.pending)
+    && payload.pending >= 0;
 }
 
 export async function bridgeCommand(method, params = {}, options = {}) {

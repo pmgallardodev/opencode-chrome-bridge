@@ -212,6 +212,8 @@ async function negotiateStatus(req) {
     diagnostics,
     extension,
     host: hostHandshake(),
+    hostReachable: true,
+    legacy: false,
     missingCapabilities,
     ok: true,
     pending: pending.size,
