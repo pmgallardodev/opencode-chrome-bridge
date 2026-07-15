@@ -1,7 +1,13 @@
 import path from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { bridgeCommand, bridgeStatus, writeDataUrlToFile, pollEvents } from "./bridge-client.js";
+import {
+  bridgeCommand,
+  bridgeStatus,
+  pollEvents,
+  requireBridgeCapabilities,
+  writeDataUrlToFile
+} from "./bridge-client.js";
 
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
@@ -747,11 +753,41 @@ function requireApprovals(tools) {
           always: [name],
           metadata: describe(args)
         });
+        await requireBridgeCapabilities(requiredCapabilitiesForTool(name));
         return run(args, context);
       }
     };
   }
   return guarded;
+}
+
+function requiredCapabilitiesForTool(name) {
+  const capability = name.includes("bookmark")
+    ? "browser.bookmarks"
+    : name.includes("history")
+      ? "browser.history"
+      : name.includes("download")
+        ? "browser.downloads"
+        : name.includes("tab_group")
+          ? "browser.tab-groups"
+          : name.includes("window")
+            ? "browser.windows"
+            : name.includes("screenshot")
+              ? "browser.screenshots"
+              : name.includes("console")
+                ? "browser.console"
+                : name.includes("cdp")
+                  ? "browser.cdp"
+                  : name.includes("accessibility") || name.endsWith("_element")
+                    ? "browser.accessibility"
+                    : name === "chrome_events"
+                      ? "browser.events"
+                      : name.includes("claim_tab") || name.includes("finalize_tabs") || name.includes("end_turn")
+                        ? "session.tab-leases"
+                        : name === "chrome_open" || name === "chrome_reload" || name === "chrome_back" || name === "chrome_forward"
+                          ? "browser.navigation"
+                          : "browser.tabs";
+  return ["bridge.handshake", capability].sort();
 }
 
 function previewText(value) {

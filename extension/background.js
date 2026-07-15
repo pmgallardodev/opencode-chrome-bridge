@@ -1,4 +1,21 @@
 const HOST_NAME = "com.opencode.chrome_bridge";
+const BRIDGE_PROTOCOL_VERSION = "1.0.0";
+const BRIDGE_CAPABILITIES = Object.freeze([
+  "bridge.handshake",
+  "browser.accessibility",
+  "browser.bookmarks",
+  "browser.cdp",
+  "browser.console",
+  "browser.downloads",
+  "browser.events",
+  "browser.history",
+  "browser.navigation",
+  "browser.screenshots",
+  "browser.tab-groups",
+  "browser.tabs",
+  "browser.windows",
+  "session.tab-leases"
+]);
 const RECONNECT_ALARM = "opencode-chrome-bridge-reconnect";
 const DEBUGGER_VERSION = "1.3";
 const OVERLAY_SOURCE = "opencode-bridge";
@@ -60,11 +77,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // (bridgeReady event) or sends any other message. Once ready, an active
     // ping/pong round trip also detects a host that is present but wedged.
     if (nativePort === null || !nativeHostReady) {
-      sendResponse({ connected: false });
+      sendResponse(disconnectedPopupStatus());
       return false;
     }
     pingNativeHost().then((pong) => {
-      sendResponse({ connected: pong });
+      sendResponse(popupStatusFromPong(pong));
     });
     return true;
   }
@@ -107,22 +124,100 @@ let pingSeq = 1;
 
 function pingNativeHost(timeoutMs = 1000) {
   const port = nativePort;
-  if (!port) return Promise.resolve(false);
+  if (!port) return Promise.resolve(null);
   return new Promise((resolve) => {
     const id = `ping:${pingSeq++}`;
     const timer = setTimeout(() => {
       pendingPings.delete(id);
-      resolve(false);
+      resolve(null);
     }, timeoutMs);
     pendingPings.set(id, { resolve, timer });
     try {
-      port.postMessage({ type: "ping", id });
+      port.postMessage({ type: "ping", id, handshake: createExtensionHandshake() });
     } catch {
       pendingPings.delete(id);
       clearTimeout(timer);
-      resolve(false);
+      resolve(null);
     }
   });
+}
+
+function createExtensionHandshake() {
+  const manifest = chrome.runtime.getManifest();
+  return {
+    capabilities: [...BRIDGE_CAPABILITIES],
+    extensionId: chrome.runtime.id,
+    extensionName: manifest.name,
+    extensionVersion: manifest.version,
+    hostName: HOST_NAME,
+    protocolVersion: BRIDGE_PROTOCOL_VERSION
+  };
+}
+
+function disconnectedPopupStatus() {
+  return {
+    compatible: false,
+    connected: false,
+    diagnostics: [{
+      code: "EXTENSION_DISCONNECTED",
+      message: "The native host is not connected.",
+      repair: "Reload the extension or reinstall the native host."
+    }],
+    extension: createExtensionHandshake(),
+    host: null,
+    missingCapabilities: []
+  };
+}
+
+function popupStatusFromPong(host) {
+  if (host === null) return disconnectedPopupStatus();
+  const validHost = isVersionString(host.version)
+    && isVersionString(host.protocolMin)
+    && isVersionString(host.protocolMax)
+    && host.name === HOST_NAME;
+  if (!validHost) {
+    return {
+      ...disconnectedPopupStatus(),
+      connected: true,
+      diagnostics: [{
+        code: "HOST_HANDSHAKE_MISSING",
+        message: "The native host does not support protocol negotiation.",
+        repair: "Reinstall the current native host."
+      }]
+    };
+  }
+  const protocolCompatible = compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMin) >= 0
+    && compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMax) <= 0;
+  return {
+    compatible: protocolCompatible,
+    connected: true,
+    diagnostics: protocolCompatible ? [] : [{
+      code: "PROTOCOL_INCOMPATIBLE",
+      message: `Extension protocol ${BRIDGE_PROTOCOL_VERSION} is outside the host range ${host.protocolMin}-${host.protocolMax}.`,
+      repair: "Update the extension and native host together."
+    }],
+    extension: createExtensionHandshake(),
+    host: {
+      name: host.name,
+      protocolMax: host.protocolMax,
+      protocolMin: host.protocolMin,
+      version: host.version
+    },
+    missingCapabilities: []
+  };
+}
+
+function isVersionString(value) {
+  return typeof value === "string" && /^\d+\.\d+\.\d+$/u.test(value);
+}
+
+function compareVersions(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
 }
 
 function scheduleReconnect() {
@@ -141,7 +236,7 @@ async function handleNativeMessage(message) {
     if (pending) {
       pendingPings.delete(message.id);
       clearTimeout(pending.timer);
-      pending.resolve(true);
+      pending.resolve(message.host ?? {});
     }
     return;
   }
@@ -176,6 +271,8 @@ function postNativeResponse(message) {
 
 async function executeCommand(method, params) {
   switch (method) {
+    case "handshake":
+      return createExtensionHandshake();
     case "status":
       return { connected: true, extensionId: chrome.runtime.id, hostName: HOST_NAME };
     case "listTabs":

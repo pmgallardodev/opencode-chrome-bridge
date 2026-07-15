@@ -65,13 +65,72 @@ try {
     throw new Error(`Expected bad JSON command to return 400, got ${badJsonResponse.status}`);
   }
 
-  const response = await fetch(`http://127.0.0.1:${state.port}/status`, {
+  const statusRequest = fetch(`http://127.0.0.1:${state.port}/status`, {
     headers: { Authorization: `Bearer ${state.token}` }
   });
+  const handshakeCommand = await readNativeMessage();
+  if (handshakeCommand.type !== "command" || handshakeCommand.method !== "handshake") {
+    throw new Error(`Expected a handshake command for bridge status, got: ${JSON.stringify(handshakeCommand)}`);
+  }
+  await writeNativeMessage(child.stdin, {
+    type: "response",
+    id: handshakeCommand.id,
+    ok: true,
+    result: {
+      capabilities: ["bridge.handshake", "browser.tabs"],
+      extensionId: "smoke-extension",
+      extensionName: "OpenCode Chrome Bridge",
+      extensionVersion: "1.1.0",
+      hostName: "com.opencode.chrome_bridge",
+      protocolVersion: "1.0.0"
+    }
+  });
+  const response = await statusRequest;
   const payload = await response.json();
   if (!response.ok || payload.ok !== true) throw new Error(`Unexpected status response: ${JSON.stringify(payload)}`);
+  if (payload.connected !== true || payload.compatible !== true || payload.extension?.extensionId !== "smoke-extension") {
+    throw new Error(`Bridge status did not negotiate the extension: ${JSON.stringify(payload)}`);
+  }
+  if (payload.host?.version !== "1.1.0" || payload.client?.version !== "1.1.0") {
+    throw new Error(`Bridge status did not report host/client versions: ${JSON.stringify(payload)}`);
+  }
   if (response.headers.get("cache-control") !== "no-store") throw new Error("Status response must disable caching");
   if (response.headers.get("x-content-type-options") !== "nosniff") throw new Error("Status response must disable MIME sniffing");
+
+  const incompatibleRequest = fetch(`http://127.0.0.1:${state.port}/status`, {
+    headers: { Authorization: `Bearer ${state.token}` }
+  });
+  const incompatibleHandshake = await readNativeMessage();
+  await writeNativeMessage(child.stdin, {
+    type: "response",
+    id: incompatibleHandshake.id,
+    ok: true,
+    result: {
+      capabilities: ["bridge.handshake"],
+      extensionId: "old-extension",
+      extensionVersion: "2.0.0",
+      hostName: "com.opencode.chrome_bridge",
+      protocolVersion: "2.0.0"
+    }
+  });
+  const incompatiblePayload = await (await incompatibleRequest).json();
+  if (incompatiblePayload.connected !== true || incompatiblePayload.compatible !== false
+    || incompatiblePayload.diagnostics?.[0]?.code !== "PROTOCOL_INCOMPATIBLE") {
+    throw new Error(`Expected a connected incompatible extension status: ${JSON.stringify(incompatiblePayload)}`);
+  }
+
+  const disconnectedRequest = fetch(`http://127.0.0.1:${state.port}/status`, {
+    headers: { Authorization: `Bearer ${state.token}` }
+  });
+  const disconnectedHandshake = await readNativeMessage();
+  if (disconnectedHandshake.method !== "handshake") {
+    throw new Error(`Expected a handshake command for disconnected status, got: ${JSON.stringify(disconnectedHandshake)}`);
+  }
+  const disconnectedPayload = await (await disconnectedRequest).json();
+  if (disconnectedPayload.connected !== false || disconnectedPayload.compatible !== false
+    || disconnectedPayload.diagnostics?.[0]?.code !== "EXTENSION_DISCONNECTED") {
+    throw new Error(`Expected a disconnected extension status: ${JSON.stringify(disconnectedPayload)}`);
+  }
 
   const commandRequest = fetch(`http://127.0.0.1:${state.port}/command`, {
     method: "POST",

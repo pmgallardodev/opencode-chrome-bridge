@@ -28,10 +28,14 @@ async function refresh(attempt = 1) {
 
     const response = await chrome.runtime.sendMessage({ type: "GET_BRIDGE_STATUS" });
     const connected = response?.connected === true;
+    const compatible = connected && response?.compatible === true;
+    const diagnostic = formatDiagnostic(response?.diagnostics);
     setStatus(
-      connected,
-      connected ? "Connected" : "Disconnected",
-      connected ? "Ready for OpenCode browser tools" : "Reload the extension or reinstall the native host"
+      compatible,
+      compatible ? "Connected" : connected ? "Update required" : "Disconnected",
+      compatible
+        ? "Ready for OpenCode browser tools"
+        : diagnostic ?? (connected ? "Update the extension and native host together" : "Reload the extension or reinstall the native host")
     );
     // The native host announces itself shortly after the service worker
     // connects; re-check briefly before settling on a disconnected verdict.
@@ -41,6 +45,14 @@ async function refresh(attempt = 1) {
   } catch (error) {
     setStatus(false, "Unavailable", error?.message ?? String(error));
   }
+}
+
+function formatDiagnostic(diagnostics) {
+  if (!Array.isArray(diagnostics) || diagnostics.length === 0) return null;
+  const first = diagnostics[0];
+  if (!first || typeof first.message !== "string") return null;
+  const repair = typeof first.repair === "string" ? ` ${first.repair}` : "";
+  return `${first.message}${repair}`;
 }
 
 function setStatus(connected, label, detailText) {

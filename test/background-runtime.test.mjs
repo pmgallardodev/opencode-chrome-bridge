@@ -206,6 +206,20 @@ test("bridge status reports connected only after the native host sends a message
   assert.equal(await harness.bridgeStatus(), true);
 });
 
+test("extension handshake exposes a stable sorted capability contract", async () => {
+  const harness = createBackgroundHarness();
+
+  const result = await harness.execute("handshake", {});
+
+  assert.equal(result.extensionId, "test-extension");
+  assert.equal(result.extensionVersion, "1.1.0");
+  assert.equal(result.hostName, "com.opencode.chrome_bridge");
+  assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
+  assert.ok(result.capabilities.includes("bridge.handshake"));
+  assert.equal(JSON.stringify(result.capabilities), JSON.stringify([...result.capabilities].sort()));
+  assert.equal(new Set(result.capabilities).size, result.capabilities.length);
+});
+
 test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {
   let tabGone = false;
   const harness = createBackgroundHarness({
@@ -910,6 +924,7 @@ function createBackgroundHarness({
     history: { search: async () => [] },
     runtime: {
       connectNative: () => nativePort,
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.1.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,
