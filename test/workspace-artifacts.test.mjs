@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdtemp,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -137,34 +138,73 @@ test("workspace artifact writing aborts and cleans up when the output directory 
   const movedDirectory = path.join(parentDirectory, "browser-moved");
   await mkdir(outputDirectory, { recursive: true });
 
+  const probePath = path.join(projectDirectory, "file-handle-probe");
+  const probe = await open(probePath, "w");
+  const fileHandlePrototype = Object.getPrototypeOf(probe);
+  const originalWriteFile = fileHandlePrototype.writeFile;
+  await probe.close();
+  await rm(probePath, { force: true });
+
+  let signalWriteStarted;
+  const writeStarted = new Promise((resolve) => {
+    signalWriteStarted = resolve;
+  });
+  let releaseWrite;
+  const writeBarrier = new Promise((resolve) => {
+    releaseWrite = resolve;
+  });
+  let barrierReleased = false;
+  const releaseBarrier = () => {
+    if (barrierReleased) return;
+    barrierReleased = true;
+    releaseWrite();
+  };
+  let intercepted = false;
+  fileHandlePrototype.writeFile = async function (...args) {
+    const result = await originalWriteFile.apply(this, args);
+    if (!intercepted) {
+      intercepted = true;
+      signalWriteStarted();
+      await writeBarrier;
+    }
+    return result;
+  };
+  t.after(() => {
+    fileHandlePrototype.writeFile = originalWriteFile;
+    releaseBarrier();
+  });
+
   const writing = writeWorkspaceTextArtifact({
     outputDirectory: "artifacts/browser",
     prefix: "tab-context",
     projectDirectory,
-    text: "x".repeat(2 * 1024 * 1024)
+    text: "race coverage"
   });
-  // Attach a rejection handler immediately while polling for the exclusive
-  // temporary file so a fast failure cannot become an unhandled rejection.
   void writing.catch(() => {});
-  let observedTemporary = false;
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    const entries = [
-      ...await readdir(projectDirectory),
-      ...await readdir(outputDirectory)
-    ];
-    if (entries.some((entry) => entry.endsWith(".tmp"))) {
-      observedTemporary = true;
-      break;
+  try {
+    await writeStarted;
+    await rename(outputDirectory, movedDirectory);
+    try {
+      await symlink(outsideDirectory, outputDirectory, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (error?.code === "EPERM") {
+        t.skip("creating directory symlinks requires elevated Windows privileges");
+        releaseBarrier();
+        await writing.catch(() => {});
+        return;
+      }
+      throw error;
     }
-    await new Promise((resolve) => setImmediate(resolve));
+    releaseBarrier();
+    await assert.rejects(writing, /output directory changed during artifact write/u);
+    assert.deepEqual(await readdir(outsideDirectory), []);
+    assert.deepEqual(await readdir(movedDirectory), []);
+    assert.equal((await readdir(projectDirectory)).some((entry) => entry.endsWith(".tmp")), false);
+  } finally {
+    fileHandlePrototype.writeFile = originalWriteFile;
+    releaseBarrier();
+    await writing.catch(() => {});
   }
-  assert.equal(observedTemporary, true, "exclusive temporary file was not observed");
-  await rename(outputDirectory, movedDirectory);
-  await symlink(outsideDirectory, outputDirectory, process.platform === "win32" ? "junction" : "dir");
-  await assert.rejects(writing, /output directory changed during artifact write/u);
-  assert.deepEqual(await readdir(outsideDirectory), []);
-  assert.deepEqual(await readdir(movedDirectory), []);
-  assert.equal((await readdir(projectDirectory)).some((entry) => entry.endsWith(".tmp")), false);
 });
 
 test("oversized context text is replaced with a preview and a workspace artifact", async (t) => {

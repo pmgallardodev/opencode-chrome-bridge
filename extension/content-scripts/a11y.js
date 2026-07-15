@@ -294,7 +294,7 @@ if (!window.__opencodeA11yInstalled) {
 
   function rangeSelectionDetails(browserSelection) {
     if (typeof browserSelection.getRangeAt !== "function") {
-      return { intersected: false, refs: [], sensitive: false };
+      return { intersected: false, refs: [], refsTruncated: false, sensitive: false };
     }
     const ranges = [];
     for (let index = 0; index < browserSelection.rangeCount; index += 1) {
@@ -303,11 +303,14 @@ if (!window.__opencodeA11yInstalled) {
         if (range && typeof range.intersectsNode === "function") ranges.push(range);
       } catch {}
     }
-    if (ranges.length === 0) return { intersected: false, refs: [], sensitive: false };
+    if (ranges.length === 0) {
+      return { intersected: false, refs: [], refsTruncated: false, sensitive: false };
+    }
 
     const refs = [];
     const seenRefs = new Set();
     let intersected = false;
+    let refsTruncated = false;
     let sensitive = false;
     let visited = 0;
 
@@ -333,11 +336,12 @@ if (!window.__opencodeA11yInstalled) {
         if (selected) {
           intersected = true;
           if (hasSensitiveAncestor(element)) sensitive = true;
-          if (refs.length < MAX_SELECTED_ELEMENT_REFS && isMeaningfulSelectionElement(element)) {
+          if (isMeaningfulSelectionElement(element)) {
             const ref = refFor(element);
             if (!seenRefs.has(ref)) {
               seenRefs.add(ref);
-              refs.push(ref);
+              if (refs.length < MAX_SELECTED_ELEMENT_REFS) refs.push(ref);
+              else refsTruncated = true;
             }
           }
         }
@@ -349,7 +353,7 @@ if (!window.__opencodeA11yInstalled) {
     }
 
     walk(document.body ?? document.documentElement);
-    return { intersected, refs, sensitive };
+    return { intersected, refs, refsTruncated, sensitive };
   }
 
   function selectionContext(maxSelectionChars) {
@@ -363,12 +367,12 @@ if (!window.__opencodeA11yInstalled) {
         ? { text: "[redacted]", truncated: false }
         : boundedText(String(active.value ?? "").slice(active.selectionStart, active.selectionEnd), maxSelectionChars);
       const ref = refFor(active);
-      return { ...selection, refs: [ref] };
+      return { ...selection, refs: [ref], refsTruncated: false };
     }
 
     const browserSelection = window.getSelection?.();
     if (!browserSelection || browserSelection.rangeCount === 0) {
-      return { refs: [], text: "", truncated: false };
+      return { refs: [], refsTruncated: false, text: "", truncated: false };
     }
     const selectedElements = [
       elementFromSelectionNode(browserSelection.anchorNode),
@@ -383,7 +387,11 @@ if (!window.__opencodeA11yInstalled) {
     const selection = sensitive
       ? { text: "[redacted]", truncated: false }
       : boundedText(browserSelection.toString(), maxSelectionChars);
-    return { ...selection, refs };
+    return {
+      ...selection,
+      refs,
+      refsTruncated: rangeDetails.intersected ? rangeDetails.refsTruncated : false
+    };
   }
 
   function finiteDimension(...values) {
@@ -430,6 +438,7 @@ if (!window.__opencodeA11yInstalled) {
         }
       },
       truncated: {
+        selectedElementRefs: selection.refsTruncated,
         visibleText: visible.truncated,
         selection: selection.truncated
       }

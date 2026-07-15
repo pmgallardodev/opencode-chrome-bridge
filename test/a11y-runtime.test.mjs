@@ -99,7 +99,11 @@ test("tab context returns bounded page metadata and selected element references"
     deviceScaleFactor: 1
   });
   assert.deepEqual({ ...context.dimensions.document }, { height: 1800, width: 1440 });
-  assert.deepEqual({ ...context.truncated }, { selection: false, visibleText: false });
+  assert.deepEqual({ ...context.truncated }, {
+    selectedElementRefs: false,
+    selection: false,
+    visibleText: false
+  });
 });
 
 test("tab context redacts sensitive controls and ignores non-visible document text", () => {
@@ -210,6 +214,7 @@ test("tab context returns meaningful selected refs in DOM order with a strict ca
   assert.equal(context.selectedElementRefs.length, 100);
   assert.deepEqual([...context.selectedElementRefs.slice(0, 3)], ["e1", "e2", "e3"]);
   assert.equal(context.selection.refs.at(-1), "e100");
+  assert.equal(context.truncated.selectedElementRefs, true);
 });
 
 test("tab context preserves fractional DPR and negative scroll offsets", () => {
