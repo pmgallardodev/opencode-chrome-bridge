@@ -117,8 +117,8 @@ if (!window.__opencodeA11yInstalled) {
   const MAX_SAFE_TEXT_NODES = 1000;
   const MAX_SAFE_TEXT_DEPTH = 100;
 
-  function safeElementText(root, max = 200, includeDescendants = true) {
-    if (!root || isSensitiveField(root)) return "";
+  function safeElementText(root, max = 200, includeDescendants = true, omitHiddenDescendants = false) {
+    if (!root || SKIP_TAGS.has(root.tagName) || isSensitiveField(root)) return "";
     const parts = [];
     const stack = [{ element: root, depth: 0 }];
     let visited = 0;
@@ -126,7 +126,9 @@ if (!window.__opencodeA11yInstalled) {
     while (stack.length > 0 && visited < MAX_SAFE_TEXT_NODES && length <= max) {
       const { element, depth } = stack.pop();
       visited += 1;
-      if (isSensitiveField(element)) continue;
+      if (SKIP_TAGS.has(element.tagName)
+        || isSensitiveField(element)
+        || (omitHiddenDescendants && depth > 0 && !isVisible(element))) continue;
       for (const node of element.childNodes ?? []) {
         if (node.nodeType !== Node.TEXT_NODE) continue;
         const value = String(node.textContent ?? "").trim();
@@ -185,7 +187,7 @@ if (!window.__opencodeA11yInstalled) {
     return text.length > max ? `${text.slice(0, max)}…` : text;
   }
 
-  function accessibleName(element, role) {
+  function accessibleName(element, role, omitHiddenDescendants = false) {
     const aria = element.getAttribute("aria-label");
     if (aria && aria.trim()) return truncate(aria);
     const labelledBy = ariaLabelledByText(element);
@@ -213,7 +215,7 @@ if (!window.__opencodeA11yInstalled) {
     if (title && title.trim()) return truncate(title);
     // Structural containers would otherwise inherit the whole page text as
     // their name; only leaf-like roles include bounded descendant text.
-    return safeElementText(element, 120, !CONTAINER_ROLES.has(role));
+    return safeElementText(element, 120, !CONTAINER_ROLES.has(role), omitHiddenDescendants);
   }
 
   function isInteractiveElement(element, role) {
@@ -681,10 +683,10 @@ if (!window.__opencodeA11yInstalled) {
           && (!roleFilter || normalizeSearchText(role) === roleFilter)
           && !sensitive) {
           const ref = refFor(element);
-          const name = accessibleName(element, role);
+          const name = accessibleName(element, role, true);
           const label = labelText(element);
           const placeholder = element.getAttribute("placeholder") || "";
-          const text = safeElementText(element, 200, !CONTAINER_ROLES.has(role));
+          const text = safeElementText(element, 200, !CONTAINER_ROLES.has(role), true);
           const weightedFields = [
             [ref, 120],
             [role, 20],
@@ -730,7 +732,7 @@ if (!window.__opencodeA11yInstalled) {
       const expected = String(condition.value ?? "");
       const matched = condition.caseSensitive === true
         ? pageText.includes(expected)
-        : pageText.toLocaleLowerCase().includes(expected.toLocaleLowerCase());
+        : pageText.toLowerCase().includes(expected.toLowerCase());
       return { matched, type: "text" };
     }
     if (condition?.type === "ref") {

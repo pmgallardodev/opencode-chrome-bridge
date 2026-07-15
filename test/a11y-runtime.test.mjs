@@ -443,6 +443,29 @@ test("findElements and accessibility names omit sensitive descendant text from n
   assert.doesNotMatch(snapshot.tree, /4111 ancestor secret/u);
 });
 
+test("findElements does not score a visible ancestor from hidden or non-rendered descendant text", () => {
+  const button = createElement("button", {
+    children: [
+      createElement("span", { text: "Public action" }),
+      createElement("span", { text: "hidden ranking phrase", visible: false }),
+      createElement("script", { text: "script ranking phrase" }),
+      createElement("template", { text: "template ranking phrase" })
+    ]
+  });
+  const harness = createA11yHarness([button]);
+
+  const publicResult = harness.find({ query: "public action", role: "button", visibleOnly: true });
+  const hiddenResult = harness.find({ query: "hidden ranking phrase", visibleOnly: true });
+  const scriptResult = harness.find({ query: "script ranking phrase", visibleOnly: true });
+  const templateResult = harness.find({ query: "template ranking phrase", visibleOnly: true });
+
+  assert.equal(publicResult.matches[0]?.name, "Public action");
+  assert.equal(publicResult.matches[0]?.text, "Public action");
+  assert.equal(hiddenResult.matches.length, 0);
+  assert.equal(scriptResult.matches.length, 0);
+  assert.equal(templateResult.matches.length, 0);
+});
+
 test("findElements resolves aria-labelledby, element.labels, explicit labels, wrapping labels, and placeholders", () => {
   const ariaFirst = createElement("span", { attributes: { id: "billing" }, text: "Billing" });
   const ariaSecond = createElement("span", { attributes: { id: "email" }, text: "email" });
@@ -522,6 +545,10 @@ test("wait checks page text, selectors, and live refs without evaluating page Ja
 
   button.isConnected = false;
   assert.equal(harness.check({ type: "ref", ref: "e1", visibleOnly: true }).matched, false);
+});
+
+test("case-insensitive text waits do not depend on the runtime locale", () => {
+  assert.doesNotMatch(a11ySource, /toLocaleLowerCase/u);
 });
 
 function createA11yHarness(elements, {
