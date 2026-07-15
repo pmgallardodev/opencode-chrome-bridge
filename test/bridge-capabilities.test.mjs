@@ -556,6 +556,37 @@ test("OpenCode plugin exposes one typed deterministic wait tool and capability",
   }
 });
 
+test("wait condition schemas are strict discriminated unions for every condition type", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const conditionSchema = plugin.tool.chrome_wait_for.args.condition;
+  const validConditions = [
+    { type: "url", value: "/ready", match: "contains" },
+    { type: "navigation" },
+    { type: "text", value: "Ready", caseSensitive: false },
+    { type: "ref", ref: "e1", visibleOnly: true },
+    { type: "selector", selector: "button", visibleOnly: false },
+    { type: "networkIdle", idleMs: 500 },
+    { type: "download", downloadId: 7 }
+  ];
+  for (const condition of validConditions) {
+    assert.equal(conditionSchema.safeParse(condition).success, true, `valid ${condition.type} condition rejected`);
+  }
+
+  const invalidConditions = [
+    { type: "url" },
+    { type: "navigation", value: "/wrong-field" },
+    { type: "text", caseSensitive: false },
+    { type: "ref", visibleOnly: true },
+    { type: "selector", visibleOnly: true },
+    { type: "networkIdle", idleMs: 9 },
+    { type: "download" },
+    { type: "text", value: "Ready", selector: "button" }
+  ];
+  for (const condition of invalidConditions) {
+    assert.equal(conditionSchema.safeParse(condition).success, false, `invalid ${condition.type} condition accepted`);
+  }
+});
+
 test("OpenCode plugin exposes one approved typed batch with negotiated action capabilities", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   assert.ok(plugin.tool.chrome_batch, "chrome_batch tool missing");

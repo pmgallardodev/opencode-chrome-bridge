@@ -98,17 +98,37 @@ export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
   const schema = tool.schema;
-  const waitConditionSchema = schema.strictObject({
-    type: schema.enum(["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]),
-    value: schema.string().min(1).max(2000).optional(),
-    match: schema.enum(["contains", "exact"]).optional(),
-    caseSensitive: schema.boolean().optional(),
-    ref: schema.string().min(1).max(50).optional(),
-    selector: schema.string().min(1).max(2000).optional(),
-    visibleOnly: schema.boolean().optional(),
-    idleMs: schema.number().int().min(10).max(30000).optional(),
-    downloadId: schema.number().int().min(0).optional()
-  });
+  const waitConditionSchema = schema.discriminatedUnion("type", [
+    schema.strictObject({
+      type: schema.literal("url"),
+      value: schema.string().min(1).max(2000),
+      match: schema.enum(["contains", "exact"]).optional()
+    }),
+    schema.strictObject({ type: schema.literal("navigation") }),
+    schema.strictObject({
+      type: schema.literal("text"),
+      value: schema.string().min(1).max(2000),
+      caseSensitive: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("ref"),
+      ref: schema.string().min(1).max(50),
+      visibleOnly: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("selector"),
+      selector: schema.string().min(1).max(2000),
+      visibleOnly: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("networkIdle"),
+      idleMs: schema.number().int().min(10).max(30000).optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("download"),
+      downloadId: schema.number().int().min(0)
+    })
+  ]);
   const batchActionTimeoutMs = schema.number().int().min(50).max(30000).optional();
   const batchTabIdParams = schema.strictObject({ tabId: schema.number().int() });
   const batchAction = schema.discriminatedUnion("type", [

@@ -335,8 +335,12 @@ async function executeCommand(method, params, options = {}) {
       return { connected: true, extensionId: chrome.runtime.id, hostName: HOST_NAME };
     case "listTabs":
       return (await chrome.tabs.query({})).map(tabInfo);
-    case "getTab":
-      return tabInfo(await chrome.tabs.get(requireTabId(params)));
+    case "getTab": {
+      throwIfAborted(options.signal);
+      const tab = await chrome.tabs.get(requireTabId(params));
+      throwIfAborted(options.signal);
+      return tabInfo(tab);
+    }
     case "createTab": {
       validateOptionalLeaseParams(params);
       const createUrl = params.url ?? "about:blank";
@@ -349,17 +353,23 @@ async function executeCommand(method, params, options = {}) {
       await chrome.tabs.remove(requireTabId(params));
       return { closed: true };
     case "activateTab":
-      return activateTab(requireTabId(params));
+      return activateTab(requireTabId(params), options.signal);
     case "navigate":
-      return navigateTab(params);
+      return navigateTab(params, options.signal);
     case "reload":
+      throwIfAborted(options.signal);
       await chrome.tabs.reload(requireTabId(params));
+      throwIfAborted(options.signal);
       return { reloaded: true };
     case "back":
+      throwIfAborted(options.signal);
       await chrome.tabs.goBack(requireTabId(params));
+      throwIfAborted(options.signal);
       return { ok: true };
     case "forward":
+      throwIfAborted(options.signal);
       await chrome.tabs.goForward(requireTabId(params));
+      throwIfAborted(options.signal);
       return { ok: true };
     case "screenshot":
       return captureScreenshot(params);
@@ -368,7 +378,7 @@ async function executeCommand(method, params, options = {}) {
     case "getConsoleLogs":
       return getConsoleLogs(params);
     case "click":
-      return dispatchClick(params);
+      return dispatchClick(params, options.signal);
     case "doubleClick":
       return dispatchDoubleClick(params);
     case "hover":
@@ -444,19 +454,19 @@ async function executeCommand(method, params, options = {}) {
     case "accessibilityTree":
       return accessibilityTree(params);
     case "tabContext":
-      return tabContext(params);
+      return tabContext(params, options.signal);
     case "readPage":
       return readPage(params);
     case "findElements":
-      return findElements(params);
+      return findElements(params, options.signal);
     case "waitFor":
       return waitFor(params, options);
     case "browserBatch":
       return browserBatch(params, options);
     case "clickElement":
-      return clickElement(params);
+      return clickElement(params, options.signal);
     case "fillElement":
-      return fillElement(params);
+      return fillElement(params, options.signal);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
@@ -480,20 +490,32 @@ function requireTabId(params) {
   return params.tabId;
 }
 
-async function activateTab(tabId) {
+async function activateTab(tabId, signal) {
+  throwIfAborted(signal);
   const tab = await chrome.tabs.get(tabId);
-  if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-  return tabInfo(await chrome.tabs.update(tabId, { active: true }));
+  throwIfAborted(signal);
+  if (tab.windowId !== undefined) {
+    await chrome.windows.update(tab.windowId, { focused: true });
+    throwIfAborted(signal);
+  }
+  const activated = await chrome.tabs.update(tabId, { active: true });
+  throwIfAborted(signal);
+  return tabInfo(activated);
 }
 
-async function navigateTab(params) {
+async function navigateTab(params, signal) {
   const tabId = requireTabId(params);
   if (typeof params.url !== "string" || params.url.length === 0) throw new Error("url must be a non-empty string");
+  throwIfAborted(signal);
   await assertNavigationAllowed(params.url);
+  throwIfAborted(signal);
   validateOptionalLeaseParams(params);
   // Claim before navigating so a tab owned by another session is left untouched.
   await maybeClaimTabFromParams(tabId, params, "user");
-  return tabInfo(await chrome.tabs.update(tabId, { url: params.url }));
+  throwIfAborted(signal);
+  const navigated = await chrome.tabs.update(tabId, { url: params.url });
+  throwIfAborted(signal);
+  return tabInfo(navigated);
 }
 
 async function tabStillExists(tabId) {
@@ -578,18 +600,22 @@ function assertScreenshotPayloadSize(base64Data) {
   }
 }
 
-async function dispatchClick(params) {
+async function dispatchClick(params, signal) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
+  throwIfAborted(signal);
   await withOverlayInputPassThrough(tabId, { x, y }, async () => {
     await withDebugger(tabId, async (target) => {
+      throwIfAborted(signal);
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      throwIfAborted(signal);
       await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
     });
-  });
+  }, signal);
+  throwIfAborted(signal);
   return { clicked: true };
 }
 
@@ -1510,16 +1536,22 @@ async function notifyOverlay(tabId, type, data) {
   await sendOverlayMessage(tabId, type, data);
 }
 
-async function withOverlayInputPassThrough(tabId, point, operation) {
-  const overlayInjected = await injectOverlay(tabId);
-  if (overlayInjected) {
-    await sendOverlayMessage(tabId, "agent-input-start", {});
-    await sendOverlayMessage(tabId, "cursor-click", point);
-  }
+async function withOverlayInputPassThrough(tabId, point, operation, signal) {
+  let inputStarted = false;
   try {
+    throwIfAborted(signal);
+    const overlayInjected = await injectOverlay(tabId);
+    throwIfAborted(signal);
+    if (overlayInjected) {
+      await sendOverlayMessage(tabId, "agent-input-start", {});
+      inputStarted = true;
+      throwIfAborted(signal);
+      await sendOverlayMessage(tabId, "cursor-click", point);
+      throwIfAborted(signal);
+    }
     return await operation();
   } finally {
-    if (overlayInjected) await sendOverlayMessage(tabId, "agent-input-end", {});
+    if (inputStarted) await sendOverlayMessage(tabId, "agent-input-end", {});
   }
 }
 
@@ -1766,16 +1798,19 @@ async function accessibilityTree(params) {
   return { tabId, ...result };
 }
 
-async function tabContext(params) {
+async function tabContext(params, signal) {
   const tabId = requireTabId(params);
   const maxChars = clampInteger(params.maxChars, 100, 200000, 50000, "maxChars");
   const maxSelectionChars = clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars");
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const result = await runInA11yWorld(
     tabId,
     (options) => window.__opencodeTabContext ? window.__opencodeTabContext(options) : null,
     [{ maxChars, maxSelectionChars }]
   );
+  throwIfAborted(signal);
   validateTabContextResult(result, "tab context");
   return { tabId, ...result };
 }
@@ -1825,7 +1860,7 @@ async function readPage(params) {
   };
 }
 
-async function findElements(params) {
+async function findElements(params, signal) {
   const tabId = requireTabId(params);
   if (typeof params.query !== "string" || params.query.trim().length === 0) {
     throw new Error("query must be a non-empty string");
@@ -1845,12 +1880,15 @@ async function findElements(params) {
     role,
     visibleOnly: params.visibleOnly !== false
   };
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const result = await runInA11yWorld(
     tabId,
     (findOptions) => window.__opencodeA11yFind ? window.__opencodeA11yFind(findOptions) : null,
     [options]
   );
+  throwIfAborted(signal);
   validateFindElementsResult(result);
   return { tabId, ...result };
 }
@@ -2030,6 +2068,9 @@ async function validateBatchActionParams(type, params, index) {
     requireTabId(params);
     requireElementRef(params);
     requireButton(params.button);
+    if (params.modifiers != null && (!Array.isArray(params.modifiers) || params.modifiers.length > 5)) {
+      throw new Error(`${label} modifiers must be an array of at most 5 modifier names`);
+    }
     resolveModifiers(params.modifiers);
     return { ...params };
   }
@@ -2355,13 +2396,16 @@ function requireElementRef(params) {
   return params.ref;
 }
 
-async function locateElement(tabId, ref) {
+async function locateElement(tabId, ref, signal) {
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const location = await runInA11yWorld(
     tabId,
     (elementRef) => window.__opencodeA11yLocate ? window.__opencodeA11yLocate(elementRef) : null,
     [ref]
   );
+  throwIfAborted(signal);
   if (location.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
@@ -2374,32 +2418,37 @@ async function locateElement(tabId, ref) {
   return location;
 }
 
-async function clickElement(params) {
+async function clickElement(params, signal) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
-  const location = await locateElement(tabId, ref);
+  const location = await locateElement(tabId, ref, signal);
+  throwIfAborted(signal);
   await dispatchClick({
     tabId,
     x: location.x,
     y: location.y,
     button: params.button,
     modifiers: params.modifiers
-  });
+  }, signal);
+  throwIfAborted(signal);
   return { clicked: true, ref, x: location.x, y: location.y, role: location.role, name: location.name };
 }
 
-async function fillElement(params) {
+async function fillElement(params, signal) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
   if (typeof params.text !== "string") throw new Error("text must be a string");
   if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
   const clear = params.clear !== false;
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const focusResult = await runInA11yWorld(
     tabId,
     (elementRef, selectAll) => window.__opencodeA11yFocus ? window.__opencodeA11yFocus(elementRef, selectAll) : null,
     [ref, clear]
   );
+  throwIfAborted(signal);
   if (focusResult.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
@@ -2410,8 +2459,10 @@ async function fillElement(params) {
     throw new Error(`Element ${ref} could not be focused; it may be disabled or covered`);
   }
   await withDebugger(tabId, async (target) => {
+    throwIfAborted(signal);
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
+  throwIfAborted(signal);
   const verifyResult = await runInA11yWorld(
     tabId,
     (elementRef, text, selectedAll) => window.__opencodeA11yVerifyFill
@@ -2419,6 +2470,7 @@ async function fillElement(params) {
       : null,
     [ref, params.text, clear]
   );
+  throwIfAborted(signal);
   if (verifyResult.found !== true) {
     throw new Error(`Element ${ref} was replaced while filling; capture a fresh accessibilityTree`);
   }

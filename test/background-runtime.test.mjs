@@ -1654,6 +1654,35 @@ test("a timed-out batch action never overlaps a later action", async () => {
   assert.match(result.results[0].error, /action 0.*timed out/iu);
 });
 
+test("a timed-out batch action cannot start mutations after delayed preparation resolves", async () => {
+  let resolveTabLookup;
+  const delayedTabLookup = new Promise((resolve) => { resolveTabLookup = resolve; });
+  let tabActivations = 0;
+  let windowFocuses = 0;
+  const harness = createBackgroundHarness({
+    tabsGet: async () => delayedTabLookup,
+    tabsUpdate: async (tabId) => {
+      tabActivations += 1;
+      return { active: true, id: tabId, index: 0, title: "Late", url: "https://example.com", windowId: 1 };
+    },
+    windowsUpdate: async (windowId) => {
+      windowFocuses += 1;
+      return { id: windowId };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [{ type: "activateTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    totalTimeoutMs: 1_000
+  });
+  assert.equal(result.stoppedAt, 0);
+  resolveTabLookup({ active: false, id: 7, index: 0, title: "Ready", url: "https://example.com", windowId: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(windowFocuses, 0, "a late tab lookup must not focus the window after timeout");
+  assert.equal(tabActivations, 0, "a late tab lookup must not activate the tab after timeout");
+});
+
 test("browser batches reject forbidden and malformed actions before side effects", async () => {
   let getCalls = 0;
   const harness = createBackgroundHarness({
@@ -1692,6 +1721,17 @@ test("browser batches reject forbidden and malformed actions before side effects
         ]
       }),
       /batch action 1|must be a boolean|idleMs must be an integer from 10 to 30000/iu
+    );
+  }
+  for (const modifiers of ["Shift", ["Shift", "Shift", "Shift", "Shift", "Shift", "Shift"]]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type: "clickElement", params: { tabId: 7, ref: "e1", modifiers } }
+        ]
+      }),
+      /batch action 1.*modifiers/iu
     );
   }
   assert.equal(getCalls, 0, "the complete batch must validate before its first action");
