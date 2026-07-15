@@ -320,6 +320,7 @@ if (!window.__opencodeA11yInstalled) {
         if (visited > MAX_SELECTION_SCAN_ELEMENTS) {
           // Fail closed if a hostile page makes the selected range too large
           // to inspect completely.
+          refsTruncated = true;
           sensitive = true;
           return false;
         }
@@ -390,7 +391,7 @@ if (!window.__opencodeA11yInstalled) {
     return {
       ...selection,
       refs,
-      refsTruncated: rangeDetails.intersected ? rangeDetails.refsTruncated : false
+      refsTruncated: rangeDetails.refsTruncated
     };
   }
 

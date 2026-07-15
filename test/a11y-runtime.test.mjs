@@ -217,6 +217,28 @@ test("tab context returns meaningful selected refs in DOM order with a strict ca
   assert.equal(context.truncated.selectedElementRefs, true);
 });
 
+test("tab context reports truncated refs when the selected range exceeds the scan limit", () => {
+  const selectedButton = createElement("button", { text: "After scan limit" });
+  const elements = [
+    ...Array.from({ length: 10000 }, () => createElement("div")),
+    selectedButton
+  ];
+  const harness = createA11yHarness(elements, {
+    selection: {
+      anchorNode: selectedButton.childNodes[0],
+      focusNode: selectedButton.childNodes[0],
+      intersectedElements: [selectedButton],
+      text: "After scan limit"
+    }
+  });
+
+  const context = harness.tabContext({ maxChars: 500 });
+
+  assert.equal(context.selection.text, "[redacted]");
+  assert.deepEqual([...context.selectedElementRefs], ["e1"]);
+  assert.equal(context.truncated.selectedElementRefs, true);
+});
+
 test("tab context preserves fractional DPR and negative scroll offsets", () => {
   const harness = createA11yHarness([createElement("main", { text: "Page" })], {
     deviceScaleFactor: 1.25,
