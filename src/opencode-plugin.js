@@ -17,6 +17,38 @@ const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].
 const MAX_UPLOAD_FILES = 20;
 const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
+const PAGE_ORIGIN_PERMISSION = "browser.origin";
+const MAX_ORIGIN_GRANT_SESSIONS = 100;
+const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
+const pageOriginSessionGrants = new Map();
+
+const DESTINATION_SCOPED_TOOLS = new Set(["chrome_open", "chrome_open_window"]);
+const TAB_SCOPED_TOOLS = new Set([
+  "chrome_accessibility_tree", "chrome_activate_tab", "chrome_back", "chrome_cdp",
+  "chrome_click", "chrome_click_element", "chrome_close_tab", "chrome_dom_content",
+  "chrome_double_click", "chrome_drag", "chrome_evaluate", "chrome_fill_element",
+  "chrome_find", "chrome_forward", "chrome_get_console_logs", "chrome_get_tab",
+  "chrome_hover", "chrome_keypress", "chrome_move", "chrome_network_requests",
+  "chrome_page_text", "chrome_read_page", "chrome_reload", "chrome_reset_viewport",
+  "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
+  "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
+  "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step"
+]);
+const PAGE_SCOPED_TOOLS = new Set([
+  ...DESTINATION_SCOPED_TOOLS,
+  ...TAB_SCOPED_TOOLS,
+  "chrome_batch",
+  "chrome_cdp_targets",
+  "chrome_tabs"
+]);
+const RETURNED_URL_TOOLS = new Set([
+  "chrome_accessibility_tree", "chrome_activate_tab", "chrome_back", "chrome_dom_content",
+  "chrome_forward", "chrome_get_tab", "chrome_open", "chrome_page_text", "chrome_reload",
+  "chrome_tab_context", "chrome_wait_for"
+]);
+const BATCH_RETURNED_URL_ACTIONS = new Set([
+  "activateTab", "back", "forward", "getTab", "navigate", "reload", "tabContext", "waitFor"
+]);
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({
   activateTab: ["browser.tabs", "browser.windows"],
@@ -1040,7 +1072,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("unsubscribeCdpEvents", args), null, 2);
         }
       })
-    })
+    }, schema)
   };
 }
 
@@ -1091,10 +1123,14 @@ const APPROVAL_METADATA = {
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })
 };
 
-function requireApprovals(tools) {
+function requireApprovals(tools, schema) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
+    if (PAGE_SCOPED_TOOLS.has(name)) {
+      definition.args.originGrant = schema.enum(["once", "session"]).default("once")
+        .describe("Use once for this call, or explicitly cache approved page scopes only for the current OpenCode session.");
+    }
     const describe = APPROVAL_METADATA[name]
       ?? (() => ({ action: definition.description ?? `Run ${name}` }));
     const run = definition.execute;
@@ -1112,11 +1148,265 @@ function requireApprovals(tools) {
         });
         const requiredCapabilities = requiredCapabilitiesForTool(name, args);
         await requireBridgeCapabilities(requiredCapabilities);
-        return run(args, context);
+        const executionArgs = PAGE_SCOPED_TOOLS.has(name) ? withoutOriginGrant(args) : args;
+        if (!PAGE_SCOPED_TOOLS.has(name) || (name === "chrome_wait_for" && args?.condition?.type === "download")) {
+          return run(executionArgs, context);
+        }
+        const callGrants = new Set();
+        const beforeScopes = await resolvePageScopes(name, executionArgs);
+        await authorizePageScopes(beforeScopes, args?.originGrant, context, describe(args), callGrants);
+        const result = await run(executionArgs, context);
+        const afterScopes = [
+          ...pageScopesFromReturnedResult(name, executionArgs, result),
+          ...await resolvePostExecutionPageScopes(name, executionArgs, result)
+        ];
+        await authorizePageScopes(afterScopes, args?.originGrant, context, {
+          ...describe(args),
+          action: `Re-authorize page scope after ${name}`
+        }, callGrants);
+        return result;
       }
     };
   }
   return guarded;
+}
+
+export function canonicalPageScope(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Page origin permission requires a valid absolute http or https URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Page origin permission supports only http and https URLs");
+  }
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return `${parsed.protocol}//${parsed.hostname}:${port}${normalizePermissionPath(parsed.pathname)}`;
+}
+
+export function pageScopeCovers(grant, requested) {
+  const granted = splitPageScope(canonicalPageScope(grant));
+  const target = splitPageScope(canonicalPageScope(requested));
+  if (granted.origin !== target.origin) return false;
+  if (granted.path === "/") return true;
+  if (target.path === granted.path) return true;
+  const prefix = granted.path.endsWith("/") ? granted.path.slice(0, -1) : granted.path;
+  return target.path.startsWith(`${prefix}/`);
+}
+
+export function clearPageOriginSessionGrants() {
+  pageOriginSessionGrants.clear();
+}
+
+async function authorizePageScopes(scopes, originGrant, context, metadata, callGrants = new Set()) {
+  const requested = [...new Set(scopes.map(canonicalPageScope))].sort();
+  if (requested.length === 0) return;
+  const sessionMode = originGrant === "session";
+  const sessionID = sessionMode ? requirePermissionSessionID(context?.sessionID) : null;
+  const grants = [...callGrants, ...(sessionID == null ? [] : (pageOriginSessionGrants.get(sessionID) ?? []))];
+  const missing = requested.filter((scope) => !grants.some((grant) => pageScopeCovers(grant, scope)));
+  if (missing.length === 0) return;
+  await context.ask({
+    permission: PAGE_ORIGIN_PERMISSION,
+    patterns: missing,
+    always: missing,
+    metadata: {
+      ...metadata,
+      action: metadata?.action ?? "Access browser pages",
+      originCount: missing.length,
+      origins: missing
+    }
+  });
+  for (const scope of missing) callGrants.add(scope);
+  if (sessionID != null) cachePageOriginSessionGrants(sessionID, missing);
+}
+
+async function resolvePageScopes(name, args) {
+  if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
+  if (name === "chrome_batch") return resolveBatchPageScopes(args.actions);
+  if (name === "chrome_tabs") {
+    return scopesFromTabs(await bridgeCommand("listTabs"));
+  }
+  if (name === "chrome_cdp_targets") {
+    return scopesFromTabs(await bridgeCommand("cdpTargets"));
+  }
+  if (name === "chrome_cdp" && !Number.isInteger(args.tabId)) {
+    if (typeof args.targetId !== "string" || args.targetId.length === 0) {
+      throw new Error("chrome_cdp requires tabId for origin-scoped authorization, or a valid targetId");
+    }
+    const targets = await bridgeCommand("cdpTargets");
+    const target = Array.isArray(targets) ? targets.find((entry) => entry?.id === args.targetId || entry?.targetId === args.targetId) : null;
+    if (typeof target?.url !== "string") throw new Error("Unable to resolve the CDP target page origin");
+    return [canonicalPageScope(target.url)];
+  }
+  if (TAB_SCOPED_TOOLS.has(name)) {
+    if (Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+    if (name === "chrome_screenshot" || name === "chrome_screenshot_region") {
+      const activeTabs = (await bridgeCommand("listTabs")).filter((tab) => tab?.active === true);
+      if (activeTabs.length === 0) throw new Error("Unable to resolve an active page origin for the screenshot");
+      return scopesFromTabs(activeTabs);
+    }
+    throw new Error(`${name} requires a tabId for origin-scoped page access`);
+  }
+  return [];
+}
+
+async function resolvePostExecutionPageScopes(name, args, result) {
+  if (name === "chrome_close_tab") return [];
+  if (name === "chrome_batch") return scopesForTabIds(batchTabIds(args.actions));
+  if (name === "chrome_tabs") return scopesFromTabs(await bridgeCommand("listTabs"));
+  if (name === "chrome_cdp_targets") return scopesFromTabs(await bridgeCommand("cdpTargets"));
+  if (DESTINATION_SCOPED_TOOLS.has(name)) {
+    if (Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+    const output = parseToolOutput(result);
+    if (name === "chrome_open_window" && Number.isInteger(output?.id)) {
+      const tabs = await bridgeCommand("listTabs");
+      if (!Array.isArray(tabs)) throw new Error("Chrome tab metadata must be an array");
+      return scopesFromTabs(tabs.filter((tab) => tab?.windowId === output.id));
+    }
+    const createdTabs = Array.isArray(output?.tabs) ? output.tabs : [output];
+    const scopes = [];
+    for (const tab of createdTabs) {
+      if (Number.isInteger(tab?.id)) scopes.push(await scopeForTab(tab.id));
+      else if (typeof tab?.url === "string") scopes.push(canonicalPageScope(tab.url));
+    }
+    return scopes;
+  }
+  if (TAB_SCOPED_TOOLS.has(name) && Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+  if ((name === "chrome_screenshot" || name === "chrome_screenshot_region") && args.tabId == null) {
+    return resolvePageScopes(name, args);
+  }
+  if (name === "chrome_cdp" && typeof args.targetId === "string") {
+    return resolvePageScopes(name, args);
+  }
+  return [];
+}
+
+async function resolveBatchPageScopes(actions) {
+  const scopes = [];
+  const currentTabIds = new Set();
+  for (const action of actions) {
+    if (action?.type === "navigate") {
+      scopes.push(canonicalPageScope(action.params?.url));
+      continue;
+    }
+    if (action?.type === "waitFor" && action.params?.condition?.type === "download") continue;
+    if (Number.isInteger(action?.params?.tabId)) currentTabIds.add(action.params.tabId);
+  }
+  scopes.push(...await scopesForTabIds([...currentTabIds]));
+  return [...new Set(scopes)].sort();
+}
+
+function batchTabIds(actions) {
+  return [...new Set(actions
+    .map((action) => action?.params?.tabId)
+    .filter(Number.isInteger))];
+}
+
+async function scopesForTabIds(tabIds) {
+  return Promise.all(tabIds.map(scopeForTab));
+}
+
+async function scopeForTab(tabId) {
+  const tab = await bridgeCommand("getTab", { tabId });
+  if (typeof tab?.url !== "string") throw new Error(`Chrome tab ${tabId} did not expose a page URL`);
+  return canonicalPageScope(tab.url);
+}
+
+function scopesFromTabs(tabs) {
+  if (!Array.isArray(tabs)) throw new Error("Chrome tab metadata must be an array");
+  return [...new Set(tabs.flatMap((tab) => {
+    if (typeof tab?.url !== "string") throw new Error("Chrome tab did not expose a page URL");
+    return isPagePermissionUrl(tab.url) ? [canonicalPageScope(tab.url)] : [];
+  }))].sort();
+}
+
+function withoutOriginGrant(args) {
+  if (!args || typeof args !== "object") return args;
+  const clean = { ...args };
+  delete clean.originGrant;
+  return clean;
+}
+
+function normalizePermissionPath(pathname) {
+  const pathValue = pathname || "/";
+  const normalized = pathValue.replace(/%([0-9a-fA-F]{2})/gu, (encoded, hex) => {
+    const value = Number.parseInt(hex, 16);
+    const character = String.fromCharCode(value);
+    return /[A-Za-z0-9._~-]/u.test(character) ? character : `%${hex.toUpperCase()}`;
+  });
+  return normalized;
+}
+
+function isPagePermissionUrl(value) {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function parseToolOutput(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function pageScopesFromReturnedResult(name, args, value) {
+  const output = parseToolOutput(value);
+  if (name === "chrome_tabs" || name === "chrome_cdp_targets") {
+    return Array.isArray(output) ? scopesFromTabs(output) : [];
+  }
+  if (name === "chrome_read_page") {
+    return isPagePermissionUrl(output?.context?.url) ? [canonicalPageScope(output.context.url)] : [];
+  }
+  if (name === "chrome_batch") {
+    if (!Array.isArray(output?.results)) return [];
+    return output.results.flatMap((entry) => {
+      const action = args.actions?.[entry?.index];
+      if (!action || !BATCH_RETURNED_URL_ACTIONS.has(action.type)) return [];
+      return isPagePermissionUrl(entry?.result?.url) ? [canonicalPageScope(entry.result.url)] : [];
+    });
+  }
+  if (RETURNED_URL_TOOLS.has(name) && isPagePermissionUrl(output?.url)) {
+    return [canonicalPageScope(output.url)];
+  }
+  return [];
+}
+
+function splitPageScope(scope) {
+  const parsed = new URL(scope);
+  return {
+    origin: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+    path: normalizePermissionPath(parsed.pathname)
+  };
+}
+
+function requirePermissionSessionID(sessionID) {
+  if (typeof sessionID !== "string" || sessionID.length === 0 || sessionID.length > 200) {
+    throw new Error("originGrant session requires a bounded OpenCode context.sessionID");
+  }
+  return sessionID;
+}
+
+function cachePageOriginSessionGrants(sessionID, scopes) {
+  let grants = pageOriginSessionGrants.get(sessionID);
+  if (!grants) {
+    if (pageOriginSessionGrants.size >= MAX_ORIGIN_GRANT_SESSIONS) {
+      pageOriginSessionGrants.delete(pageOriginSessionGrants.keys().next().value);
+    }
+    grants = new Set();
+    pageOriginSessionGrants.set(sessionID, grants);
+  }
+  for (const scope of scopes) {
+    if (grants.size >= MAX_ORIGIN_GRANTS_PER_SESSION) break;
+    grants.add(scope);
+  }
 }
 
 export function requiredCapabilitiesForTool(name, args) {
