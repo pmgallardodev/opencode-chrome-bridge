@@ -682,6 +682,7 @@ export default async function OpenCodeChromeBridgePlugin() {
 
           let clickResult;
           let transitionScope;
+          let transitionBinding;
           try {
             clickResult = await bridgeCommand("click", {
               tabId: args.tabId,
@@ -690,10 +691,14 @@ export default async function OpenCodeChromeBridgePlugin() {
               button: args.button,
               modifiers: args.modifiers
             }, { timeoutMs });
+            transitionScope = clickResult?.transition?.pageScope;
+            if (transitionScope && typeof context.authorizePageTransition === "function") {
+              transitionBinding = await context.authorizePageTransition(transitionScope);
+            }
           } catch (error) {
             transitionScope = pageScopeFromMismatchError(error);
             if (!transitionScope || typeof context.authorizePageTransition !== "function") throw error;
-            await context.authorizePageTransition(transitionScope);
+            transitionBinding = await context.authorizePageTransition(transitionScope);
             clickResult = { navigated: true, scope: transitionScope };
           }
 
@@ -722,7 +727,7 @@ export default async function OpenCodeChromeBridgePlugin() {
             return { evaluation, screenshot };
           };
           const { evaluation, screenshot } = transitionScope
-            ? await withBridgePageScopes([transitionScope], finishStep)
+            ? await withBridgePageScopes([transitionScope], finishStep, transitionBinding ? [transitionBinding] : [])
             : await finishStep();
 
           return JSON.stringify({
@@ -1182,16 +1187,21 @@ function requireApprovals(tools, schema) {
         const operationStartedAt = name === "chrome_batch" ? Date.now() : undefined;
         validateRawCdpAccess(name, executionArgs);
         await resolveImplicitPageTarget(name, executionArgs);
-        const beforeScopes = await resolvePageScopes(name, executionArgs);
+        const pageMetadata = new Map();
+        const beforeScopes = await resolvePageScopes(name, executionArgs, pageMetadata);
+        const beforeBindings = await resolvePageBindings(name, executionArgs, pageMetadata);
         await authorizePageScopes(beforeScopes, args?.originGrant, context, describe(args), callGrants);
         const executionContext = {
           ...context,
-          authorizePageTransition: async (scope) => authorizePageScopes(
-            [scope], args?.originGrant, context, {
+          authorizePageTransition: async (scope) => {
+            await authorizePageScopes([scope], args?.originGrant, context, {
               ...describe(args),
               action: `Authorize page transition during ${name}`
-            }, callGrants
-          )
+            }, callGrants);
+            return Number.isInteger(executionArgs.tabId)
+              ? (await resolvePageBindings(name, executionArgs))[0]
+              : undefined;
+          }
         };
         const result = name === "chrome_batch"
           ? await runPermissionAwareBatch(
@@ -1199,7 +1209,7 @@ function requireApprovals(tools, schema) {
           )
           : beforeScopes.length === 0
             ? await run(executionArgs, executionContext)
-            : await withBridgePageScopes(beforeScopes, () => run(executionArgs, executionContext));
+            : await withBridgePageScopes(beforeScopes, () => run(executionArgs, executionContext), beforeBindings);
         const afterScopes = [
           ...pageScopesFromReturnedResult(name, executionArgs, result),
           ...await resolvePostExecutionPageScopes(name, executionArgs, result)
@@ -1225,9 +1235,12 @@ async function runPermissionAwareBatch(args, originGrant, context, metadata, cal
     const action = args.actions[index];
     const remaining = deadline - Date.now();
     let scopes;
+    let bindings = [];
     try {
       if (remaining < 50) throw new Error(`browser batch total timeout after ${totalTimeoutMs}ms`);
-      scopes = await resolveBatchPageScopes([action]);
+      const pageMetadata = new Map();
+      scopes = await resolveBatchPageScopes([action], pageMetadata);
+      bindings = await resolvePageBindings("chrome_batch", { actions: [action] }, pageMetadata);
       await authorizePageScopes(scopes, originGrant, context, {
         ...metadata,
         action: `Authorize browser batch action ${index}`,
@@ -1250,7 +1263,7 @@ async function runPermissionAwareBatch(args, originGrant, context, metadata, cal
         stopOnError: true,
         totalTimeoutMs: Math.min(actionRemaining, totalTimeoutMs)
       }, { timeoutMs: Math.min(125_000, actionRemaining + 5_000) });
-      const one = scopes.length === 0 ? await executeOne() : await withBridgePageScopes(scopes, executeOne);
+      const one = scopes.length === 0 ? await executeOne() : await withBridgePageScopes(scopes, executeOne, bindings);
       const entry = one?.results?.[0];
       if (!entry?.ok) throw new Error(entry?.error ?? `browser batch action ${index} failed`);
       results.push({ ...entry, index });
@@ -1334,9 +1347,9 @@ async function authorizePageScopes(scopes, originGrant, context, metadata, callG
   if (sessionID != null) cachePageOriginSessionGrants(sessionID, missing);
 }
 
-async function resolvePageScopes(name, args) {
+async function resolvePageScopes(name, args, pageMetadata) {
   if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
-  if (name === "chrome_batch") return resolveBatchPageScopes(args.actions);
+  if (name === "chrome_batch") return resolveBatchPageScopes(args.actions, pageMetadata);
   if (name === "chrome_tabs") {
     return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
   }
@@ -1357,7 +1370,7 @@ async function resolvePageScopes(name, args) {
   }
   if (TAB_SCOPED_TOOLS.has(name)) {
     if (Number.isInteger(args.tabId)) {
-      const scopes = [await scopeForTab(args.tabId)];
+      const scopes = [await scopeForTab(args.tabId, pageMetadata)];
       if (name === "chrome_cdp" && args.method === "Page.navigate") {
         scopes.push(canonicalPageScope(args.commandParams?.url));
       }
@@ -1371,6 +1384,25 @@ async function resolvePageScopes(name, args) {
     throw new Error(`${name} requires a tabId for origin-scoped page access`);
   }
   return [];
+}
+
+async function resolvePageBindings(name, args, pageMetadata) {
+  let tabIds = [];
+  if (name === "chrome_batch") tabIds = batchTabIds(args.actions);
+  else if (Number.isInteger(args?.tabId)) tabIds = [args.tabId];
+  if (tabIds.length === 0) return [];
+  const bindings = [];
+  for (const tabId of tabIds) {
+    const tab = await tabMetadata(tabId, pageMetadata);
+    if (typeof tab?.documentId !== "string" || !Number.isInteger(tab?.navigationGeneration)) continue;
+    bindings.push({
+      documentId: tab.documentId,
+      navigationGeneration: tab.navigationGeneration,
+      pageScope: canonicalPageScope(tab.url),
+      tabId
+    });
+  }
+  return bindings;
 }
 
 function validateRawCdpAccess(name, args) {
@@ -1421,7 +1453,7 @@ async function resolveImplicitPageTarget(name, args) {
   args.tabId = tab.id;
 }
 
-async function resolveBatchPageScopes(actions) {
+async function resolveBatchPageScopes(actions, pageMetadata) {
   const scopes = [];
   const currentTabIds = new Set();
   for (const action of actions) {
@@ -1432,7 +1464,7 @@ async function resolveBatchPageScopes(actions) {
     if (action?.type === "waitFor" && action.params?.condition?.type === "download") continue;
     if (Number.isInteger(action?.params?.tabId)) currentTabIds.add(action.params.tabId);
   }
-  scopes.push(...await scopesForTabIds([...currentTabIds]));
+  scopes.push(...await scopesForTabIds([...currentTabIds], pageMetadata));
   return [...new Set(scopes)].sort();
 }
 
@@ -1442,14 +1474,21 @@ function batchTabIds(actions) {
     .filter(Number.isInteger))];
 }
 
-async function scopesForTabIds(tabIds) {
-  return Promise.all(tabIds.map(scopeForTab));
+async function scopesForTabIds(tabIds, pageMetadata) {
+  return Promise.all(tabIds.map((tabId) => scopeForTab(tabId, pageMetadata)));
 }
 
-async function scopeForTab(tabId) {
-  const tab = await bridgeCommand("getTab", { tabId });
+async function scopeForTab(tabId, pageMetadata) {
+  const tab = await tabMetadata(tabId, pageMetadata);
   if (typeof tab?.url !== "string") throw new Error(`Chrome tab ${tabId} did not expose a page URL`);
   return canonicalPageScope(tab.url);
+}
+
+async function tabMetadata(tabId, cache) {
+  if (cache?.has(tabId)) return cache.get(tabId);
+  const tab = await bridgeCommand("getTab", { tabId });
+  cache?.set(tabId, tab);
+  return tab;
 }
 
 function scopesFromTabs(tabs) {

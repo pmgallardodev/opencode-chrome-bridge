@@ -202,7 +202,12 @@ function isLegacyBridgeStatus(payload) {
 export async function bridgeCommand(method, params = {}, options = {}) {
   const scope = pageScopeContext.getStore();
   if (scope && ORIGIN_SCOPED_BRIDGE_METHODS.has(method)) {
-    params = { expectedScopes: scope.expectedScopes, method, params };
+    params = {
+      expectedBindings: scope.expectedBindings,
+      expectedScopes: scope.expectedScopes,
+      method,
+      params
+    };
     method = "scopedCommand";
   }
   const response = await request("POST", "/command", {
@@ -213,11 +218,14 @@ export async function bridgeCommand(method, params = {}, options = {}) {
   return response.result;
 }
 
-export function withBridgePageScopes(expectedScopes, operation) {
+export function withBridgePageScopes(expectedScopes, operation, expectedBindings = []) {
   if (!Array.isArray(expectedScopes) || expectedScopes.length === 0) {
     throw new Error("withBridgePageScopes requires at least one expected page scope");
   }
-  return pageScopeContext.run({ expectedScopes: [...expectedScopes] }, operation);
+  return pageScopeContext.run({
+    expectedBindings: Array.isArray(expectedBindings) ? expectedBindings.map((entry) => ({ ...entry })) : [],
+    expectedScopes: [...expectedScopes]
+  }, operation);
 }
 
 export async function pollEvents(since = 0) {

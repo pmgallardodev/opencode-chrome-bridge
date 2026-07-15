@@ -8,6 +8,9 @@ import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/opencode-plugin.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const backgroundSource = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
+const pageBinding = (tabId = 7, scope = "https://example.com:443/", documentId = `document-${tabId}`) => ({
+  documentId, navigationGeneration: 0, pageScope: scope, tabId
+});
 
 test("scoped page commands fail before a read when the tab navigated after approval", async () => {
   const harness = createBackgroundHarness({
@@ -35,6 +38,126 @@ test("scoped CDP blocks cross-target Target methods and unauthorized Page.naviga
     params: { tabId: 7, method: "Page.navigate", commandParams: { url: "https://evil.example/" } }
   }), /destination.*not authorized|scope/iu);
   assert.equal(harness.calls.debuggerCommands.length, 0);
+});
+
+test("scoped native input preserves CDP mouse, keyboard, text, scroll, evaluate, and drag semantics", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Runtime.evaluate"
+      ? { result: { value: "evaluated" } }
+      : {}
+  });
+  const execute = (method, params) => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"], method, params: { tabId: 7, ...params }
+  });
+  await execute("click", { button: "right", modifiers: ["Shift"], x: 11, y: 12 });
+  await execute("doubleClick", { button: "left", modifiers: ["Control"], x: 13, y: 14 });
+  await execute("keypress", { key: "Enter", modifiers: [] });
+  await execute("keypress", { key: "Tab", modifiers: [] });
+  await execute("type", { text: "native text" });
+  await execute("scroll", { deltaX: 4, deltaY: 9, x: 15, y: 16 });
+  assert.equal(await execute("evaluate", { expression: "Promise.resolve('evaluated')" }), "evaluated");
+  await execute("moveSequence", {
+    button: "middle", drag: true, modifiers: ["Alt"], points: [{ x: 1, y: 2 }, { x: 5, y: 6 }], stepDelayMs: 0, steps: 2
+  });
+
+  const commands = harness.calls.debuggerCommands;
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mousePressed" && params.button === "right" && params.modifiers === 8));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.clickCount === 2));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchKeyEvent" && params.key === "Enter" && params.windowsVirtualKeyCode === 13 && params.text === "\r"));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchKeyEvent" && params.key === "Tab" && params.windowsVirtualKeyCode === 9));
+  assert.ok(commands.some(({ method, params }) => method === "Input.insertText" && params.text === "native text"));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mouseWheel" && params.x === 15 && params.y === 16 && params.deltaX === 4 && params.deltaY === 9));
+  assert.ok(commands.some(({ method, params }) => method === "Runtime.evaluate" && params.awaitPromise === true && params.returnByValue === true));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mousePressed" && params.button === "middle" && params.modifiers === 1));
+  assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mouseReleased" && params.x === 5 && params.y === 6));
+});
+
+test("every native mutation family emits zero CDP effects after document identity changes", async () => {
+  const cases = [
+    ["click", { button: "left", x: 1, y: 2 }],
+    ["doubleClick", { button: "left", x: 1, y: 2 }],
+    ["hover", { x: 1, y: 2 }],
+    ["keypress", { key: "Enter" }],
+    ["type", { text: "blocked" }],
+    ["scroll", { deltaY: 5, x: 1, y: 2 }],
+    ["evaluate", { expression: "window.mutated = true" }],
+    ["moveSequence", { button: "left", drag: true, points: [{ x: 1, y: 2 }, { x: 3, y: 4 }], stepDelayMs: 0, steps: 1 }]
+  ];
+  for (const [method, params] of cases) {
+    let bindingReads = 0;
+    const harness = createBackgroundHarness({
+      webNavigationGetFrame: async () => ({
+        documentId: bindingReads++ === 0 ? "approved-document" : "replacement-document",
+        frameId: 0
+      })
+    });
+    await assert.rejects(() => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding(7, "https://example.com:443/", "approved-document")],
+      expectedScopes: ["https://example.com:443/"], method, params: { tabId: 7, ...params }
+    }), /document changed|not authorized/iu, method);
+    assert.equal(harness.calls.debuggerCommands.length, 0, `${method} emitted a native effect after document replacement`);
+  }
+});
+
+test("scoped native click reports one structured document transition after navigation", async () => {
+  let currentUrl = "https://example.com/start";
+  let documentId = "document-start";
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        currentUrl = "https://redirect.example/next";
+        documentId = "document-next";
+      }
+      return {};
+    },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 })
+  });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/start", "document-start")],
+    expectedScopes: ["https://example.com:443/start"],
+    method: "click", params: { button: "left", tabId: 7, x: 10, y: 10 }
+  });
+  assert.equal(result.clicked, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.transition)), {
+    documentId: "document-next", navigationGeneration: 0,
+    pageScope: "https://redirect.example:443/next", tabId: 7
+  });
+  assert.equal(harness.calls.debuggerCommands.filter(({ params }) => params?.type === "mousePressed").length, 1);
+});
+
+test("scoped screenshot discards A to B to A activation races inside captureVisibleTab", async () => {
+  let harness;
+  harness = createBackgroundHarness({
+    tabsCaptureVisibleTab: async () => {
+      await harness.events.tabsOnActivated.emit({ tabId: 8, windowId: 1 });
+      await harness.events.tabsOnActivated.emit({ tabId: 7, windowId: 1 });
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "screenshot", params: { tabId: 7, format: "png" }
+  }), /discarded.*active tab|changed during capture/iu);
+});
+
+test("scoped readPage discards A to B to A activation races before returning screenshot data", async () => {
+  let harness;
+  harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: {
+      accessibility: { tree: "button Continue" },
+      context: { visibleText: "Page", returnedChars: 4, totalChars: 4 }
+    } }],
+    tabsCaptureVisibleTab: async () => {
+      await harness.events.tabsOnActivated.emit({ tabId: 8, windowId: 1 });
+      await harness.events.tabsOnActivated.emit({ tabId: 7, windowId: 1 });
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "readPage", params: { includeScreenshot: true, tabId: 7 }
+  }), /discarded.*active tab|changed during capture/iu);
 });
 
 test("scoped coordinate click has zero effect when navigation wins the precheck race", async () => {
@@ -900,7 +1023,7 @@ test("readPage returns one combined context and accessibility result with an opt
   );
   assert.equal(injections.filter((injection) => injection.files).length, 1);
   assert.equal(injections.filter((injection) => typeof injection.func === "function").length, 1);
-  assert.deepEqual(order, ["get", "focus", "activate", "inject", "read", "get", "capture"]);
+  assert.deepEqual(order, ["get", "focus", "activate", "inject", "read", "get", "get", "capture", "get"]);
   const funcCall = injections.find((injection) => typeof injection.func === "function");
   assert.deepEqual({ ...funcCall.args[0] }, {
     interactiveOnly: false,
@@ -2917,6 +3040,7 @@ function createBackgroundHarness({
   tabsCaptureVisibleTab = async () => "data:image/png;base64,iVBORw0KGgo=",
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
+  tabsQuery = async () => [{ active: true, id: 7, index: 0, title: "Example", url: "https://example.com", windowId: 1 }],
   tabsRemove = async () => {},
   tabsGroup = async (options) => options.groupId ?? 1,
   tabsUngroup = async () => {},
@@ -2927,7 +3051,8 @@ function createBackgroundHarness({
   }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId }),
-  windowsUpdate = async (windowId) => ({ id: windowId })
+  windowsUpdate = async (windowId) => ({ id: windowId }),
+  webNavigationGetFrame = async ({ tabId }) => ({ documentId: `document-${tabId}`, frameId: 0 })
 } = {}) {
   const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
@@ -2938,8 +3063,10 @@ function createBackgroundHarness({
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
+    tabsOnActivated: createEvent(),
     tabsOnReplaced: createEvent(),
     tabsOnUpdated: createEvent(),
+    webNavigationOnCommitted: createEvent(),
     webNavigationOnCreatedNavigationTarget: createEvent()
   };
   const nativePort = {
@@ -3011,12 +3138,12 @@ function createBackgroundHarness({
       create: tabsCreate,
       get: tabsGet,
       group: tabsGroup,
-      onActivated: createEvent(),
+      onActivated: events.tabsOnActivated,
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
       onReplaced: events.tabsOnReplaced,
       onUpdated: events.tabsOnUpdated,
-      query: async () => [],
+      query: tabsQuery,
       remove: tabsRemove,
       sendMessage: async (_tabId, message) => {
         calls.sendMessage += 1;
@@ -3033,7 +3160,11 @@ function createBackgroundHarness({
       onFocusChanged: createEvent(),
       update: windowsUpdate
     },
-    webNavigation: { onCreatedNavigationTarget: events.webNavigationOnCreatedNavigationTarget }
+    webNavigation: {
+      getFrame: webNavigationGetFrame,
+      onCommitted: events.webNavigationOnCommitted,
+      onCreatedNavigationTarget: events.webNavigationOnCreatedNavigationTarget
+    }
   };
   const harnessConsole = Object.create(console);
   harnessConsole.error = consoleError;

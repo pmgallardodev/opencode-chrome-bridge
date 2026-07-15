@@ -118,10 +118,6 @@ const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
   "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
   "Runtime.getProperties", "Page.navigate"
 ]);
-const ATOMIC_MAIN_MUTATION_COMMANDS = new Set([
-  "back", "doubleClick", "evaluate", "forward", "hover", "keypress", "moveSequence",
-  "reload", "scroll", "type"
-]);
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -152,6 +148,7 @@ const networkTrackerAttached = new Set();
 const networkCaptureAttached = new Set();
 const networkWaitConsumers = new Map();
 const navigationSequences = new Map();
+const windowActivationGenerations = new Map();
 const tabPageProvenance = new Map();
 const executionContextScopes = new Map();
 const activeNativeCommands = new Map();
@@ -393,13 +390,13 @@ async function executeCommand(method, params, options = {}) {
     case "getActiveTab": {
       const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (tabs.length !== 1 || !Number.isInteger(tabs[0]?.id)) throw new Error("Active Chrome tab cannot be resolved deterministically");
-      return tabInfo(tabs[0]);
+      return { ...tabInfo(tabs[0]), ...await currentPageBinding(tabs[0].id, tabs[0].url) };
     }
     case "getTab": {
       throwIfAborted(options.signal);
       const tab = await chrome.tabs.get(requireTabId(params));
       throwIfAborted(options.signal);
-      return tabInfo(tab);
+      return { ...tabInfo(tab), ...await currentPageBinding(tab.id, tab.url) };
     }
     case "createTab": {
       validateOptionalLeaseParams(params);
@@ -432,7 +429,7 @@ async function executeCommand(method, params, options = {}) {
       throwIfAborted(options.signal);
       return { ok: true };
     case "screenshot":
-      return captureScreenshot(params);
+      return captureScreenshot(params, options.pageGuard);
     case "screenshotRegion":
       return captureScreenshotRegion(params);
     case "getConsoleLogs":
@@ -448,31 +445,31 @@ async function executeCommand(method, params, options = {}) {
     case "fileUploadAbort":
       return abortFileUpload(params);
     case "click":
-      return dispatchClick(params, options.signal);
+      return dispatchClick(params, options.signal, options.pageGuard);
     case "doubleClick":
-      return dispatchDoubleClick(params);
+      return dispatchDoubleClick(params, options.pageGuard);
     case "hover":
-      return dispatchHover(params);
+      return dispatchHover(params, options.pageGuard);
     case "type":
-      return insertText(params);
+      return insertText(params, options.pageGuard);
     case "keypress":
-      return dispatchKey(params);
+      return dispatchKey(params, options.pageGuard);
     case "evaluate":
-      return evaluateInTab(params);
+      return evaluateInTab(params, options.pageGuard);
     case "pageText":
       return pageText(params);
     case "domContent":
       return domContent(params);
     case "scroll":
-      return dispatchScroll(params);
+      return dispatchScroll(params, options.pageGuard);
     case "setViewport":
-      return setViewport(params);
+      return setViewport(params, options.pageGuard);
     case "resetViewport":
-      return resetViewport(params);
+      return resetViewport(params, options.pageGuard);
     case "cdpTargets":
       return cdpTargets();
     case "cdpCommand":
-      return cdpCommand(params);
+      return cdpCommand(params, options.pageGuard);
     case "history":
       return searchHistory(params);
     case "bookmarks":
@@ -494,7 +491,7 @@ async function executeCommand(method, params, options = {}) {
     case "releaseDebuggers":
       return releaseDebuggers(params);
     case "moveSequence":
-      return moveSequence(params);
+      return moveSequence(params, options.pageGuard);
     case "listDownloads":
       return listDownloads(params);
     case "cancelDownload":
@@ -528,7 +525,7 @@ async function executeCommand(method, params, options = {}) {
     case "tabContext":
       return tabContext(params, options.signal);
     case "readPage":
-      return readPage(params, options.signal);
+      return readPage(params, options.signal, options.pageGuard);
     case "findElements":
       return findElements(params, options.signal);
     case "waitFor":
@@ -536,9 +533,9 @@ async function executeCommand(method, params, options = {}) {
     case "browserBatch":
       return browserBatch(params, options);
     case "clickElement":
-      return clickElement(params, options.signal);
+      return clickElement(params, options.signal, options.pageGuard);
     case "fillElement":
-      return fillElement(params, options.signal);
+      return fillElement(params, options.signal, options.pageGuard);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
@@ -551,16 +548,19 @@ async function executeScopedPageCommand(envelope, options) {
     throw new Error("scoped page command is invalid or not allowed");
   }
   const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes);
+  const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const method = envelope.method;
   const params = envelope.params;
-  if (method === "click") return executeAtomicCoordinateClick(params, expectedScopes);
-  if (method === "clickElement" || method === "fillElement") {
-    const atomic = await executeAtomicBatchElementAction({ type: method, params }, expectedScopes);
-    return atomic.results[0].result;
-  }
-  if (ATOMIC_MAIN_MUTATION_COMMANDS.has(method)) return executeAtomicMainMutation(method, params, expectedScopes);
+  params.__expectedScopes = expectedScopes;
   if (method === "fileUploadCommit") params.__expectedScopes = expectedScopes;
+  if (method === "fileUploadCommit") params.__expectedBindings = expectedBindings;
   if (method === "setCursorState" || method === "setFaviconBadge") params.__expectedScopes = expectedScopes;
+  if (method === "setCursorState" || method === "setFaviconBadge") params.__expectedBindings = expectedBindings;
+  const expectedTabBinding = Number.isInteger(params.tabId)
+    ? expectedBindings.find((entry) => entry.tabId === params.tabId)
+    : undefined;
+  if (expectedTabBinding) params.__expectedDocumentId = expectedTabBinding.documentId;
+  const pageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
   if (method === "browserBatch") {
     if (!Array.isArray(params.actions) || params.actions.length !== 1) {
       throw new Error("origin-scoped browser batches must contain exactly one action");
@@ -572,20 +572,9 @@ async function executeScopedPageCommand(envelope, options) {
     }
     const tabId = action?.params?.tabId;
     if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
-    if (action.type === "clickElement" || action.type === "fillElement") {
-      return executeAtomicBatchElementAction(action, expectedScopes);
-    }
-    if (["reload", "back", "forward"].includes(action.type)) {
-      const value = await executeAtomicMainMutation(action.type, action.params, expectedScopes);
-      return {
-        completed: 1, elapsedMs: 0, ok: true,
-        results: [{ index: 0, ok: true, result: value, type: action.type }],
-        stoppedAt: null, totalActions: 1
-      };
-    }
-    assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
-    const batchResult = await executeCommand(method, params, options);
-    assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
+    await pageGuard(action.params);
+    const batchResult = await executeCommand(method, params, { ...options, pageGuard });
+    await pageGuard(action.params);
     return batchResult;
   }
   if (method === "cdpCommand" && !ALLOWED_RAW_PAGE_CDP_METHODS.has(params.method)) {
@@ -596,114 +585,78 @@ async function executeScopedPageCommand(envelope, options) {
   } else if (method === "navigate") {
     assertAuthorizedDestination(params.url, expectedScopes);
   } else {
-    const beforeScope = await currentCommandPageScope(method, params);
-    assertExpectedScopeAuthorized(beforeScope, expectedScopes);
+    await pageGuard(params);
   }
-  const result = await executeCommand(method, params, options);
+  let result;
+  try {
+    result = await executeCommand(method, params, { ...options, pageGuard });
+  } catch (error) {
+    if (method !== "click" || error?.authorizedPageEffect !== true) throw error;
+    const transition = await currentPageBindingForCommand(method, params);
+    if (!transition || pageBindingMatches(transition, expectedBindings, expectedScopes)) throw error;
+    return { clicked: true, transition };
+  }
   if (method !== "closeTab") {
-    const afterScope = await currentCommandPageScope(method, params, result);
-    assertExpectedScopeAuthorized(afterScope, expectedScopes);
+    const after = await currentPageBindingForCommand(method, params, result);
+    if (method === "click" && after && !pageBindingMatches(after, expectedBindings, expectedScopes)) {
+      return { ...result, transition: after };
+    }
+    if (method !== "navigate") await pageGuard(params, result);
   }
   return result;
 }
 
-async function executeAtomicCoordinateClick(params, expectedScopes) {
-  const tabId = requireTabId(params);
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: (scopes, x, y, button) => {
-      const port = location.port || (location.protocol === "https:" ? "443" : "80");
-      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
-      if (!scopes.includes(scope)) return { authorized: false, scope };
-      const element = document.elementFromPoint(x, y);
-      if (!element) return { authorized: true, clicked: false };
-      const buttonCode = button === "middle" ? 1 : button === "right" ? 2 : 0;
-      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
-      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
-      if (buttonCode === 0 && typeof element.click === "function") element.click();
-      else element.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
-      return { authorized: true, clicked: true, scope };
-    },
-    args: [expectedScopes, requireFiniteNumber(params.x, "x"), requireFiniteNumber(params.y, "y"), requireButton(params.button)]
-  });
-  const outcome = result?.[0]?.result;
-  if (outcome?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${outcome?.scope ?? "unknown"}`);
-  if (outcome.clicked !== true) throw new Error("No clickable page element exists at the requested coordinates");
-  return { clicked: true, tabId, x: params.x, y: params.y };
+function validateExpectedPageBindings(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry) => isRecord(entry)
+    && Number.isInteger(entry.tabId)
+    && typeof entry.documentId === "string"
+    && Number.isInteger(entry.navigationGeneration))
+    .map((entry) => ({
+      documentId: entry.documentId,
+      navigationGeneration: entry.navigationGeneration,
+      pageScope: canonicalPermissionScope(entry.pageScope),
+      tabId: entry.tabId
+    }));
 }
 
-async function executeAtomicMainMutation(method, params, expectedScopes) {
-  const tabId = requireTabId(params);
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: (scopes, action, input) => {
-      const port = location.port || (location.protocol === "https:" ? "443" : "80");
-      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
-      if (!scopes.includes(scope)) return { authorized: false, scope };
-      const target = document.activeElement || document.body || document.documentElement;
-      if (action === "reload") location.reload();
-      else if (action === "back") history.back();
-      else if (action === "forward") history.forward();
-      else if (action === "scroll") window.scrollBy(input.deltaX ?? 0, input.deltaY ?? 0);
-      else if (action === "evaluate") {
-        const value = (0, eval)(input.expression);
-        if (value && typeof value.then === "function") throw new Error("Async evaluation is not allowed in an atomic scoped mutation");
-        return { authorized: true, scope, value };
-      } else if (action === "type") {
-        const text = String(input.text ?? "");
-        if ("value" in target) target.value = `${target.value ?? ""}${text}`;
-        else target.textContent = `${target.textContent ?? ""}${text}`;
-        target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
-      } else if (action === "keypress") {
-        target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: input.key }));
-        target.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: input.key }));
-      } else {
-        const point = action === "moveSequence" ? input.points?.at(-1) : input;
-        const x = Number(point?.x ?? 0);
-        const y = Number(point?.y ?? 0);
-        const element = document.elementFromPoint(x, y) || target;
-        const type = action === "doubleClick" ? "dblclick" : "mousemove";
-        element.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y }));
-      }
-      return { authorized: true, scope, value: true };
-    },
-    args: [expectedScopes, method, params]
-  });
-  const outcome = result?.[0]?.result;
-  if (outcome?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${outcome?.scope ?? "unknown"}`);
-  return method === "evaluate" ? outcome.value : { atomic: true, tabId };
-}
-
-async function executeAtomicBatchElementAction(action, expectedScopes) {
-  const tabId = requireTabId(action.params);
-  await injectA11yScript(tabId);
-  let result;
-  try {
-    result = await runInA11yWorld(tabId, (scopes, input) => {
-      const port = location.port || (location.protocol === "https:" ? "443" : "80");
-      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
-      if (!scopes.includes(scope)) return { authorized: false, scope };
-      const value = input.type === "clickElement"
-        ? window.__opencodeA11yAtomicClick?.(input.params.ref)
-        : window.__opencodeA11yAtomicFill?.(input.params.ref, input.params.text, input.params.clear);
-      return { authorized: true, scope, value };
-    }, [expectedScopes, action]);
-  } catch (error) {
-    const actualScope = safeCanonicalPermissionScope((await chrome.tabs.get(tabId)).url);
-    if (!actualScope || !expectedScopes.includes(actualScope)) {
-      throw new Error(`Page scope changed or is not authorized: ${actualScope ?? "unknown"}`);
+function createPageGuard(method, params, expectedScopes, expectedBindings) {
+  return async (override = params, result) => {
+    const current = await currentPageBindingForCommand(method, override, result);
+    if (!current || !pageBindingMatches(current, expectedBindings, expectedScopes)) {
+      throw new Error(`Page scope or document changed and is not authorized: ${current?.pageScope ?? "unknown"}`);
     }
-    throw error;
+    return current;
+  };
+}
+
+function pageBindingMatches(current, expectedBindings, expectedScopes) {
+  if (!expectedScopes.includes(current.pageScope)) return false;
+  const expected = expectedBindings.find((entry) => entry.tabId === current.tabId);
+  return Boolean(expected
+    && expected.documentId === current.documentId
+    && expected.navigationGeneration === current.navigationGeneration
+    && expected.pageScope === current.pageScope);
+}
+
+async function currentPageBindingForCommand(method, params, result) {
+  const tabId = Number.isInteger(params?.tabId) ? params.tabId : Number.isInteger(result?.tabId) ? result.tabId : null;
+  if (tabId === null) return null;
+  const tab = await chrome.tabs.get(tabId);
+  return currentPageBinding(tabId, tab.url);
+}
+
+async function currentPageBinding(tabId, knownUrl) {
+  let documentId;
+  if (typeof chrome.webNavigation?.getFrame === "function") {
+    try { documentId = (await chrome.webNavigation.getFrame({ tabId, frameId: 0 }))?.documentId; } catch {}
   }
-  if (result.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${result.scope ?? "unknown"}`);
-  if (action.type === "clickElement" && result.value?.clicked !== true) throw new Error("Atomic element click failed");
-  if (action.type === "fillElement" && result.value?.filled !== true) throw new Error("Atomic element fill failed");
+  const navigationGeneration = navigationSequences.get(tabId) ?? 0;
   return {
-    completed: 1, elapsedMs: 0, ok: true,
-    results: [{ index: 0, ok: true, result: result.value, type: action.type }],
-    stoppedAt: null, totalActions: 1
+    documentId: typeof documentId === "string" ? documentId : `generation:${navigationGeneration}`,
+    navigationGeneration,
+    pageScope: canonicalPermissionScope(knownUrl ?? (await chrome.tabs.get(tabId)).url),
+    tabId
   };
 }
 
@@ -817,12 +770,13 @@ async function tabStillExists(tabId) {
   }
 }
 
-async function captureScreenshot(params) {
+async function captureScreenshot(params, pageGuard) {
   const tabId = params.tabId == null ? null : requireTabId(params);
   let windowId = params.windowId;
+  let targetTab = null;
   if (tabId !== null) {
-    const tab = await activateTab(tabId);
-    windowId = tab.windowId;
+    targetTab = params.__alreadyActive === true ? await chrome.tabs.get(tabId) : await activateTab(tabId);
+    windowId = targetTab.windowId;
   }
   if (!Number.isInteger(windowId)) {
     const current = await chrome.windows.getCurrent();
@@ -831,7 +785,25 @@ async function captureScreenshot(params) {
   const format = params.format === "jpeg" ? "jpeg" : "png";
   const quality = format === "jpeg" ? clampInteger(params.quality, 1, 100, 80, "quality") : undefined;
   const captureOptions = quality === undefined ? { format } : { format, quality };
+  if (targetTab === null) {
+    const active = await chrome.tabs.query({ active: true, windowId });
+    if (active.length !== 1) throw new Error("Screenshot active tab cannot be resolved deterministically");
+    targetTab = active[0];
+  }
+  await pageGuard?.();
+  const beforeBinding = await currentPageBinding(targetTab.id, targetTab.url);
+  const activationGeneration = windowActivationGenerations.get(windowId) ?? 0;
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, captureOptions);
+  const activeAfter = await chrome.tabs.query({ active: true, windowId });
+  const afterBinding = await currentPageBinding(targetTab.id);
+  if (activeAfter.length !== 1
+    || activeAfter[0].id !== targetTab.id
+    || (windowActivationGenerations.get(windowId) ?? 0) !== activationGeneration
+    || afterBinding.documentId !== beforeBinding.documentId
+    || afterBinding.navigationGeneration !== beforeBinding.navigationGeneration) {
+    throw new Error("Screenshot discarded because the active tab or document changed during capture");
+  }
+  await pageGuard?.();
   const separator = typeof dataUrl === "string" ? dataUrl.indexOf(",") : -1;
   if (separator === -1) throw new Error("Chrome did not return a screenshot data URL");
   assertScreenshotPayloadSize(dataUrl.slice(separator + 1));
@@ -890,62 +862,70 @@ function assertScreenshotPayloadSize(base64Data) {
   }
 }
 
-async function dispatchClick(params, signal) {
+async function dispatchClick(params, signal, pageGuard) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
   throwIfAborted(signal);
+  await pageGuard?.();
   await withOverlayInputPassThrough(tabId, { x, y }, async () => {
     await withDebugger(tabId, async (target) => {
       throwIfAborted(signal);
+      await pageGuard?.();
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
       throwIfAborted(signal);
-      await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
+      await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y }, pageGuard);
     });
   }, signal);
   throwIfAborted(signal);
   return { clicked: true };
 }
 
-async function dispatchDoubleClick(params) {
+async function dispatchDoubleClick(params, pageGuard) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
+  await pageGuard?.();
   await withOverlayInputPassThrough(tabId, { x, y }, async () => {
     await withDebugger(tabId, async (target) => {
+      await pageGuard?.();
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
       for (const clickCount of [1, 2]) {
-        await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y });
+        await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y }, pageGuard);
       }
     });
   });
   return { doubleClicked: true };
 }
 
-async function dispatchHover(params) {
+async function dispatchHover(params, pageGuard) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
+  await pageGuard?.();
   await notifyOverlay(tabId, "cursor-move", { x, y });
   await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
   });
   return { hovered: true };
 }
 
-async function dispatchScroll(params) {
+async function dispatchScroll(params, pageGuard) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const deltaX = typeof params.deltaX === "number" && Number.isFinite(params.deltaX) ? params.deltaX : 0;
   const deltaY = typeof params.deltaY === "number" && Number.isFinite(params.deltaY) ? params.deltaY : 0;
   if (deltaX === 0 && deltaY === 0) throw new Error("at least one of deltaX or deltaY must be a non-zero finite number");
+  await pageGuard?.();
   await notifyOverlay(tabId, "cursor-move", { x, y });
   await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
       x,
@@ -957,37 +937,41 @@ async function dispatchScroll(params) {
   return { scrolled: true };
 }
 
-async function insertText(params) {
+async function insertText(params, pageGuard) {
   const tabId = requireTabId(params);
   if (typeof params.text !== "string") throw new Error("text must be a string");
   if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
   await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
   return { typed: true };
 }
 
-async function dispatchKey(params) {
+async function dispatchKey(params, pageGuard) {
   const tabId = requireTabId(params);
   if (typeof params.key !== "string" || params.key.length === 0) throw new Error("key must be a non-empty string");
   if (params.key.length > MAX_KEY_CHARS) throw new Error(`key is too large; max ${MAX_KEY_CHARS} characters`);
   const modifiers = resolveModifiers(params.modifiers);
   await withDebugger(tabId, async (target) => {
-    await dispatchKeyDownAndUp(target, { key: params.key, modifiers });
+    await dispatchKeyDownAndUp(target, { key: params.key, modifiers }, pageGuard);
   });
   return { pressed: true };
 }
 
-async function dispatchMousePressAndRelease(target, event) {
+async function dispatchMousePressAndRelease(target, event, pageGuard) {
   let pressed = false;
   let operationError = null;
   try {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...event, type: "mousePressed" });
     pressed = true;
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...event, type: "mouseReleased" });
     pressed = false;
   } catch (error) {
     operationError = error;
+    if (pressed && error && typeof error === "object") error.authorizedPageEffect = true;
     throw error;
   } finally {
     if (pressed) {
@@ -1047,7 +1031,7 @@ function keyEventDetails(rawKey, modifiers) {
   return { key };
 }
 
-async function dispatchKeyDownAndUp(target, { key, modifiers }) {
+async function dispatchKeyDownAndUp(target, { key, modifiers }, pageGuard) {
   const details = keyEventDetails(key, modifiers);
   const event = { key: details.key, modifiers };
   if (details.keyCode !== undefined) {
@@ -1060,8 +1044,10 @@ async function dispatchKeyDownAndUp(target, { key, modifiers }) {
   let keyDown = false;
   let operationError = null;
   try {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyDownEvent);
     keyDown = true;
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyUp" });
     keyDown = false;
   } catch (error) {
@@ -1078,7 +1064,7 @@ async function dispatchKeyDownAndUp(target, { key, modifiers }) {
   }
 }
 
-async function evaluateInTab(params) {
+async function evaluateInTab(params, pageGuard) {
   const tabId = requireTabId(params);
   if (typeof params.expression !== "string" || params.expression.length === 0) {
     throw new Error("expression must be a non-empty string");
@@ -1087,9 +1073,13 @@ async function evaluateInTab(params) {
     throw new Error(`expression is too large; max ${MAX_EXPRESSION_CHARS} characters`);
   }
   return withDebugger(tabId, async (target) => {
+    await pageGuard?.();
+    const guardedExpression = Array.isArray(params.__expectedScopes)
+      ? `(() => { const p = location.port || (location.protocol === "https:" ? "443" : "80"); const s = location.protocol + "//" + location.hostname + ":" + p + (location.pathname || "/"); if (!${JSON.stringify(params.__expectedScopes)}.includes(s)) throw new Error("Page scope changed before evaluation"); return (0, eval)(${JSON.stringify(params.expression)}); })()`
+      : params.expression;
     const response = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       awaitPromise: true,
-      expression: params.expression,
+      expression: guardedExpression,
       returnByValue: true
     });
     if (response.exceptionDetails) throw new Error(response.exceptionDetails.text || "Page evaluation failed");
@@ -1118,7 +1108,7 @@ async function domContent(params) {
   return evaluateInTab({ tabId, expression });
 }
 
-async function setViewport(params) {
+async function setViewport(params, pageGuard) {
   const tabId = requireTabId(params);
   const width = clampInteger(params.width, 100, 7680, null, "width");
   const height = clampInteger(params.height, 100, 4320, null, "height");
@@ -1128,6 +1118,7 @@ async function setViewport(params) {
     : 1;
   const mobile = params.mobile === true;
   const result = await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", {
       width,
       height,
@@ -1139,9 +1130,10 @@ async function setViewport(params) {
   return { tabId, emulated: true, ...result };
 }
 
-async function resetViewport(params) {
+async function resetViewport(params, pageGuard) {
   const tabId = requireTabId(params);
   await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Emulation.clearDeviceMetricsOverride", {});
   });
   return { tabId, reset: true };
@@ -1715,7 +1707,7 @@ function reportLeasePersistenceError(error) {
   console.error("OpenCode bridge could not persist tab lease cleanup", error);
 }
 
-async function moveSequence(params) {
+async function moveSequence(params, pageGuard) {
   const tabId = requireTabId(params);
   const points = Array.isArray(params.points) ? params.points : [];
   if (points.length === 0) throw new Error("points must be a non-empty array of {x,y}");
@@ -1745,6 +1737,7 @@ async function moveSequence(params) {
   const first = interpolated[0];
   const last = interpolated[interpolated.length - 1];
 
+  await pageGuard?.();
   const overlayReady = await injectOverlay(tabId);
   if (overlayReady) await sendOverlayMessage(tabId, "cursor-move", { x: first.x, y: first.y });
 
@@ -1752,16 +1745,19 @@ async function moveSequence(params) {
     let mousePressed = false;
     let operationError = null;
     try {
+      await pageGuard?.();
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: first.x, y: first.y, modifiers
       });
       if (drag) {
+        await pageGuard?.();
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
           type: "mousePressed", button, clickCount: 1, modifiers, x: first.x, y: first.y
         });
         mousePressed = true;
       }
       for (const point of interpolated) {
+        await pageGuard?.();
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
           type: "mouseMoved", x: point.x, y: point.y, modifiers
         });
@@ -1978,7 +1974,7 @@ async function cdpTargets() {
   }));
 }
 
-async function cdpCommand(params) {
+async function cdpCommand(params, pageGuard) {
   if (!isValidCdpMethod(params.method)) {
     throw new Error("method must be a CDP method string in 'Domain.method' format");
   }
@@ -2002,6 +1998,7 @@ async function cdpCommand(params) {
     throw new Error("commandParams must be an object when provided");
   }
   return withDebuggerTarget(target, async (attachedTarget, { reused }) => {
+    await pageGuard?.();
     const result = await chrome.debugger.sendCommand(attachedTarget, params.method, commandParams);
     if (reused && Number.isInteger(attachedTarget.tabId)) {
       syncRawCdpDomainState(attachedTarget.tabId, params.method);
@@ -2128,9 +2125,9 @@ async function releaseDebuggers(params = {}) {
   return { released: true, tabIds };
 }
 
-async function notifyOverlay(tabId, type, data) {
-  if (!await injectOverlay(tabId)) return;
-  return sendOverlayMessage(tabId, type, data);
+async function notifyOverlay(tabId, type, data, documentId) {
+  if (!await injectOverlay(tabId, documentId)) return;
+  return sendOverlayMessage(tabId, type, data, documentId);
 }
 
 async function withOverlayInputPassThrough(tabId, point, operation, signal) {
@@ -2152,9 +2149,10 @@ async function withOverlayInputPassThrough(tabId, point, operation, signal) {
   }
 }
 
-async function injectOverlay(tabId) {
+async function injectOverlay(tabId, documentId) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content-scripts/opencode.js"] });
+    const target = typeof documentId === "string" ? { tabId, documentIds: [documentId] } : { tabId };
+    await chrome.scripting.executeScript({ target, files: ["content-scripts/opencode.js"] });
     return true;
   } catch {
     // Tab may be chrome://, file://, or otherwise non-injectable — silently skip
@@ -2162,8 +2160,9 @@ async function injectOverlay(tabId) {
   }
 }
 
-async function sendOverlayMessage(tabId, type, data) {
-  return chrome.tabs.sendMessage(tabId, { source: OVERLAY_SOURCE, type, ...data }).catch(() => null);
+async function sendOverlayMessage(tabId, type, data, documentId) {
+  const options = typeof documentId === "string" ? { documentId } : undefined;
+  return chrome.tabs.sendMessage(tabId, { source: OVERLAY_SOURCE, type, ...data }, options).catch(() => null);
 }
 
 function debuggerTarget(params) {
@@ -2216,6 +2215,14 @@ function sendEvent(event) {
 }
 
 function registerBrowserEventListeners() {
+  chrome.webNavigation.onCommitted?.addListener((details) => {
+    if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
+    const generation = (navigationSequences.get(details.tabId) ?? 0) + 1;
+    navigationSequences.set(details.tabId, generation);
+    const pageScope = safeCanonicalPermissionScope(details.url);
+    if (pageScope) tabPageProvenance.set(details.tabId, { navigationGeneration: generation, pageScope });
+    executionContextScopes.delete(details.tabId);
+  });
   chrome.webNavigation.onCreatedNavigationTarget.addListener((details) =>
     adoptCreatedNavigationTarget(details).catch(reportLeasePersistenceError)
   );
@@ -2246,9 +2253,13 @@ function registerBrowserEventListeners() {
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
     sendEvent({ category: "tabs", type: "tabRemoved", tabId, windowId: removeInfo.windowId, isWindowClosing: removeInfo.isWindowClosing });
   });
-  chrome.tabs.onActivated.addListener((activeInfo) =>
-    sendEvent({ category: "tabs", type: "tabActivated", tabId: activeInfo.tabId, windowId: activeInfo.windowId })
-  );
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    windowActivationGenerations.set(
+      activeInfo.windowId,
+      (windowActivationGenerations.get(activeInfo.windowId) ?? 0) + 1
+    );
+    sendEvent({ category: "tabs", type: "tabActivated", tabId: activeInfo.tabId, windowId: activeInfo.windowId });
+  });
   chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
     navigationSequences.delete(removedTabId);
     const persistence = replaceClosedTabLease(addedTabId, removedTabId);
@@ -2545,7 +2556,7 @@ async function setCursorState(params) {
   if (!["active", "handoff", "deliverable", "hidden", "abort"].includes(state)) {
     throw new Error("state must be active, handoff, deliverable, hidden, or abort");
   }
-  const response = await notifyOverlay(tabId, "cursor-state", { state, expectedScopes: params.__expectedScopes });
+  const response = await notifyOverlay(tabId, "cursor-state", { state, expectedScopes: params.__expectedScopes }, params.__expectedDocumentId);
   if (params.__expectedScopes && response?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${response?.scope ?? "unknown"}`);
   return { tabId, state };
 }
@@ -2556,7 +2567,7 @@ async function setFaviconBadge(params) {
   if (badge !== null && !["active", "handoff", "deliverable"].includes(badge)) {
     throw new Error("badge must be active, handoff, deliverable, or null");
   }
-  const response = await notifyOverlay(tabId, "favicon-badge", { badge, expectedScopes: params.__expectedScopes });
+  const response = await notifyOverlay(tabId, "favicon-badge", { badge, expectedScopes: params.__expectedScopes }, params.__expectedDocumentId);
   if (params.__expectedScopes && response?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${response?.scope ?? "unknown"}`);
   return { tabId, badge };
 }
@@ -2569,8 +2580,9 @@ async function injectA11yScript(tabId) {
   await chrome.scripting.executeScript({ target: { tabId }, files: ["content-scripts/a11y.js"] });
 }
 
-async function runInA11yWorld(tabId, func, args) {
-  const results = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+async function runInA11yWorld(tabId, func, args, documentId) {
+  const target = typeof documentId === "string" ? { tabId, documentIds: [documentId] } : { tabId };
+  const results = await chrome.scripting.executeScript({ target, func, args });
   const result = results?.[0]?.result;
   if (result == null) throw new Error("Accessibility script did not return a result");
   return result;
@@ -2743,7 +2755,8 @@ async function commitFileUpload(params, signal) {
           value: window.__opencodeA11yUpload?.(action, payload) ?? null
         };
       },
-      ["commit", { transferId: params.transferId, ref }, params.__expectedScopes]
+      ["commit", { transferId: params.transferId, ref }, params.__expectedScopes],
+      params.__expectedDocumentId
     );
     if (committed.authorized !== true) {
       throw new Error(`Page scope changed or is not authorized: ${committed.scope ?? "unknown"}`);
@@ -2807,7 +2820,7 @@ async function tabContext(params, signal) {
   return { tabId, ...result };
 }
 
-async function readPage(params, signal) {
+async function readPage(params, signal, pageGuard) {
   const tabId = requireTabId(params);
   const includeScreenshot = params.includeScreenshot === true;
   const options = {
@@ -2817,6 +2830,7 @@ async function readPage(params, signal) {
     maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
   };
   throwIfAborted(signal);
+  await pageGuard?.();
   const activatedTab = includeScreenshot ? await activateTab(tabId, signal) : null;
   throwIfAborted(signal);
   await injectA11yScript(tabId);
@@ -2834,6 +2848,7 @@ async function readPage(params, signal) {
   );
   throwIfAborted(signal);
   validateReadPageResult(combined);
+  await pageGuard?.();
   let screenshot = null;
   if (includeScreenshot) {
     throwIfAborted(signal);
@@ -2848,8 +2863,10 @@ async function readPage(params, signal) {
     screenshot = await captureScreenshot({
       format: params.screenshotFormat,
       quality: params.screenshotQuality,
+      tabId,
+      __alreadyActive: true,
       windowId: activatedTab.windowId
-    });
+    }, pageGuard);
     throwIfAborted(signal);
   }
   return {
@@ -2926,7 +2943,7 @@ function validateFindElementsResult(result) {
   }
 }
 
-async function browserBatch(params, { signal } = {}) {
+async function browserBatch(params, { signal, pageGuard } = {}) {
   const batch = await validateBrowserBatch(params);
   const startedAt = Date.now();
   const deadline = startedAt + batch.totalTimeoutMs;
@@ -2937,7 +2954,7 @@ async function browserBatch(params, { signal } = {}) {
     throwIfAborted(signal);
     const action = batch.actions[index];
     try {
-      const result = await runBatchAction(action, index, deadline, batch.totalTimeoutMs, signal);
+      const result = await runBatchAction(action, index, deadline, batch.totalTimeoutMs, signal, pageGuard);
       results.push({ index, ok: true, result, type: action.type });
     } catch (error) {
       throwIfAborted(signal);
@@ -3085,7 +3102,7 @@ async function validateBatchActionParams(type, params, index) {
   return { ...params };
 }
 
-function runBatchAction(action, index, deadline, totalTimeoutMs, signal) {
+function runBatchAction(action, index, deadline, totalTimeoutMs, signal, pageGuard) {
   throwIfAborted(signal);
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) {
@@ -3114,7 +3131,7 @@ function runBatchAction(action, index, deadline, totalTimeoutMs, signal) {
   const execution = Promise.resolve().then(() => executeCommand(
     BATCH_ACTION_METHODS[action.type],
     action.params,
-    { signal: controller.signal }
+    { pageGuard, signal: controller.signal }
   ));
   return Promise.race([execution, abortPromise]).finally(() => {
     clearTimeout(timer);
@@ -3418,10 +3435,12 @@ async function locateElement(tabId, ref, signal) {
   return location;
 }
 
-async function clickElement(params, signal) {
+async function clickElement(params, signal, pageGuard) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
+  await pageGuard?.();
   const location = await locateElement(tabId, ref, signal);
+  await pageGuard?.();
   throwIfAborted(signal);
   await dispatchClick({
     tabId,
@@ -3429,18 +3448,19 @@ async function clickElement(params, signal) {
     y: location.y,
     button: params.button,
     modifiers: params.modifiers
-  }, signal);
+  }, signal, pageGuard);
   throwIfAborted(signal);
   return { clicked: true, ref, x: location.x, y: location.y, role: location.role, name: location.name };
 }
 
-async function fillElement(params, signal) {
+async function fillElement(params, signal, pageGuard) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
   if (typeof params.text !== "string") throw new Error("text must be a string");
   if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
   const clear = params.clear !== false;
   throwIfAborted(signal);
+  await pageGuard?.();
   await injectA11yScript(tabId);
   throwIfAborted(signal);
   const focusResult = await runInA11yWorld(
@@ -3448,6 +3468,7 @@ async function fillElement(params, signal) {
     (elementRef, selectAll) => window.__opencodeA11yFocus ? window.__opencodeA11yFocus(elementRef, selectAll) : null,
     [ref, clear]
   );
+  await pageGuard?.();
   throwIfAborted(signal);
   if (focusResult.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
@@ -3460,6 +3481,7 @@ async function fillElement(params, signal) {
   }
   await withDebugger(tabId, async (target) => {
     throwIfAborted(signal);
+    await pageGuard?.();
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
   throwIfAborted(signal);
@@ -3470,6 +3492,7 @@ async function fillElement(params, signal) {
       : null,
     [ref, params.text, clear]
   );
+  await pageGuard?.();
   throwIfAborted(signal);
   if (verifyResult.found !== true) {
     throw new Error(`Element ${ref} was replaced while filling; capture a fresh accessibilityTree`);

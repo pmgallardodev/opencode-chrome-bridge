@@ -450,9 +450,17 @@ test("wizard can continue under the newly approved redirect scope without clicki
   const bridge = installBridge(({ method }) => {
     if (method === "getTab") {
       tabReads += 1;
-      return { id: 7, url: tabReads === 1 ? "https://example.com/start" : "https://redirect.example/next" };
+      return {
+        documentId: tabReads === 1 ? "document-start" : "document-next",
+        id: 7,
+        navigationGeneration: tabReads === 1 ? 1 : 2,
+        url: tabReads === 1 ? "https://example.com/start" : "https://redirect.example/next"
+      };
     }
-    if (method === "click") throw new Error("Page scope changed or is not authorized: https://redirect.example:443/next");
+    if (method === "click") return { clicked: true, transition: {
+      documentId: "document-next", navigationGeneration: 2,
+      pageScope: "https://redirect.example:443/next", tabId: 7
+    } };
     if (method === "evaluate") return "continued";
     throw new Error(`unexpected ${method}`);
   });
@@ -469,6 +477,7 @@ test("wizard can continue under the newly approved redirect scope without clicki
     bridge.restore();
   }
   assert.equal(bridge.calls.filter((entry) => entry.method === "click").length, 1);
+  assert.equal(bridge.calls.find((entry) => entry.method === "evaluate").expectedBindings[0].documentId, "document-next");
 });
 
 test("scope race rejects combined page data before any workspace artifact is written", async () => {
