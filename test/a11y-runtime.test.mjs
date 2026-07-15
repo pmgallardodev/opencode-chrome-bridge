@@ -444,6 +444,14 @@ test("findElements and accessibility names omit sensitive descendant text from n
 });
 
 test("findElements does not score a visible ancestor from hidden or non-rendered descendant text", () => {
+  const labelledInput = createElement("input", { attributes: { type: "text" } });
+  const wrappingLabel = createElement("label", {
+    children: [
+      createElement("span", { text: "Visible account" }),
+      createElement("span", { text: "hidden label phrase", visible: false }),
+      labelledInput
+    ]
+  });
   const button = createElement("button", {
     children: [
       createElement("span", { text: "Public action" }),
@@ -452,18 +460,22 @@ test("findElements does not score a visible ancestor from hidden or non-rendered
       createElement("template", { text: "template ranking phrase" })
     ]
   });
-  const harness = createA11yHarness([button]);
+  const harness = createA11yHarness([button, wrappingLabel]);
 
   const publicResult = harness.find({ query: "public action", role: "button", visibleOnly: true });
   const hiddenResult = harness.find({ query: "hidden ranking phrase", visibleOnly: true });
   const scriptResult = harness.find({ query: "script ranking phrase", visibleOnly: true });
   const templateResult = harness.find({ query: "template ranking phrase", visibleOnly: true });
+  const visibleLabelResult = harness.find({ query: "visible account", role: "textbox", visibleOnly: true });
+  const hiddenLabelResult = harness.find({ query: "hidden label phrase", visibleOnly: true });
 
   assert.equal(publicResult.matches[0]?.name, "Public action");
   assert.equal(publicResult.matches[0]?.text, "Public action");
   assert.equal(hiddenResult.matches.length, 0);
   assert.equal(scriptResult.matches.length, 0);
   assert.equal(templateResult.matches.length, 0);
+  assert.equal(visibleLabelResult.matches[0]?.name, "Visible account");
+  assert.equal(hiddenLabelResult.matches.length, 0);
 });
 
 test("findElements resolves aria-labelledby, element.labels, explicit labels, wrapping labels, and placeholders", () => {

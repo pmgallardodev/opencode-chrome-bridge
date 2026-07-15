@@ -150,19 +150,19 @@ if (!window.__opencodeA11yInstalled) {
     return truncate(parts.join(" "), max);
   }
 
-  function ariaLabelledByText(element) {
+  function ariaLabelledByText(element, omitHiddenDescendants = false) {
     const ids = (element.getAttribute("aria-labelledby") || "").trim().split(/\s+/u).filter(Boolean).slice(0, 20);
     const parts = [];
     for (const id of ids) {
       if (id.length > 128) continue;
       const labelled = element.ownerDocument.getElementById(id);
-      const text = safeElementText(labelled, 200);
+      const text = safeElementText(labelled, 200, true, omitHiddenDescendants);
       if (text) parts.push(text);
     }
     return truncate(parts.join(" "), 200);
   }
 
-  function labelText(element) {
+  function labelText(element, omitHiddenDescendants = false) {
     const labels = [];
     for (const label of Array.from(element.labels ?? []).slice(0, 20)) labels.push(label);
     if (element.id) {
@@ -176,7 +176,7 @@ if (!window.__opencodeA11yInstalled) {
     for (const label of labels) {
       if (!label || seen.has(label)) continue;
       seen.add(label);
-      const text = safeElementText(label, 200);
+      const text = safeElementText(label, 200, true, omitHiddenDescendants);
       if (text) parts.push(text);
     }
     return truncate(parts.join(" "), 200);
@@ -190,12 +190,12 @@ if (!window.__opencodeA11yInstalled) {
   function accessibleName(element, role, omitHiddenDescendants = false) {
     const aria = element.getAttribute("aria-label");
     if (aria && aria.trim()) return truncate(aria);
-    const labelledBy = ariaLabelledByText(element);
+    const labelledBy = ariaLabelledByText(element, omitHiddenDescendants);
     if (labelledBy) return labelledBy;
     const tag = element.tagName.toLowerCase();
 
     if (tag === "input" || tag === "textarea" || tag === "select") {
-      const external = labelText(element)
+      const external = labelText(element, omitHiddenDescendants)
         || (element.getAttribute("placeholder") || "").trim()
         || (element.getAttribute("title") || "").trim();
       if (isSensitiveField(element)) return external ? truncate(external) : "";
@@ -684,7 +684,7 @@ if (!window.__opencodeA11yInstalled) {
           && !sensitive) {
           const ref = refFor(element);
           const name = accessibleName(element, role, true);
-          const label = labelText(element);
+          const label = labelText(element, true);
           const placeholder = element.getAttribute("placeholder") || "";
           const text = safeElementText(element, 200, !CONTAINER_ROLES.has(role), true);
           const weightedFields = [
