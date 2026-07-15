@@ -113,6 +113,15 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
   "waitFor", "type"
 ]);
+const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
+  "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
+  "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
+  "Runtime.getProperties", "Page.navigate"
+]);
+const ATOMIC_MAIN_MUTATION_COMMANDS = new Set([
+  "back", "doubleClick", "evaluate", "forward", "hover", "keypress", "moveSequence",
+  "reload", "scroll", "type"
+]);
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -143,6 +152,8 @@ const networkTrackerAttached = new Set();
 const networkCaptureAttached = new Set();
 const networkWaitConsumers = new Map();
 const navigationSequences = new Map();
+const tabPageProvenance = new Map();
+const executionContextScopes = new Map();
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
@@ -542,6 +553,14 @@ async function executeScopedPageCommand(envelope, options) {
   const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes);
   const method = envelope.method;
   const params = envelope.params;
+  if (method === "click") return executeAtomicCoordinateClick(params, expectedScopes);
+  if (method === "clickElement" || method === "fillElement") {
+    const atomic = await executeAtomicBatchElementAction({ type: method, params }, expectedScopes);
+    return atomic.results[0].result;
+  }
+  if (ATOMIC_MAIN_MUTATION_COMMANDS.has(method)) return executeAtomicMainMutation(method, params, expectedScopes);
+  if (method === "fileUploadCommit") params.__expectedScopes = expectedScopes;
+  if (method === "setCursorState" || method === "setFaviconBadge") params.__expectedScopes = expectedScopes;
   if (method === "browserBatch") {
     if (!Array.isArray(params.actions) || params.actions.length !== 1) {
       throw new Error("origin-scoped browser batches must contain exactly one action");
@@ -553,13 +572,24 @@ async function executeScopedPageCommand(envelope, options) {
     }
     const tabId = action?.params?.tabId;
     if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
+    if (action.type === "clickElement" || action.type === "fillElement") {
+      return executeAtomicBatchElementAction(action, expectedScopes);
+    }
+    if (["reload", "back", "forward"].includes(action.type)) {
+      const value = await executeAtomicMainMutation(action.type, action.params, expectedScopes);
+      return {
+        completed: 1, elapsedMs: 0, ok: true,
+        results: [{ index: 0, ok: true, result: value, type: action.type }],
+        stoppedAt: null, totalActions: 1
+      };
+    }
     assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
     const batchResult = await executeCommand(method, params, options);
     assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
     return batchResult;
   }
-  if (method === "cdpCommand" && typeof params.method === "string" && params.method.startsWith("Target.")) {
-    throw new Error("Browser-wide Target CDP methods are not allowed; use the dedicated authorized target tools");
+  if (method === "cdpCommand" && !ALLOWED_RAW_PAGE_CDP_METHODS.has(params.method)) {
+    throw new Error(`CDP method ${String(params.method)} is not allowed; use a dedicated high-level browser tool`);
   }
   if (method === "cdpCommand" && params.method === "Page.navigate") {
     assertAuthorizedDestination(params.commandParams?.url, expectedScopes);
@@ -575,6 +605,106 @@ async function executeScopedPageCommand(envelope, options) {
     assertExpectedScopeAuthorized(afterScope, expectedScopes);
   }
   return result;
+}
+
+async function executeAtomicCoordinateClick(params, expectedScopes) {
+  const tabId = requireTabId(params);
+  const result = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (scopes, x, y, button) => {
+      const port = location.port || (location.protocol === "https:" ? "443" : "80");
+      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
+      if (!scopes.includes(scope)) return { authorized: false, scope };
+      const element = document.elementFromPoint(x, y);
+      if (!element) return { authorized: true, clicked: false };
+      const buttonCode = button === "middle" ? 1 : button === "right" ? 2 : 0;
+      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
+      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
+      if (buttonCode === 0 && typeof element.click === "function") element.click();
+      else element.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: buttonCode }));
+      return { authorized: true, clicked: true, scope };
+    },
+    args: [expectedScopes, requireFiniteNumber(params.x, "x"), requireFiniteNumber(params.y, "y"), requireButton(params.button)]
+  });
+  const outcome = result?.[0]?.result;
+  if (outcome?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${outcome?.scope ?? "unknown"}`);
+  if (outcome.clicked !== true) throw new Error("No clickable page element exists at the requested coordinates");
+  return { clicked: true, tabId, x: params.x, y: params.y };
+}
+
+async function executeAtomicMainMutation(method, params, expectedScopes) {
+  const tabId = requireTabId(params);
+  const result = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (scopes, action, input) => {
+      const port = location.port || (location.protocol === "https:" ? "443" : "80");
+      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
+      if (!scopes.includes(scope)) return { authorized: false, scope };
+      const target = document.activeElement || document.body || document.documentElement;
+      if (action === "reload") location.reload();
+      else if (action === "back") history.back();
+      else if (action === "forward") history.forward();
+      else if (action === "scroll") window.scrollBy(input.deltaX ?? 0, input.deltaY ?? 0);
+      else if (action === "evaluate") {
+        const value = (0, eval)(input.expression);
+        if (value && typeof value.then === "function") throw new Error("Async evaluation is not allowed in an atomic scoped mutation");
+        return { authorized: true, scope, value };
+      } else if (action === "type") {
+        const text = String(input.text ?? "");
+        if ("value" in target) target.value = `${target.value ?? ""}${text}`;
+        else target.textContent = `${target.textContent ?? ""}${text}`;
+        target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+      } else if (action === "keypress") {
+        target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: input.key }));
+        target.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: input.key }));
+      } else {
+        const point = action === "moveSequence" ? input.points?.at(-1) : input;
+        const x = Number(point?.x ?? 0);
+        const y = Number(point?.y ?? 0);
+        const element = document.elementFromPoint(x, y) || target;
+        const type = action === "doubleClick" ? "dblclick" : "mousemove";
+        element.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y }));
+      }
+      return { authorized: true, scope, value: true };
+    },
+    args: [expectedScopes, method, params]
+  });
+  const outcome = result?.[0]?.result;
+  if (outcome?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${outcome?.scope ?? "unknown"}`);
+  return method === "evaluate" ? outcome.value : { atomic: true, tabId };
+}
+
+async function executeAtomicBatchElementAction(action, expectedScopes) {
+  const tabId = requireTabId(action.params);
+  await injectA11yScript(tabId);
+  let result;
+  try {
+    result = await runInA11yWorld(tabId, (scopes, input) => {
+      const port = location.port || (location.protocol === "https:" ? "443" : "80");
+      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
+      if (!scopes.includes(scope)) return { authorized: false, scope };
+      const value = input.type === "clickElement"
+        ? window.__opencodeA11yAtomicClick?.(input.params.ref)
+        : window.__opencodeA11yAtomicFill?.(input.params.ref, input.params.text, input.params.clear);
+      return { authorized: true, scope, value };
+    }, [expectedScopes, action]);
+  } catch (error) {
+    const actualScope = safeCanonicalPermissionScope((await chrome.tabs.get(tabId)).url);
+    if (!actualScope || !expectedScopes.includes(actualScope)) {
+      throw new Error(`Page scope changed or is not authorized: ${actualScope ?? "unknown"}`);
+    }
+    throw error;
+  }
+  if (result.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${result.scope ?? "unknown"}`);
+  if (action.type === "clickElement" && result.value?.clicked !== true) throw new Error("Atomic element click failed");
+  if (action.type === "fillElement" && result.value?.filled !== true) throw new Error("Atomic element fill failed");
+  return {
+    completed: 1, elapsedMs: 0, ok: true,
+    results: [{ index: 0, ok: true, result: result.value, type: action.type }],
+    stoppedAt: null, totalActions: 1
+  };
 }
 
 function validateExpectedPageScopes(value) {
@@ -2000,7 +2130,7 @@ async function releaseDebuggers(params = {}) {
 
 async function notifyOverlay(tabId, type, data) {
   if (!await injectOverlay(tabId)) return;
-  await sendOverlayMessage(tabId, type, data);
+  return sendOverlayMessage(tabId, type, data);
 }
 
 async function withOverlayInputPassThrough(tabId, point, operation, signal) {
@@ -2033,7 +2163,7 @@ async function injectOverlay(tabId) {
 }
 
 async function sendOverlayMessage(tabId, type, data) {
-  await chrome.tabs.sendMessage(tabId, { source: OVERLAY_SOURCE, type, ...data }).catch(() => {});
+  return chrome.tabs.sendMessage(tabId, { source: OVERLAY_SOURCE, type, ...data }).catch(() => null);
 }
 
 function debuggerTarget(params) {
@@ -2092,12 +2222,25 @@ function registerBrowserEventListeners() {
   chrome.tabs.onCreated.addListener((tab) => sendEvent({ category: "tabs", type: "tabCreated", tab: tabInfo(tab) }));
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo?.status === "loading" || typeof changeInfo?.url === "string") {
-      navigationSequences.set(tabId, (navigationSequences.get(tabId) ?? 0) + 1);
+      const navigationGeneration = (navigationSequences.get(tabId) ?? 0) + 1;
+      navigationSequences.set(tabId, navigationGeneration);
+      updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration);
+      executionContextScopes.delete(tabId);
+      consoleLogBuffers.delete(tabId);
+      consoleLogBufferChars.delete(tabId);
+      networkRequestStates.delete(tabId);
+      if (networkTrackerAttached.has(tabId)) {
+        const state = ensureNetworkRequestState(tabId);
+        state.awaitingTopLevelDocument = true;
+        state.pageScope = tabPageProvenance.get(tabId)?.pageScope ?? null;
+      }
     }
     sendEvent({ category: "tabs", type: "tabUpdated", tabId, changeInfo, tab: tabInfo(tab) });
   });
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
     navigationSequences.delete(tabId);
+    tabPageProvenance.delete(tabId);
+    executionContextScopes.delete(tabId);
     const persistence = removeClosedTabLease(tabId);
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
@@ -2124,14 +2267,19 @@ function registerBrowserEventListeners() {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source?.tabId;
     if (!Number.isInteger(tabId)) return;
+    recordExecutionContextScope(tabId, method, params);
     if (networkTrackerAttached.has(tabId)) trackNetworkEvent(tabId, method, params);
     const subscribed = cdpSubscriptions.get(tabId);
     const collectsConsole = consoleLogAttached.has(tabId) && CONSOLE_LOG_METHODS.includes(method);
     if (!collectsConsole && (!subscribed || !subscribed.has(method))) return;
+    const provenance = cdpEventPageProvenance(tabId, method, params);
     if (collectsConsole) {
-      appendConsoleLog(tabId, method, params);
+      appendConsoleLog(tabId, method, params, provenance);
     }
-    sendEvent({ category: "cdp", type: "cdpEvent", tabId, method, params });
+    sendEvent({
+      category: "cdp", type: "cdpEvent", tabId, method,
+      ...(provenance ? { ...provenance, params } : { provenance: "unverified" })
+    });
   });
   chrome.debugger.onDetach.addListener((source, reason) => {
     const tabId = source?.tabId;
@@ -2146,9 +2294,63 @@ function registerBrowserEventListeners() {
       networkWaitConsumers.delete(tabId);
       networkRequestStates.delete(tabId);
       cdpEnabledDomains.delete(tabId);
+      executionContextScopes.delete(tabId);
       sendEvent({ category: "cdp", type: "cdpDetached", tabId, reason });
     }
   });
+}
+
+async function refreshTabPageProvenance(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  updateTabPageProvenanceFromTab(tabId, tab, navigationSequences.get(tabId) ?? 0);
+}
+
+function updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration) {
+  const pageScope = safeCanonicalPermissionScope(tab?.url);
+  if (!pageScope) {
+    tabPageProvenance.delete(tabId);
+    return;
+  }
+  tabPageProvenance.set(tabId, { navigationGeneration, pageScope });
+}
+
+function safeCanonicalPermissionScope(value) {
+  try { return canonicalPermissionScope(value); } catch { return null; }
+}
+
+function recordExecutionContextScope(tabId, method, params) {
+  if (method === "Runtime.executionContextDestroyed" && Number.isInteger(params?.executionContextId)) {
+    executionContextScopes.get(tabId)?.delete(params.executionContextId);
+    return;
+  }
+  if (method !== "Runtime.executionContextCreated") return;
+  const context = params?.context;
+  const pageScope = safeCanonicalPermissionScope(context?.origin);
+  if (!Number.isInteger(context?.id) || !pageScope) return;
+  let contexts = executionContextScopes.get(tabId);
+  if (!contexts) {
+    contexts = new Map();
+    executionContextScopes.set(tabId, contexts);
+  }
+  contexts.set(context.id, pageScope);
+}
+
+function cdpEventPageProvenance(tabId, method, params) {
+  let pageScope = null;
+  if (Number.isInteger(params?.executionContextId)) {
+    pageScope = executionContextScopes.get(tabId)?.get(params.executionContextId) ?? null;
+  }
+  if (!pageScope && method === "Runtime.executionContextCreated") {
+    pageScope = safeCanonicalPermissionScope(params?.context?.origin);
+  }
+  if (!pageScope) {
+    pageScope = safeCanonicalPermissionScope(
+      params?.message?.url ?? params?.entry?.url ?? params?.exceptionDetails?.url
+    );
+  }
+  const current = tabPageProvenance.get(tabId);
+  if (!pageScope || !current || pageScope !== current.pageScope) return null;
+  return { navigationGeneration: current.navigationGeneration, pageScope };
 }
 
 const CDP_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/u;
@@ -2156,6 +2358,7 @@ const VALID_MOUSE_BUTTONS = new Set(["left", "middle", "right"]);
 
 async function subscribeCdpEvents(params) {
   const tabId = requireTabId(params);
+  await refreshTabPageProvenance(tabId);
   const methods = Array.isArray(params.methods) ? params.methods : [];
   if (methods.length === 0 || methods.length > MAX_CDP_METHODS || !methods.every(isValidCdpMethod)) {
     throw new Error("methods must be a non-empty array of CDP method strings in 'Domain.method' format");
@@ -2342,7 +2545,8 @@ async function setCursorState(params) {
   if (!["active", "handoff", "deliverable", "hidden", "abort"].includes(state)) {
     throw new Error("state must be active, handoff, deliverable, hidden, or abort");
   }
-  await notifyOverlay(tabId, "cursor-state", { state });
+  const response = await notifyOverlay(tabId, "cursor-state", { state, expectedScopes: params.__expectedScopes });
+  if (params.__expectedScopes && response?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${response?.scope ?? "unknown"}`);
   return { tabId, state };
 }
 
@@ -2352,7 +2556,8 @@ async function setFaviconBadge(params) {
   if (badge !== null && !["active", "handoff", "deliverable"].includes(badge)) {
     throw new Error("badge must be active, handoff, deliverable, or null");
   }
-  await notifyOverlay(tabId, "favicon-badge", { badge });
+  const response = await notifyOverlay(tabId, "favicon-badge", { badge, expectedScopes: params.__expectedScopes });
+  if (params.__expectedScopes && response?.authorized !== true) throw new Error(`Page scope changed or is not authorized: ${response?.scope ?? "unknown"}`);
   return { tabId, badge };
 }
 
@@ -2526,11 +2731,24 @@ async function commitFileUpload(params, signal) {
       || !Array.isArray(prepared.names) || prepared.names.some((name, index) => name !== expectedNames[index])) {
       throw new Error("isolated upload preparation did not verify the exact files");
     }
-    const result = await runInA11yWorld(
+    const committed = await runInA11yWorld(
       tabId,
-      (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
-      ["commit", { transferId: params.transferId, ref }]
+      (action, payload, scopes) => {
+        const port = location.port || (location.protocol === "https:" ? "443" : "80");
+        const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
+        if (Array.isArray(scopes) && !scopes.includes(scope)) return { authorized: false, scope };
+        return {
+          authorized: true,
+          scope,
+          value: window.__opencodeA11yUpload?.(action, payload) ?? null
+        };
+      },
+      ["commit", { transferId: params.transferId, ref }, params.__expectedScopes]
     );
+    if (committed.authorized !== true) {
+      throw new Error(`Page scope changed or is not authorized: ${committed.scope ?? "unknown"}`);
+    }
+    const result = committed.value;
     if (result.committed !== true || result.count !== expectedNames.length
       || !Array.isArray(result.names) || result.names.some((name, index) => name !== expectedNames[index])) {
       throw new Error("isolated upload commit did not verify the exact files");
@@ -3426,6 +3644,7 @@ async function releaseNetworkWaitTracker(tabId) {
 
 async function ensureNetworkCaptureDebugger(tabId, signal) {
   const target = { tabId };
+  await refreshTabPageProvenance(tabId);
   return withDebuggerLock(debuggerKey(target), async () => {
     throwIfAborted(signal);
     const hadNetworkCapture = networkCaptureAttached.has(tabId);
@@ -3482,6 +3701,9 @@ function ensureNetworkRequestState(tabId) {
     lastActivityAt: trackingSince,
     nextCursor: 1,
     overflowed: false,
+    awaitingTopLevelDocument: false,
+    loaderId: null,
+    pageScope: tabPageProvenance.get(tabId)?.pageScope ?? null,
     requests: new Map(),
     trackingSince
   };
@@ -3510,6 +3732,14 @@ function trackNetworkEvent(tabId, method, params) {
   state.lastActivityAt = now;
 
   if (method === "Network.requestWillBeSent") {
+    if (state.awaitingTopLevelDocument) {
+      const requestScope = safeCanonicalPermissionScope(params?.request?.url);
+      if (params?.type !== "Document" || requestScope !== state.pageScope) return;
+      state.awaitingTopLevelDocument = false;
+      state.loaderId = typeof params?.loaderId === "string" ? params.loaderId : params.requestId;
+    } else if (state.loaderId && typeof params?.loaderId === "string" && params.loaderId !== state.loaderId) {
+      return;
+    }
     const cursor = state.nextCursor++;
     const previous = state.requests.get(requestId);
     let entry = previous;
@@ -3669,6 +3899,7 @@ function networkIdleSnapshot(tabId) {
 
 async function ensureConsoleLogDebugger(tabId) {
   const target = { tabId };
+  await refreshTabPageProvenance(tabId);
   return withDebuggerLock(debuggerKey(target), async () => {
     const alreadyAttached = consoleLogAttached.has(tabId);
     if (!isPersistentDebuggerAttached(tabId)) {
@@ -3680,7 +3911,8 @@ async function ensureConsoleLogDebugger(tabId) {
   });
 }
 
-function appendConsoleLog(tabId, method, params) {
+function appendConsoleLog(tabId, method, params, provenance) {
+  if (!provenance || provenance.pageScope !== tabPageProvenance.get(tabId)?.pageScope) return;
   let buffer = consoleLogBuffers.get(tabId);
   if (!buffer) {
     buffer = [];

@@ -863,6 +863,27 @@ if (!window.__opencodeA11yInstalled) {
     return { found: true, verified: current !== pending.before && current.includes(text) };
   };
 
+  window.__opencodeA11yAtomicClick = function (ref) {
+    const element = derefElement(ref);
+    if (!element || !isVisible(element) || isDisabled(element)) return { found: element !== null, clicked: false };
+    element.click();
+    return { found: true, clicked: true, role: roleFor(element), name: accessibleName(element, roleFor(element)) };
+  };
+
+  window.__opencodeA11yAtomicFill = function (ref, text, clear) {
+    const element = derefElement(ref);
+    if (!element || isDisabled(element)) return { found: element !== null, filled: false };
+    const tag = element.tagName.toLowerCase();
+    const editable = tag === "textarea" || (tag === "input" && WRITABLE_INPUT_TYPES.has((element.type || "text").toLowerCase())) || element.isContentEditable;
+    if (!editable) return { found: true, filled: false };
+    element.focus();
+    if (tag === "input" || tag === "textarea") element.value = clear === false ? `${element.value}${text}` : text;
+    else element.textContent = clear === false ? `${element.textContent}${text}` : text;
+    element.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    return { found: true, filled: true };
+  };
+
   window.__opencodeA11yUpload = function (action, payload) {
     const transferId = String(payload?.transferId ?? "");
     if (!/^[A-Za-z0-9_-]{8,128}$/u.test(transferId)) throw new Error("upload transfer id is invalid");

@@ -211,6 +211,24 @@ test("raw CDP rejects browser-wide Target methods before dispatch", async () => 
   assert.equal(bridge.calls.some((entry) => entry.method === "cdpCommand"), false);
 });
 
+test("raw CDP allowlist rejects global storage, cookie, and browser domains", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  for (const method of [
+    "Storage.getCookies", "Storage.clearDataForOrigin", "Network.getAllCookies",
+    "Network.setCookie", "Browser.getVersion", "Security.enable", "SystemInfo.getInfo"
+  ]) {
+    const bridge = installBridge(({ method: bridgeMethod }) => bridgeMethod === "getTab"
+      ? { id: 7, url: "https://example.com/app" }
+      : (() => { throw new Error("forbidden CDP dispatched"); })());
+    try {
+      await assert.rejects(() => plugin.tool.chrome_cdp.execute({ tabId: 7, method }, context([])), /CDP method.*not allowed|dedicated/iu, method);
+    } finally {
+      bridge.restore();
+    }
+    assert.equal(bridge.calls.some((entry) => entry.method === "cdpCommand"), false, method);
+  }
+});
+
 test("batch preflights a deduplicated origin union once before its first side effect", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];
@@ -308,6 +326,54 @@ test("batch navigation redirect requires the new scope before the following clic
     bridge.restore();
   }
   assert.equal(bridge.calls.filter((entry) => entry.method === "browserBatch").length, 1);
+});
+
+test("batch rechecks its total timeout after a slow origin approval", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const bridge = installBridge(({ method }) => method === "getTab"
+    ? { id: 7, url: "https://example.com/app" }
+    : (() => { throw new Error("expired batch action executed"); })());
+  const slow = context([]);
+  slow.ask = async (request) => {
+    if (request.permission === "browser.origin") await new Promise((resolve) => setTimeout(resolve, 70));
+  };
+  try {
+    const output = JSON.parse(await plugin.tool.chrome_batch.execute({
+      actions: [{ type: "clickElement", params: { tabId: 7, ref: "e1" } }],
+      totalTimeoutMs: 50
+    }, slow));
+    assert.equal(output.ok, false);
+    assert.match(output.results[0].error, /total timeout/iu);
+  } finally {
+    bridge.restore();
+  }
+  assert.equal(bridge.calls.some((entry) => entry.method === "browserBatch"), false);
+});
+
+test("batch stopOnError false continues after an action-specific failure", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  let batches = 0;
+  const bridge = installBridge(({ method, params }) => {
+    if (method === "getTab") return { id: params.tabId, url: "https://example.com/app" };
+    if (method === "browserBatch") {
+      batches += 1;
+      const action = params.actions[0];
+      return { results: [{ index: 0, ok: batches > 1, error: batches === 1 ? "first failed" : undefined, result: {}, type: action.type }] };
+    }
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    const output = JSON.parse(await plugin.tool.chrome_batch.execute({
+      actions: [
+        { type: "clickElement", params: { tabId: 7, ref: "e1" } },
+        { type: "fillElement", params: { tabId: 8, ref: "e2", text: "ok" } }
+      ],
+      stopOnError: false
+    }, context([])));
+    assert.deepEqual(output.results.map((entry) => [entry.index, entry.ok]), [[0, false], [1, true]]);
+  } finally {
+    bridge.restore();
+  }
 });
 
 test("internal tabs and targets are filtered before tool output", async () => {
@@ -462,4 +528,15 @@ test("origin-bearing events drop internal page metadata before exposure", () => 
     nextSeq: 3
   });
   assert.deepEqual(sanitized.events.map((entry) => entry.seq), [2]);
+});
+
+test("CDP events without capture-time page provenance never expose params", () => {
+  const sanitized = pluginModule.sanitizeOriginBearingEvents({
+    events: [
+      { seq: 1, event: { category: "cdp", method: "Runtime.consoleAPICalled", params: { args: [{ value: "secret-B" }], executionContextId: 12 } } },
+      { seq: 2, event: { category: "cdp", method: "Runtime.consoleAPICalled", pageScope: "https://a.example:443/", navigationGeneration: 3, params: { args: [{ value: "allowed-A" }] } } }
+    ]
+  });
+  assert.equal(sanitized.events.length, 1);
+  assert.equal(sanitized.events[0].seq, 2);
 });

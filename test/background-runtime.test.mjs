@@ -37,6 +37,72 @@ test("scoped CDP blocks cross-target Target methods and unauthorized Page.naviga
   assert.equal(harness.calls.debuggerCommands.length, 0);
 });
 
+test("scoped coordinate click has zero effect when navigation wins the precheck race", async () => {
+  let currentUrl = "https://example.com/app";
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: async () => { currentUrl = "https://other.example/private"; return []; }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedScopes: ["https://example.com:443/app"],
+    method: "click",
+    params: { tabId: 7, x: 10, y: 10, button: "left" }
+  }), /scope.*changed|not authorized/iu);
+  assert.equal(harness.calls.debuggerCommands.length, 0, "no CDP input effect may occur after the raced navigation");
+});
+
+test("scoped batch mutation has zero effect when navigation wins the action race", async () => {
+  let currentUrl = "https://example.com/app";
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: async () => { currentUrl = "https://other.example/private"; return []; }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedScopes: ["https://example.com:443/app"],
+    method: "browserBatch",
+    params: { actions: [{ type: "clickElement", params: { tabId: 7, ref: "e1" } }], totalTimeoutMs: 1000 }
+  }), /scope.*changed|not authorized/iu);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+});
+
+test("top-level B to A navigation cannot expose old or late B console entries", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Console.messageAdded",
+    { message: { level: "log", text: "secret-B", url: "https://b.example/private" } }
+  );
+  await harness.events.tabsOnUpdated.emit(7, { status: "loading", url: "https://a.example/" }, {
+    active: true, id: 7, url: "https://a.example/", windowId: 1
+  });
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Console.messageAdded",
+    { message: { level: "log", text: "late-secret-B", url: "https://b.example/private" } }
+  );
+  const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(result.logs.length, 0);
+});
+
+test("top-level B to A navigation cannot expose old or late B network entries", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 }, "Network.requestWillBeSent",
+    { requestId: "b-1", request: { method: "GET", url: "https://b.example/private" }, timestamp: 1, type: "Document" }
+  );
+  await harness.events.tabsOnUpdated.emit(7, { status: "loading", url: "https://a.example/" }, {
+    active: true, id: 7, url: "https://a.example/", windowId: 1
+  });
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 }, "Network.requestWillBeSent",
+    { requestId: "b-late", request: { method: "GET", url: "https://b.example/late" }, timestamp: 2, type: "XHR" }
+  );
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(result.requests.length, 0);
+});
+
 test("tab claims fail closed when session storage cannot be read", async () => {
   const harness = createBackgroundHarness({
     storageGet: async () => {
@@ -1235,7 +1301,7 @@ test("network-idle waits reset on activity and preserve console debugger consume
   await harness.events.debuggerOnEvent.emit(
     { tabId: 7 },
     "Console.messageAdded",
-    { message: { level: "info", text: "still collecting" } }
+    { message: { level: "info", text: "still collecting", url: "https://example.com/" } }
   );
   const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(logs.logs[0].text, "still collecting");
@@ -1518,7 +1584,7 @@ test("network capture cancellation during enable preserves prior debugger consum
   assert.equal(harness.networkTrackerState(7), null, "cancelled enable must not leave late capture active");
 
   await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Console.messageAdded", {
-    message: { level: "info", text: "console survived" }
+    message: { level: "info", text: "console survived", url: "https://example.com/" }
   });
   const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(logs.attached, true);
@@ -2179,7 +2245,7 @@ test("unsubscribing CDP events preserves persistent console collection", async (
   await harness.events.debuggerOnEvent.emit(
     { tabId: 7 },
     "Console.messageAdded",
-    { message: { level: "error", text: "still captured" } }
+    { message: { level: "error", text: "still captured", url: "https://example.com/" } }
   );
 
   const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
@@ -2196,7 +2262,7 @@ test("console logs and forwarded CDP events are bounded before buffering or nati
   await harness.events.debuggerOnEvent.emit(
     { tabId: 7 },
     "Console.messageAdded",
-    { message: { level: "error", text: oversizedText } }
+    { message: { level: "error", text: oversizedText, url: "https://example.com/" } }
   );
 
   const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
@@ -2955,6 +3021,7 @@ function createBackgroundHarness({
       sendMessage: async (_tabId, message) => {
         calls.sendMessage += 1;
         calls.overlayMessages.push(message);
+        return message.expectedScopes ? { authorized: true, scope: message.expectedScopes[0] } : undefined;
       },
       update: tabsUpdate,
       ungroup: tabsUngroup

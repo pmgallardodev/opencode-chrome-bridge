@@ -52,6 +52,11 @@ const RETURNED_URL_TOOLS = new Set([
 const BATCH_RETURNED_URL_ACTIONS = new Set([
   "activateTab", "back", "forward", "getTab", "navigate", "reload", "tabContext", "waitFor"
 ]);
+const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
+  "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
+  "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
+  "Runtime.getProperties", "Page.navigate"
+]);
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({
   activateTab: ["browser.tabs", "browser.windows"],
@@ -1174,6 +1179,7 @@ function requireApprovals(tools, schema) {
           return run(executionArgs, context);
         }
         const callGrants = new Set();
+        const operationStartedAt = name === "chrome_batch" ? Date.now() : undefined;
         validateRawCdpAccess(name, executionArgs);
         await resolveImplicitPageTarget(name, executionArgs);
         const beforeScopes = await resolvePageScopes(name, executionArgs);
@@ -1188,7 +1194,9 @@ function requireApprovals(tools, schema) {
           )
         };
         const result = name === "chrome_batch"
-          ? await runPermissionAwareBatch(executionArgs, args?.originGrant, context, describe(args), callGrants)
+          ? await runPermissionAwareBatch(
+            executionArgs, args?.originGrant, context, describe(args), callGrants, operationStartedAt
+          )
           : beforeScopes.length === 0
             ? await run(executionArgs, executionContext)
             : await withBridgePageScopes(beforeScopes, () => run(executionArgs, executionContext));
@@ -1207,8 +1215,8 @@ function requireApprovals(tools, schema) {
   return guarded;
 }
 
-async function runPermissionAwareBatch(args, originGrant, context, metadata, callGrants) {
-  const startedAt = Date.now();
+async function runPermissionAwareBatch(args, originGrant, context, metadata, callGrants, operationStartedAt) {
+  const startedAt = operationStartedAt ?? Date.now();
   const totalTimeoutMs = args.totalTimeoutMs ?? 60_000;
   const deadline = startedAt + totalTimeoutMs;
   const results = [];
@@ -1228,15 +1236,20 @@ async function runPermissionAwareBatch(args, originGrant, context, metadata, cal
       }, callGrants);
     } catch (error) {
       results.push({ error: error?.message ?? String(error), index, ok: false, type: action?.type });
-      stoppedAt = index;
-      break;
+      if (error?.pageOriginDenied === true || args.stopOnError !== false || remaining < 50) {
+        stoppedAt = index;
+        break;
+      }
+      continue;
     }
     try {
+      const actionRemaining = deadline - Date.now();
+      if (actionRemaining < 50) throw new Error(`browser batch total timeout after ${totalTimeoutMs}ms`);
       const executeOne = () => bridgeCommand("browserBatch", {
         actions: [action],
         stopOnError: true,
-        totalTimeoutMs: Math.min(remaining, totalTimeoutMs)
-      }, { timeoutMs: Math.min(125_000, remaining + 5_000) });
+        totalTimeoutMs: Math.min(actionRemaining, totalTimeoutMs)
+      }, { timeoutMs: Math.min(125_000, actionRemaining + 5_000) });
       const one = scopes.length === 0 ? await executeOne() : await withBridgePageScopes(scopes, executeOne);
       const entry = one?.results?.[0];
       if (!entry?.ok) throw new Error(entry?.error ?? `browser batch action ${index} failed`);
@@ -1313,6 +1326,9 @@ async function authorizePageScopes(scopes, originGrant, context, metadata, callG
       originCount: missing.length,
       origins: missing
     }
+  }).catch((error) => {
+    if (error && typeof error === "object") error.pageOriginDenied = true;
+    throw error;
   });
   for (const scope of missing) callGrants.add(scope);
   if (sessionID != null) cachePageOriginSessionGrants(sessionID, missing);
@@ -1359,8 +1375,8 @@ async function resolvePageScopes(name, args) {
 
 function validateRawCdpAccess(name, args) {
   if (name !== "chrome_cdp") return;
-  if (typeof args.method === "string" && args.method.startsWith("Target.")) {
-    throw new Error("Browser-wide Target CDP methods are not allowed; use chrome_cdp_targets");
+  if (!ALLOWED_RAW_PAGE_CDP_METHODS.has(args.method)) {
+    throw new Error(`CDP method ${String(args.method)} is not allowed; use a dedicated high-level browser tool`);
   }
 }
 
@@ -1453,7 +1469,15 @@ function filterOriginBearingEvents(payload) {
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.events)) return payload;
   return {
     ...payload,
-    events: payload.events.filter((event) => !containsUnsupportedPageUrl(event))
+    events: payload.events.filter((entry) => {
+      const event = entry?.event ?? entry;
+      if (event?.category === "cdp") {
+        return typeof event.pageScope === "string"
+          && Number.isInteger(event.navigationGeneration)
+          && isPagePermissionUrl(event.pageScope);
+      }
+      return !containsUnsupportedPageUrl(event);
+    })
   };
 }
 
@@ -1474,7 +1498,7 @@ function pageScopesFromObject(value) {
   const scopes = [];
   if (!value || typeof value !== "object") return scopes;
   for (const [key, entry] of Object.entries(value)) {
-    if ((key === "url" || key === "pendingUrl") && isPagePermissionUrl(entry)) scopes.push(canonicalPageScope(entry));
+    if ((key === "url" || key === "pendingUrl" || key === "pageScope") && isPagePermissionUrl(entry)) scopes.push(canonicalPageScope(entry));
     else if (entry && typeof entry === "object") scopes.push(...pageScopesFromObject(entry));
   }
   return [...new Set(scopes)].sort();

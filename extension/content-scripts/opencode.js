@@ -414,9 +414,18 @@ if (!window.__opencodeOverlayInstalled) {
     if (hideTimer !== null) { clearTimeout(hideTimer); hideTimer = null; }
   }
 
-  chrome.runtime.onMessage.addListener((message, sender) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id) return;
     if (message?.source !== OVERLAY_SOURCE) return;
+    if (Array.isArray(message.expectedScopes)) {
+      const port = location.port || (location.protocol === "https:" ? "443" : "80");
+      const scope = `${location.protocol}//${location.hostname}:${port}${location.pathname || "/"}`;
+      if (!message.expectedScopes.includes(scope)) {
+        sendResponse?.({ authorized: false, scope });
+        return;
+      }
+      sendResponse?.({ authorized: true, scope });
+    }
     switch (message.type) {
       case "cursor-move":
         showAt(message.x, message.y);
