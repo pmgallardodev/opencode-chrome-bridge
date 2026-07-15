@@ -476,6 +476,44 @@ test("readPage omits screenshot capture unless explicitly requested", async () =
   assert.equal(captures, 0);
 });
 
+test("readPage cancellation stops browser work before screenshot capture", async () => {
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  const delayedRead = new Promise((resolve) => { releaseRead = resolve; });
+  let captures = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      markReadStarted();
+      await delayedRead;
+      return [{
+        result: {
+          accessibility: { nodeCount: 0, tree: "", truncated: false },
+          context: { visibleText: "Page text" }
+        }
+      }];
+    },
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+  const controller = new AbortController();
+
+  const result = harness.execute(
+    "readPage",
+    { includeScreenshot: true, tabId: 7 },
+    { signal: controller.signal }
+  );
+  await readStarted;
+  controller.abort(new Error("read page cancelled"));
+  releaseRead();
+
+  await assert.rejects(result, /cancelled/u);
+  assert.equal(captures, 0);
+});
+
 test("tabContext and readPage fail closed on malformed isolated-world results", async () => {
   const malformedContext = createBackgroundHarness({
     scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { visibleText: 42 } }]
@@ -1916,10 +1954,11 @@ function createBackgroundHarness({
       }
       return response?.connected === true;
     },
-    execute(method, params) {
+    execute(method, params, options = {}) {
       context.__testMethod = method;
       context.__testParams = params;
-      return vm.runInContext("executeCommand(__testMethod, __testParams)", context);
+      context.__testOptions = options;
+      return vm.runInContext("executeCommand(__testMethod, __testParams, __testOptions)", context);
     },
     reloadTabLeases() {
       return vm.runInContext(

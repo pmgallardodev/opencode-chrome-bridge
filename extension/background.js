@@ -456,7 +456,7 @@ async function executeCommand(method, params, options = {}) {
     case "tabContext":
       return tabContext(params, options.signal);
     case "readPage":
-      return readPage(params);
+      return readPage(params, options.signal);
     case "findElements":
       return findElements(params, options.signal);
     case "waitFor":
@@ -1815,7 +1815,7 @@ async function tabContext(params, signal) {
   return { tabId, ...result };
 }
 
-async function readPage(params) {
+async function readPage(params, signal) {
   const tabId = requireTabId(params);
   const includeScreenshot = params.includeScreenshot === true;
   const options = {
@@ -1824,8 +1824,11 @@ async function readPage(params) {
     maxNodes: clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes"),
     maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
   };
-  const activatedTab = includeScreenshot ? await activateTab(tabId) : null;
+  throwIfAborted(signal);
+  const activatedTab = includeScreenshot ? await activateTab(tabId, signal) : null;
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const combined = await runInA11yWorld(
     tabId,
     (readOptions) => {
@@ -1837,20 +1840,25 @@ async function readPage(params) {
     },
     [options]
   );
+  throwIfAborted(signal);
   validateReadPageResult(combined);
   let screenshot = null;
   if (includeScreenshot) {
+    throwIfAborted(signal);
     const currentTab = await chrome.tabs.get(tabId);
+    throwIfAborted(signal);
     if (!Number.isInteger(activatedTab.windowId)
       || currentTab.active !== true
       || currentTab.windowId !== activatedTab.windowId) {
       throw new Error("read page target tab changed before screenshot capture");
     }
+    throwIfAborted(signal);
     screenshot = await captureScreenshot({
       format: params.screenshotFormat,
       quality: params.screenshotQuality,
       windowId: activatedTab.windowId
     });
+    throwIfAborted(signal);
   }
   return {
     tabId,
