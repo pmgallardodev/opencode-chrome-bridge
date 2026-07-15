@@ -2191,26 +2191,40 @@ function validateWaitCondition(condition) {
     return {
       type,
       value: requireWaitString(condition.value, "text condition value"),
-      caseSensitive: condition.caseSensitive === true
+      caseSensitive: optionalWaitBoolean(condition.caseSensitive, false, "text condition caseSensitive")
     };
   }
   if (type === "ref") {
-    return { type, ref: requireElementRef({ ref: condition.ref }), visibleOnly: condition.visibleOnly !== false };
+    return {
+      type,
+      ref: requireElementRef({ ref: condition.ref }),
+      visibleOnly: optionalWaitBoolean(condition.visibleOnly, true, "ref condition visibleOnly")
+    };
   }
   if (type === "selector") {
     return {
       type,
       selector: requireWaitString(condition.selector, "selector condition selector"),
-      visibleOnly: condition.visibleOnly !== false
+      visibleOnly: optionalWaitBoolean(condition.visibleOnly, true, "selector condition visibleOnly")
     };
   }
   if (type === "networkIdle") {
-    return { type, idleMs: clampInteger(condition.idleMs, 10, 30_000, 500, "idleMs") };
+    const idleMs = condition.idleMs ?? 500;
+    if (!Number.isInteger(idleMs) || idleMs < 10 || idleMs > 30_000) {
+      throw new Error("idleMs must be an integer from 10 to 30000");
+    }
+    return { type, idleMs };
   }
   if (!Number.isInteger(condition.downloadId) || condition.downloadId < 0) {
     throw new Error("download condition downloadId must be a non-negative integer");
   }
   return { type, downloadId: condition.downloadId };
+}
+
+function optionalWaitBoolean(value, fallback, name) {
+  if (value == null) return fallback;
+  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value;
 }
 
 function requireWaitString(value, name) {

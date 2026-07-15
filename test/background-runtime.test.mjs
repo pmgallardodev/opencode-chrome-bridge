@@ -585,6 +585,26 @@ test("waitFor validates one typed condition and bounds its timing controls", asy
     harness.execute("waitFor", { condition: { type: "unknown" }, tabId: 7, timeoutMs: 50 }),
     /condition type must be one of/u
   );
+  for (const condition of [
+    { type: "text", value: "ready", caseSensitive: "false" },
+    { type: "ref", ref: "e1", visibleOnly: 1 },
+    { type: "selector", selector: "button", visibleOnly: "true" }
+  ]) {
+    await assert.rejects(
+      harness.execute("waitFor", { condition, tabId: 7, timeoutMs: 50 }),
+      /must be a boolean/u
+    );
+  }
+  for (const idleMs of [9, 30_001]) {
+    await assert.rejects(
+      harness.execute("waitFor", {
+        condition: { type: "networkIdle", idleMs },
+        tabId: 7,
+        timeoutMs: 50
+      }),
+      /idleMs must be an integer from 10 to 30000/u
+    );
+  }
 });
 
 test("waitFor observes URL and only navigation that starts after the wait baseline", async () => {
@@ -1659,6 +1679,21 @@ test("browser batches reject forbidden and malformed actions before side effects
     }),
     /batch action 0.*unsupported fields.*unexpected/iu
   );
+  for (const condition of [
+    { type: "text", value: "ready", caseSensitive: "false" },
+    { type: "selector", selector: "button", visibleOnly: 1 },
+    { type: "networkIdle", idleMs: 30_001 }
+  ]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type: "waitFor", params: { tabId: 7, condition } }
+        ]
+      }),
+      /batch action 1|must be a boolean|idleMs must be an integer from 10 to 30000/iu
+    );
+  }
   assert.equal(getCalls, 0, "the complete batch must validate before its first action");
 });
 
