@@ -203,6 +203,73 @@ test("created navigation targets are adopted only from their own leased web sess
   assert.ok(grouped.some((entry) => entry.groupId === 41 && entry.tabIds[0] === 8));
 });
 
+for (const failureStage of ["group", "update"]) {
+  test(`child adoption rolls back completely when managed group ${failureStage} fails`, async () => {
+    const sourceLease = {
+      claimedAt: 1, groupId: 41, origin: "user", sessionId: "session-a",
+      state: "active", tabId: 7, turnId: "turn-a"
+    };
+    let stored = { opencodeTabLeases: { "7": sourceLease } };
+    let groupAttempts = 0;
+    let updateAttempts = 0;
+    let adoptionPhase = true;
+    const ungrouped = [];
+    const harness = createBackgroundHarness({
+      storageGet: async () => stored,
+      storageSet: async (value) => { stored = structuredClone(value); },
+      tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com", windowId: 1 }),
+      tabsGroup: async (options) => {
+        groupAttempts += 1;
+        if (failureStage === "group" && adoptionPhase) throw new Error("group failed");
+        return options.groupId ?? 55;
+      },
+      tabsUngroup: async (tabIds) => { ungrouped.push(...tabIds); },
+      tabGroupsUpdate: async (groupId, update) => {
+        updateAttempts += 1;
+        if (failureStage === "update" && updateAttempts === 1) throw new Error("group update failed");
+        return { id: groupId, ...update };
+      },
+      consoleError: () => {}
+    });
+
+    await harness.events.webNavigationOnCreatedNavigationTarget.emit({
+      sourceTabId: 7, tabId: 8, url: "https://child.example"
+    });
+    await harness.awaitTabLeaseQueue();
+    adoptionPhase = false;
+
+    assert.equal(stored.opencodeTabLeases["8"], undefined);
+    assert.ok(ungrouped.includes(8));
+    const claimed = await harness.execute("claimTab", {
+      tabId: 8, sessionId: "session-b", turnId: "turn-b", origin: "user"
+    });
+    assert.equal(claimed.sessionId, "session-b");
+    assert.equal(stored.opencodeTabLeases["8"].sessionId, "session-b");
+  });
+}
+
+test("created navigation targets adopt a legitimate about:blank popup", async () => {
+  const sourceLease = {
+    claimedAt: 1, groupId: 41, origin: "user", sessionId: "session-a",
+    state: "active", tabId: 7, turnId: "turn-a"
+  };
+  let stored = { opencodeTabLeases: { "7": sourceLease } };
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ id: tabId, url: "about:blank", windowId: 1 }),
+    tabsGroup: async (options) => options.groupId ?? 41
+  });
+
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({
+    sourceTabId: 7, tabId: 8, url: "about:blank"
+  });
+  await harness.awaitTabLeaseQueue();
+
+  assert.equal(stored.opencodeTabLeases["8"].sessionId, "session-a");
+  assert.equal(stored.opencodeTabLeases["8"].groupId, 41);
+});
+
 test("resumeSession recovers handoff tabs after restart and removes stale leases", async () => {
   const lease = (tabId, state, extra = {}) => ({
     claimedAt: 1, groupId: 41, origin: "agent", sessionId: "session-a",
@@ -241,24 +308,27 @@ test("resumeSession recovers handoff tabs after restart and removes stale leases
   assert.equal(activated[0].update.active, true);
 });
 
-test("child adoption fails closed before grouping when session storage cannot persist", async () => {
+test("child adoption remains grouped and fail closed when session storage cannot persist", async () => {
   const sourceLease = {
     claimedAt: 1, groupId: 41, origin: "user", sessionId: "session-a",
     state: "active", tabId: 7, turnId: "turn-a"
   };
   let grouped = 0;
+  const ungrouped = [];
   const harness = createBackgroundHarness({
     storageGet: async () => ({ opencodeTabLeases: { "7": sourceLease } }),
     storageSet: async () => { throw new Error("session storage write failed"); },
     tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com", windowId: 1 }),
     tabsGroup: async () => { grouped += 1; return 41; },
+    tabsUngroup: async (tabIds) => { ungrouped.push(...tabIds); },
     consoleError: () => {}
   });
 
   await harness.events.webNavigationOnCreatedNavigationTarget.emit({ sourceTabId: 7, tabId: 8, url: "https://child.example" });
   await harness.awaitTabLeaseQueue();
 
-  assert.equal(grouped, 0);
+  assert.equal(grouped, 1);
+  assert.deepEqual(ungrouped, []);
   await assert.rejects(
     harness.execute("claimTab", { tabId: 8, sessionId: "session-b", turnId: "turn-b", origin: "user" }),
     /already part of browser session session-a/u
@@ -1936,6 +2006,7 @@ function createBackgroundHarness({
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
   tabsGroup = async (options) => options.groupId ?? 1,
+  tabsUngroup = async () => {},
   tabsUpdate = async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 }),
   tabGroupsUpdate = async (groupId, update) => ({ id: groupId, ...update }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
@@ -2028,7 +2099,8 @@ function createBackgroundHarness({
         calls.sendMessage += 1;
         calls.overlayMessages.push(message);
       },
-      update: tabsUpdate
+      update: tabsUpdate,
+      ungroup: tabsUngroup
     },
     windows: {
       create: windowsCreate,

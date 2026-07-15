@@ -947,7 +947,7 @@ function sessionGroupId(sessionId) {
   return null;
 }
 
-async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = null) {
+async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = null, allowFallback = true) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) throw new Error("managed session group requires at least one tab");
   const groupOptions = { tabIds: [...new Set(tabIds)] };
   if (Number.isInteger(preferredGroupId) && preferredGroupId >= 0) groupOptions.groupId = preferredGroupId;
@@ -955,7 +955,7 @@ async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = n
   try {
     groupId = await chrome.tabs.group(groupOptions);
   } catch (error) {
-    if (groupOptions.groupId === undefined) throw error;
+    if (groupOptions.groupId === undefined || !allowFallback) throw error;
     groupId = await chrome.tabs.group({ tabIds: groupOptions.tabIds });
   }
   await chrome.tabGroups.update(groupId, {
@@ -969,6 +969,7 @@ function isAdoptableNavigationTarget(tab, eventUrl) {
   const candidates = [eventUrl, tab?.url].filter((value) => typeof value === "string" && value.length > 0);
   if (candidates.length === 0) return false;
   return candidates.every((value) => {
+    if (value === "about:blank") return true;
     try {
       return ["http:", "https:", "file:"].includes(new URL(value).protocol);
     } catch {
@@ -1012,13 +1013,21 @@ async function adoptCreatedNavigationTarget(details) {
     const nextLeases = new Map(tabLeases);
     nextLeases.set(details.tabId, adoptedLease);
     try {
+      await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], groupId, false);
+    } catch (error) {
+      await ungroupTabsIfAvailable([details.tabId]);
+      throw error;
+    }
+    try {
       await persistTabLeases(nextLeases);
     } catch (error) {
+      // Keep the successfully grouped tab and the in-memory lease together.
+      // Storage failures are fail-closed: this worker must not let another
+      // session claim the child while persistence is unavailable.
       replaceTabLeases(nextLeases);
       throw error;
     }
     replaceTabLeases(nextLeases);
-    await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], groupId);
     return { adopted: true, groupId, sessionId: sourceLease.sessionId, tabId: details.tabId };
   });
 }
