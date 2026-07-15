@@ -9,6 +9,66 @@ import {
   writeDataUrlToFile
 } from "./bridge-client.js";
 
+const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
+
+export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
+  chrome_accessibility_tree: capabilities("browser.accessibility", "browser.tabs"),
+  chrome_activate_tab: capabilities("browser.tabs", "browser.windows"),
+  chrome_back: capabilities("browser.navigation", "browser.tabs"),
+  chrome_blocked_urls: capabilities("browser.navigation"),
+  chrome_bookmarks: capabilities("browser.bookmarks"),
+  chrome_cdp: capabilities("browser.cdp"),
+  chrome_cdp_targets: capabilities("browser.cdp"),
+  chrome_claim_tab: capabilities("browser.tabs", "session.tab-leases"),
+  chrome_click: capabilities("browser.cdp", "browser.tabs"),
+  chrome_click_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_close_tab: capabilities("browser.tabs"),
+  chrome_cursor_state: capabilities("browser.tabs"),
+  chrome_dom_content: capabilities("browser.cdp", "browser.tabs"),
+  chrome_double_click: capabilities("browser.cdp", "browser.tabs"),
+  chrome_download_cancel: capabilities("browser.downloads"),
+  chrome_download_pause: capabilities("browser.downloads"),
+  chrome_download_resume: capabilities("browser.downloads"),
+  chrome_download_show: capabilities("browser.downloads"),
+  chrome_downloads_list: capabilities("browser.downloads"),
+  chrome_drag: capabilities("browser.cdp", "browser.tabs"),
+  chrome_end_turn: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
+  chrome_evaluate: capabilities("browser.cdp", "browser.tabs"),
+  chrome_events: capabilities("browser.events"),
+  chrome_favicon_badge: capabilities("browser.tabs"),
+  chrome_fill_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_finalize_tabs: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
+  chrome_forward: capabilities("browser.navigation", "browser.tabs"),
+  chrome_get_console_logs: capabilities("browser.cdp", "browser.console", "browser.tabs"),
+  chrome_get_tab: capabilities("browser.tabs"),
+  chrome_get_window_state: capabilities("browser.windows"),
+  chrome_group_tabs: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_history: capabilities("browser.history"),
+  chrome_hover: capabilities("browser.cdp", "browser.tabs"),
+  chrome_keypress: capabilities("browser.cdp", "browser.tabs"),
+  chrome_move: capabilities("browser.cdp", "browser.tabs"),
+  chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
+  chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
+  chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
+  chrome_release_debuggers: capabilities("browser.cdp"),
+  chrome_reload: capabilities("browser.navigation", "browser.tabs"),
+  chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_screenshot: capabilities("browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_screenshot_region: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_scroll: capabilities("browser.cdp", "browser.tabs"),
+  chrome_set_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_set_window_state: capabilities("browser.windows"),
+  chrome_subscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_tab_group_create: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_group_update: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_groups: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tabs: capabilities("browser.tabs"),
+  chrome_type: capabilities("browser.cdp", "browser.tabs"),
+  chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
+});
+
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
   const schema = tool.schema;
@@ -738,6 +798,7 @@ function requireApprovals(tools) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
+    const requiredCapabilities = requiredCapabilitiesForTool(name);
     const describe = APPROVAL_METADATA[name]
       ?? (() => ({ action: definition.description ?? `Run ${name}` }));
     const run = definition.execute;
@@ -753,7 +814,7 @@ function requireApprovals(tools) {
           always: [name],
           metadata: describe(args)
         });
-        await requireBridgeCapabilities(requiredCapabilitiesForTool(name));
+        await requireBridgeCapabilities(requiredCapabilities);
         return run(args, context);
       }
     };
@@ -762,32 +823,9 @@ function requireApprovals(tools) {
 }
 
 function requiredCapabilitiesForTool(name) {
-  const capability = name.includes("bookmark")
-    ? "browser.bookmarks"
-    : name.includes("history")
-      ? "browser.history"
-      : name.includes("download")
-        ? "browser.downloads"
-        : name.includes("tab_group")
-          ? "browser.tab-groups"
-          : name.includes("window")
-            ? "browser.windows"
-            : name.includes("screenshot")
-              ? "browser.screenshots"
-              : name.includes("console")
-                ? "browser.console"
-                : name.includes("cdp")
-                  ? "browser.cdp"
-                  : name.includes("accessibility") || name.endsWith("_element")
-                    ? "browser.accessibility"
-                    : name === "chrome_events"
-                      ? "browser.events"
-                      : name.includes("claim_tab") || name.includes("finalize_tabs") || name.includes("end_turn")
-                        ? "session.tab-leases"
-                        : name === "chrome_open" || name === "chrome_reload" || name === "chrome_back" || name === "chrome_forward"
-                          ? "browser.navigation"
-                          : "browser.tabs";
-  return ["bridge.handshake", capability].sort();
+  const required = TOOL_CAPABILITY_REQUIREMENTS[name];
+  if (!required) throw new Error(`Browser tool ${name} is missing an explicit capability declaration`);
+  return required;
 }
 
 function previewText(value) {

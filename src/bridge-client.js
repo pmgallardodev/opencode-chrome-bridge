@@ -77,9 +77,9 @@ export function validateBridgeStatus(payload) {
     }
     const protocolCompatible = isVersionInRange(extension.protocolVersion, host.protocolMin, host.protocolMax)
       && isVersionInRange(extension.protocolVersion, client.protocolMin, client.protocolMax);
-    const expectedCompatible = protocolCompatible && missingCapabilities.length === 0;
+    const expectedCompatible = protocolCompatible && missingCapabilities.length === 0 && diagnostics.length === 0;
     if (payload.compatible !== expectedCompatible) {
-      throw new Error("Bridge status compatibility is inconsistent with the negotiated protocol and capabilities");
+      throw new Error("Bridge status compatibility is inconsistent with the negotiated protocol, capabilities, or diagnostics");
     }
   } else if (payload.compatible) {
     throw new Error("Disconnected bridge status cannot be compatible");
