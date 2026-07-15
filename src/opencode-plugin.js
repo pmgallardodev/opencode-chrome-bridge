@@ -70,6 +70,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
   chrome_read_page: capabilities("browser.accessibility", "browser.page-context", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_resume_session: capabilities("browser.tab-groups", "browser.tabs", "session.resume"),
   chrome_release_debuggers: capabilities("browser.cdp"),
   chrome_reload: capabilities("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
@@ -313,6 +314,16 @@ export default async function OpenCodeChromeBridgePlugin() {
         },
         async execute(args) {
           return JSON.stringify(await bridgeCommand("finalizeTabs", args), null, 2);
+        }
+      }),
+      chrome_resume_session: tool({
+        description: "Resume live handoff tabs from a managed browser session, clean up stale leases, regroup them, and assign a new turn.",
+        args: {
+          sessionId: schema.string().min(1).max(100).describe("Browser-control session id to resume."),
+          turnId: schema.string().min(1).max(100).describe("New browser-control turn id.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("resumeSession", args), null, 2);
         }
       }),
       chrome_end_turn: tool({

@@ -136,6 +136,135 @@ test("endTurn keeps the active lease when persistence fails", async () => {
   );
 });
 
+test("claimed tabs reuse one named colored group per browser session", async () => {
+  let stored = {};
+  const grouped = [];
+  const groupUpdates = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGroup: async (options) => {
+      grouped.push(options);
+      return options.groupId ?? 41;
+    },
+    tabGroupsUpdate: async (groupId, update) => {
+      groupUpdates.push({ groupId, update });
+      return { id: groupId, ...update };
+    }
+  });
+
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" });
+  await harness.execute("claimTab", { tabId: 8, sessionId: "session-a", turnId: "turn-a", origin: "agent" });
+
+  assert.equal(JSON.stringify(grouped[0].tabIds), JSON.stringify([7]));
+  assert.equal(grouped[0].groupId, undefined);
+  assert.equal(JSON.stringify(grouped[1].tabIds), JSON.stringify([8]));
+  assert.equal(grouped[1].groupId, 41);
+  assert.equal(groupUpdates.length, 2);
+  for (const entry of groupUpdates) {
+    assert.equal(entry.groupId, 41);
+    assert.equal(entry.update.color, "blue");
+    assert.equal(entry.update.title, "OpenCode · session-a");
+  }
+  assert.equal(stored.opencodeTabLeases["7"].groupId, 41);
+  assert.equal(stored.opencodeTabLeases["8"].groupId, 41);
+});
+
+test("created navigation targets are adopted only from their own leased web session", async () => {
+  let stored = {};
+  const grouped = [];
+  const tabs = new Map([
+    [7, { id: 7, url: "https://source.example", windowId: 1 }],
+    [8, { id: 8, url: "https://child.example", windowId: 1 }],
+    [9, { id: 9, url: "https://other.example", windowId: 1 }],
+    [10, { id: 10, url: "chrome://settings", windowId: 1 }]
+  ]);
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => tabs.get(tabId),
+    tabsGroup: async (options) => {
+      grouped.push(options);
+      return options.groupId ?? 41;
+    }
+  });
+  await harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" });
+  await harness.execute("claimTab", { tabId: 9, sessionId: "session-b", turnId: "turn-b", origin: "user" });
+
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({ sourceTabId: 7, tabId: 8, url: "https://child.example" });
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({ sourceTabId: 7, tabId: 9, url: "https://other.example" });
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({ sourceTabId: 7, tabId: 10, url: "chrome://settings" });
+  await harness.awaitTabLeaseQueue();
+
+  assert.equal(stored.opencodeTabLeases["8"].sessionId, "session-a");
+  assert.equal(stored.opencodeTabLeases["8"].origin, "agent");
+  assert.equal(stored.opencodeTabLeases["9"].sessionId, "session-b");
+  assert.equal(stored.opencodeTabLeases["10"], undefined);
+  assert.ok(grouped.some((entry) => entry.groupId === 41 && entry.tabIds[0] === 8));
+});
+
+test("resumeSession recovers handoff tabs after restart and removes stale leases", async () => {
+  const lease = (tabId, state, extra = {}) => ({
+    claimedAt: 1, groupId: 41, origin: "agent", sessionId: "session-a",
+    state, tabId, turnId: "turn-old", ...extra
+  });
+  let stored = {
+    opencodeTabLeases: {
+      "7": lease(7, "handoff", { handoffStatus: "handoff" }),
+      "8": lease(8, "handoff", { handoffStatus: "deliverable" })
+    }
+  };
+  const activated = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => {
+      if (tabId === 8) throw new Error("No tab with id: 8");
+      return { id: tabId, url: "https://live.example", windowId: 1 };
+    },
+    tabsGroup: async (options) => options.groupId ?? 41,
+    tabsUpdate: async (tabId, update) => {
+      activated.push({ tabId, update });
+      return { active: true, id: tabId, index: 0, title: "Live", url: "https://live.example", windowId: 1 };
+    }
+  });
+
+  const result = await harness.execute("resumeSession", { sessionId: "session-a", turnId: "turn-new" });
+
+  assert.equal(JSON.stringify(result.recoveredTabIds), JSON.stringify([7]));
+  assert.equal(JSON.stringify(result.skipped), JSON.stringify([{ reason: "missing", tabId: 8 }]));
+  assert.equal(stored.opencodeTabLeases["8"], undefined);
+  assert.equal(stored.opencodeTabLeases["7"].state, "active");
+  assert.equal(stored.opencodeTabLeases["7"].turnId, "turn-new");
+  assert.equal(activated.length, 1);
+  assert.equal(activated[0].tabId, 7);
+  assert.equal(activated[0].update.active, true);
+});
+
+test("child adoption fails closed before grouping when session storage cannot persist", async () => {
+  const sourceLease = {
+    claimedAt: 1, groupId: 41, origin: "user", sessionId: "session-a",
+    state: "active", tabId: 7, turnId: "turn-a"
+  };
+  let grouped = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => ({ opencodeTabLeases: { "7": sourceLease } }),
+    storageSet: async () => { throw new Error("session storage write failed"); },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com", windowId: 1 }),
+    tabsGroup: async () => { grouped += 1; return 41; },
+    consoleError: () => {}
+  });
+
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({ sourceTabId: 7, tabId: 8, url: "https://child.example" });
+  await harness.awaitTabLeaseQueue();
+
+  assert.equal(grouped, 0);
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 8, sessionId: "session-b", turnId: "turn-b", origin: "user" }),
+    /already part of browser session session-a/u
+  );
+});
+
 test("finalizeTabs does not report or release an agent tab that Chrome failed to close", async () => {
   const harness = createBackgroundHarness({
     tabsRemove: async () => { throw new Error("tab close denied"); }
@@ -1806,7 +1935,9 @@ function createBackgroundHarness({
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
+  tabsGroup = async (options) => options.groupId ?? 1,
   tabsUpdate = async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 }),
+  tabGroupsUpdate = async (groupId, update) => ({ id: groupId, ...update }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId }),
   windowsUpdate = async (windowId) => ({ id: windowId })
@@ -1821,7 +1952,8 @@ function createBackgroundHarness({
     runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnReplaced: createEvent(),
-    tabsOnUpdated: createEvent()
+    tabsOnUpdated: createEvent(),
+    webNavigationOnCreatedNavigationTarget: createEvent()
   };
   const nativePort = {
     onDisconnect: events.nativeOnDisconnect,
@@ -1876,11 +2008,15 @@ function createBackgroundHarness({
       }
     },
     storage,
-    tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
+    tabGroups: {
+      onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent(),
+      update: tabGroupsUpdate
+    },
     tabs: {
       captureVisibleTab: tabsCaptureVisibleTab,
       create: tabsCreate,
       get: tabsGet,
+      group: tabsGroup,
       onActivated: createEvent(),
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
@@ -1900,7 +2036,8 @@ function createBackgroundHarness({
       getCurrent: async () => ({ id: 1 }),
       onFocusChanged: createEvent(),
       update: windowsUpdate
-    }
+    },
+    webNavigation: { onCreatedNavigationTarget: events.webNavigationOnCreatedNavigationTarget }
   };
   const harnessConsole = Object.create(console);
   harnessConsole.error = consoleError;

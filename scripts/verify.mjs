@@ -29,7 +29,8 @@ const expectedPermissions = [
   "scripting",
   "storage",
   "tabGroups",
-  "tabs"
+  "tabs",
+  "webNavigation"
 ];
 
 await checkJson("package.json");

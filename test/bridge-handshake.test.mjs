@@ -70,6 +70,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_open_window: caps("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: caps("browser.cdp", "browser.tabs"),
   chrome_read_page: caps("browser.accessibility", "browser.page-context", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_resume_session: caps("browser.tab-groups", "browser.tabs", "session.resume"),
   chrome_release_debuggers: caps("browser.cdp"),
   chrome_reload: caps("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: caps("browser.cdp", "browser.tabs"),

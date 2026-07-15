@@ -18,6 +18,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.tabs",
   "browser.wait",
   "browser.windows",
+  "session.resume",
   "session.tab-leases"
 ]);
 const RECONNECT_ALARM = "opencode-chrome-bridge-reconnect";
@@ -32,6 +33,8 @@ const MAX_EXTENSION_EVENT_CHARS = 170_000;
 const MAX_NATIVE_RESPONSE_BYTES = 15 * 1024 * 1024;
 const MAX_NATIVE_ERROR_CHARS = 2_000;
 const TAB_LEASES_STORAGE_KEY = "opencodeTabLeases";
+const MANAGED_GROUP_COLOR = "blue";
+const MANAGED_GROUP_TITLE_PREFIX = "OpenCode · ";
 const MAX_CAPTURE_DIMENSION = 10000;
 const MAX_CAPTURE_AREA = 25_000_000;
 const MAX_SCREENSHOT_BASE64_CHARS = Math.ceil((10 * 1024 * 1024) / 3) * 4;
@@ -415,6 +418,8 @@ async function executeCommand(method, params, options = {}) {
       return createWindow(params);
     case "claimTab":
       return claimTab(params);
+    case "resumeSession":
+      return resumeSession(params);
     case "finalizeTabs":
       return finalizeTabs(params);
     case "endTurn":
@@ -907,12 +912,15 @@ async function claimTab(params) {
     assertClaimableTab(tab);
     await ensureTabLeasesLoaded();
     const existing = tabLeases.get(tabId);
-    if (existing?.state === "active" && existing.sessionId !== sessionId) {
+    if (existing && existing.sessionId !== sessionId) {
       throw new Error(`Tab ${tabId} is already part of browser session ${existing.sessionId}`);
     }
+    const preferredGroupId = sessionGroupId(sessionId);
+    const groupId = await ensureManagedSessionGroup(sessionId, [tabId], preferredGroupId);
     const nextLeases = new Map(tabLeases);
     nextLeases.set(tabId, {
       claimedAt: Date.now(),
+      groupId,
       origin,
       sessionId,
       state: "active",
@@ -929,6 +937,147 @@ async function claimTab(params) {
     }
     replaceTabLeases(nextLeases);
     return { claimed: true, tabId, sessionId, turnId, origin };
+  });
+}
+
+function sessionGroupId(sessionId) {
+  for (const lease of tabLeases.values()) {
+    if (lease.sessionId === sessionId && Number.isInteger(lease.groupId) && lease.groupId >= 0) return lease.groupId;
+  }
+  return null;
+}
+
+async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = null) {
+  if (!Array.isArray(tabIds) || tabIds.length === 0) throw new Error("managed session group requires at least one tab");
+  const groupOptions = { tabIds: [...new Set(tabIds)] };
+  if (Number.isInteger(preferredGroupId) && preferredGroupId >= 0) groupOptions.groupId = preferredGroupId;
+  let groupId;
+  try {
+    groupId = await chrome.tabs.group(groupOptions);
+  } catch (error) {
+    if (groupOptions.groupId === undefined) throw error;
+    groupId = await chrome.tabs.group({ tabIds: groupOptions.tabIds });
+  }
+  await chrome.tabGroups.update(groupId, {
+    color: MANAGED_GROUP_COLOR,
+    title: `${MANAGED_GROUP_TITLE_PREFIX}${sessionId}`.slice(0, 255)
+  });
+  return groupId;
+}
+
+function isAdoptableNavigationTarget(tab, eventUrl) {
+  const candidates = [eventUrl, tab?.url].filter((value) => typeof value === "string" && value.length > 0);
+  if (candidates.length === 0) return false;
+  return candidates.every((value) => {
+    try {
+      return ["http:", "https:", "file:"].includes(new URL(value).protocol);
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function adoptCreatedNavigationTarget(details) {
+  if (!Number.isInteger(details?.sourceTabId) || !Number.isInteger(details?.tabId)) return { adopted: false, reason: "invalid" };
+  return withTabLeaseMutation(async () => {
+    await ensureTabLeasesLoaded();
+    const sourceLease = tabLeases.get(details.sourceTabId);
+    if (!sourceLease) return { adopted: false, reason: "unleased-source" };
+    const existing = tabLeases.get(details.tabId);
+    if (existing && existing.sessionId !== sourceLease.sessionId) {
+      return { adopted: false, reason: "cross-session" };
+    }
+    if (existing) return { adopted: false, reason: "already-leased" };
+    let tab;
+    try {
+      tab = await chrome.tabs.get(details.tabId);
+    } catch {
+      return { adopted: false, reason: "missing" };
+    }
+    if (!isAdoptableNavigationTarget(tab, details.url)) return { adopted: false, reason: "internal" };
+    assertClaimableTab(tab);
+    const groupId = Number.isInteger(sourceLease.groupId) && sourceLease.groupId >= 0
+      ? sourceLease.groupId
+      : null;
+    if (groupId === null) return { adopted: false, reason: "missing-group" };
+    const adoptedLease = {
+      claimedAt: Date.now(),
+      groupId,
+      origin: "agent",
+      sessionId: sourceLease.sessionId,
+      state: "active",
+      tabId: details.tabId,
+      turnId: sourceLease.turnId
+    };
+    const nextLeases = new Map(tabLeases);
+    nextLeases.set(details.tabId, adoptedLease);
+    try {
+      await persistTabLeases(nextLeases);
+    } catch (error) {
+      replaceTabLeases(nextLeases);
+      throw error;
+    }
+    replaceTabLeases(nextLeases);
+    await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], groupId);
+    return { adopted: true, groupId, sessionId: sourceLease.sessionId, tabId: details.tabId };
+  });
+}
+
+async function resumeSession(params) {
+  const sessionId = requireNonEmptyString(params.sessionId, "sessionId");
+  const turnId = requireNonEmptyString(params.turnId, "turnId");
+  return withTabLeaseMutation(async () => {
+    await ensureTabLeasesLoaded();
+    const nextLeases = new Map(tabLeases);
+    const liveLeases = [];
+    const recoveredTabIds = [];
+    const skipped = [];
+    const rejectedLiveTabIds = [];
+    for (const lease of tabLeases.values()) {
+      if (lease.sessionId !== sessionId) continue;
+      let tab;
+      try {
+        tab = await chrome.tabs.get(lease.tabId);
+      } catch {
+        nextLeases.delete(lease.tabId);
+        skipped.push({ reason: "missing", tabId: lease.tabId });
+        continue;
+      }
+      try {
+        assertClaimableTab(tab);
+      } catch {
+        nextLeases.delete(lease.tabId);
+        rejectedLiveTabIds.push(lease.tabId);
+        skipped.push({ reason: "internal", tabId: lease.tabId });
+        continue;
+      }
+      const resumed = lease.state === "handoff"
+        ? { ...lease, claimedAt: Date.now(), state: "active", turnId }
+        : lease;
+      if (lease.state === "handoff") recoveredTabIds.push(lease.tabId);
+      nextLeases.set(lease.tabId, resumed);
+      liveLeases.push(resumed);
+    }
+
+    await persistTabLeases(nextLeases);
+    replaceTabLeases(nextLeases);
+    if (rejectedLiveTabIds.length > 0 && typeof chrome.tabs.ungroup === "function") {
+      await chrome.tabs.ungroup(rejectedLiveTabIds).catch(() => {});
+    }
+
+    let groupId = null;
+    if (liveLeases.length > 0) {
+      const preferredGroupId = liveLeases.find((lease) => Number.isInteger(lease.groupId) && lease.groupId >= 0)?.groupId ?? null;
+      groupId = await ensureManagedSessionGroup(sessionId, liveLeases.map((lease) => lease.tabId), preferredGroupId);
+      if (liveLeases.some((lease) => lease.groupId !== groupId)) {
+        const regroupedLeases = new Map(tabLeases);
+        for (const lease of liveLeases) regroupedLeases.set(lease.tabId, { ...regroupedLeases.get(lease.tabId), groupId });
+        await persistTabLeases(regroupedLeases);
+        replaceTabLeases(regroupedLeases);
+      }
+    }
+    for (const tabId of recoveredTabIds) await chrome.tabs.update(tabId, { active: true });
+    return { groupId, recoveredTabIds, sessionId, skipped, turnId };
   });
 }
 
@@ -1005,6 +1154,7 @@ async function finalizeTabs(params) {
 
     await persistTabLeases(nextLeases);
     replaceTabLeases(nextLeases);
+    await ungroupTabsIfAvailable(releasedTabIds);
     await releaseDebuggers({ tabIds: releasedTabIds });
     if (closeFailures.length > 0) {
       const detail = closeFailures.map(({ error, tabId }) => `${tabId}: ${error?.message || error}`).join(", ");
@@ -1029,10 +1179,16 @@ async function endTurn(params) {
     if (releasedTabIds.length === 0) return { ended: true, releasedTabIds: [], sessionId, turnId };
     await persistTabLeases(nextLeases);
     replaceTabLeases(nextLeases);
+    await ungroupTabsIfAvailable(releasedTabIds);
     await releaseDebuggers({ tabIds: releasedTabIds });
     await Promise.all(releasedTabIds.map((tabId) => notifyOverlay(tabId, "cursor-state", { state: "hidden" })));
     return { ended: true, releasedTabIds, sessionId, turnId };
   });
+}
+
+async function ungroupTabsIfAvailable(tabIds) {
+  if (tabIds.length === 0 || typeof chrome.tabs.ungroup !== "function") return;
+  for (const tabId of tabIds) await chrome.tabs.ungroup([tabId]).catch(() => {});
 }
 
 function normalizeFinalizeKeep(keep) {
@@ -1098,6 +1254,7 @@ function isValidStoredTabLease(tabId, value) {
     && (value.origin === "agent" || value.origin === "user")
     && (value.state === "active" || value.state === "handoff")
     && Number.isFinite(value.claimedAt)
+    && (value.groupId === undefined || (Number.isInteger(value.groupId) && value.groupId >= 0))
     && (value.state !== "handoff" || value.handoffStatus === "handoff" || value.handoffStatus === "deliverable");
 }
 
@@ -1619,6 +1776,9 @@ function sendEvent(event) {
 }
 
 function registerBrowserEventListeners() {
+  chrome.webNavigation.onCreatedNavigationTarget.addListener((details) =>
+    adoptCreatedNavigationTarget(details).catch(reportLeasePersistenceError)
+  );
   chrome.tabs.onCreated.addListener((tab) => sendEvent({ category: "tabs", type: "tabCreated", tab: tabInfo(tab) }));
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo?.status === "loading" || typeof changeInfo?.url === "string") {

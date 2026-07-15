@@ -423,6 +423,28 @@ test("OpenCode plugin exposes session, cleanup, cursor, and favicon tools", asyn
   }
 });
 
+test("managed resumable sessions expose one capability-gated resume tool", async () => {
+  const pluginModule = await import("../src/opencode-plugin.js");
+  const plugin = await pluginModule.default({ client: {} });
+  assert.ok(plugin.tool.chrome_resume_session, "chrome_resume_session tool missing");
+  assert.match(plugin.tool.chrome_resume_session.description, /resume|handoff|session/iu);
+  assert.deepEqual(
+    [...pluginModule.TOOL_CAPABILITY_REQUIREMENTS.chrome_resume_session],
+    ["bridge.handshake", "browser.tab-groups", "browser.tabs", "session.resume"].sort()
+  );
+  assert.match(await readFile(path.join(repoRoot, "extension", "background.js"), "utf8"), /onCreatedNavigationTarget/u);
+});
+
+test("managed sessions add only webNavigation to the verified permission set", async () => {
+  const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
+  assert.ok(manifest.permissions.includes("webNavigation"));
+  for (const permission of ["notifications", "sessions", "unlimitedStorage"]) {
+    assert.equal(manifest.permissions.includes(permission), false, `${permission} must not be added`);
+  }
+  const verify = await readFile(path.join(repoRoot, "scripts", "verify.mjs"), "utf8");
+  assert.match(verify, /"webNavigation"/u);
+});
+
 test("OpenCode plugin chrome_drag accepts a points array and performs press-move-release", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
 
