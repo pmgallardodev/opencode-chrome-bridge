@@ -115,7 +115,14 @@ test("release metadata is synchronized for v1.2.0", async () => {
 
 test("README documents the exact Browser Intelligence public tools and safeguards", async () => {
   const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
-  const section = readme.match(/### Browser Intelligence\n([\s\S]*?)(?=\n### )/u)?.[1] ?? "";
+  const extractSection = (contents) => contents.match(
+    /### Browser Intelligence\r?\n([\s\S]*?)(?=\r?\n### )/u
+  )?.[1] ?? "";
+  const section = extractSection(readme);
+  assert.equal(
+    extractSection(readme.replace(/\r?\n/gu, "\r\n")).replace(/\r\n/gu, "\n"),
+    section.replace(/\r\n/gu, "\n")
+  );
   const documentedTools = [...section.matchAll(/\| `(chrome_[a-z_]+)` \|/gu)].map((match) => match[1]);
   assert.deepEqual(documentedTools, [
     "chrome_tab_context",
