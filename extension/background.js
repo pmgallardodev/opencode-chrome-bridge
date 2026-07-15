@@ -2079,7 +2079,9 @@ async function getNetworkRequests(params) {
   if (autoAttach) await ensureNetworkCaptureDebugger(tabId);
 
   const state = networkRequestStates.get(tabId);
-  const all = state ? [...state.requests.values()].map(publicNetworkEntry) : [];
+  const all = state
+    ? [...state.requests.values()].map(publicNetworkEntry).sort((left, right) => left.cursor - right.cursor)
+    : [];
   const matching = all.filter((entry) => entry.cursor > since
     && (methods.length === 0 || methods.includes(entry.method))
     && (resourceTypes.length === 0 || resourceTypes.includes(entry.resourceType))
@@ -2089,15 +2091,21 @@ async function getNetworkRequests(params) {
     && (!failuresOnly || entry.failure !== null));
   const requests = matching.slice(0, limit);
   const cursors = state ? [...state.requests.values()].map((entry) => entry.cursor) : [];
+  const latest = state ? state.nextCursor - 1 : 0;
+  const hasMore = matching.length > requests.length;
   const cursor = {
     dropped: state?.dropped ?? 0,
-    hasMore: matching.length > requests.length,
-    next: state ? state.nextCursor - 1 : 0,
-    oldest: cursors.length > 0 ? Math.min(...cursors) : null
+    hasMore,
+    latest,
+    next: hasMore ? requests.at(-1).cursor : latest,
+    oldest: cursors.length > 0 ? Math.min(...cursors) : null,
+    overflowed: state?.overflowed === true
   };
   if (clear && state) {
     state.requests.clear();
     state.bufferChars = 0;
+    state.dropped = 0;
+    state.overflowed = false;
   }
   return {
     attached: networkCaptureAttached.has(tabId),
@@ -3124,41 +3132,34 @@ function trackNetworkEvent(tabId, method, params) {
   state.lastActivityAt = now;
 
   if (method === "Network.requestWillBeSent") {
-    let entry = state.requests.get(requestId);
+    const cursor = state.nextCursor++;
+    const previous = state.requests.get(requestId);
+    let entry = previous;
     if (!entry && state.requests.size >= MAX_NETWORK_REQUEST_STATES) {
       const completedId = [...state.requests].find(([, candidate]) => candidate.inFlight === false)?.[0];
       if (completedId) removeNetworkEntry(state, completedId);
       else {
         state.overflowed = true;
+        state.dropped += 1;
         return;
       }
     }
-    if (!entry) {
-      entry = {
-        cursor: state.nextCursor++,
-        encodedLength: 0,
-        failure: null,
-        finishedAt: null,
-        initiatorType: "other",
-        method: "GET",
-        mimeType: "",
-        requestId,
-        resourceType: "Other",
-        startedAt: finiteNetworkNumber(params.timestamp, now),
-        status: null,
-        url: ""
-      };
-    } else {
-      state.bufferChars -= entry.bufferChars ?? 0;
-    }
-    entry.inFlight = true;
-    entry.startedAt = finiteNetworkNumber(params.timestamp, now);
-    entry.finishedAt = null;
-    entry.failure = null;
-    entry.method = sanitizeNetworkToken(params?.request?.method, 20, "GET").toUpperCase();
-    entry.url = redactNetworkUrl(params?.request?.url);
-    entry.resourceType = sanitizeNetworkToken(params?.type, 50, "Other");
-    entry.initiatorType = sanitizeNetworkToken(params?.initiator?.type, 50, "other");
+    if (previous) state.bufferChars -= previous.bufferChars ?? 0;
+    entry = {
+      cursor,
+      encodedLength: 0,
+      failure: null,
+      finishedAt: null,
+      inFlight: true,
+      initiatorType: sanitizeNetworkToken(params?.initiator?.type, 50, "other"),
+      method: sanitizeNetworkToken(params?.request?.method, 20, "GET").toUpperCase(),
+      mimeType: "",
+      requestId,
+      resourceType: sanitizeNetworkToken(params?.type, 50, "Other"),
+      startedAt: finiteNetworkNumber(params.timestamp, now),
+      status: null,
+      url: redactNetworkUrl(params?.request?.url)
+    };
     state.requests.delete(requestId);
     state.requests.set(requestId, entry);
     updateNetworkEntrySize(state, entry);
@@ -3169,6 +3170,7 @@ function trackNetworkEvent(tabId, method, params) {
   const entry = state.requests.get(requestId);
   if (!entry) return;
   state.bufferChars -= entry.bufferChars ?? 0;
+  entry.cursor = state.nextCursor++;
   if (method === "Network.responseReceived") {
     entry.resourceType = sanitizeNetworkToken(params?.type, 50, entry.resourceType);
     entry.status = Number.isInteger(params?.response?.status) ? params.response.status : entry.status;
@@ -3183,6 +3185,8 @@ function trackNetworkEvent(tabId, method, params) {
       entry.failure = truncateString(params?.errorText || "Network request failed", MAX_NETWORK_FAILURE_CHARS);
     }
   }
+  state.requests.delete(requestId);
+  state.requests.set(requestId, entry);
   updateNetworkEntrySize(state, entry);
   trimNetworkRequestState(state);
 }

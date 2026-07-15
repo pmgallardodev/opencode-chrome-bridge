@@ -1252,7 +1252,7 @@ test("network request summaries merge lifecycle events and redact sensitive URLs
   const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
   assert.equal(result.count, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(result.requests[0])), {
-    cursor: 1,
+    cursor: 3,
     encodedLength: 456,
     failure: null,
     finishedAt: 12,
@@ -1269,8 +1269,9 @@ test("network request summaries merge lifecycle events and redact sensitive URLs
   assert.equal(JSON.stringify(result).includes("alice:secret"), false);
   assert.equal(JSON.stringify(result).includes("hunter2"), false);
   assert.equal(JSON.stringify(result).includes("hidden"), false);
-  assert.equal(result.cursor.next, 1);
-  assert.equal(result.cursor.oldest, 1);
+  assert.equal(result.cursor.next, 3);
+  assert.equal(result.cursor.latest, 3);
+  assert.equal(result.cursor.oldest, 3);
 
   await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
     requestId: "request-2",
@@ -1279,9 +1280,143 @@ test("network request summaries merge lifecycle events and redact sensitive URLs
     request: { method: "GET", url: "data:text/plain,private-body-content" },
     initiator: { type: "other" }
   });
-  const withDataUrl = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: 1 });
+  const withDataUrl = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: result.cursor.next });
   assert.equal(withDataUrl.requests[0].url, "data:[REDACTED]");
   assert.equal(JSON.stringify(withDataUrl).includes("private-body-content"), false);
+});
+
+test("network request cursors advance on every lifecycle mutation", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "lifecycle", timestamp: 1, type: "Fetch",
+    request: { method: "GET", url: "https://example.com/api" }, initiator: { type: "script" }
+  });
+  const started = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(started.requests[0].cursor, 1);
+  assert.equal(started.cursor.next, 1);
+
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.responseReceived", {
+    requestId: "lifecycle", timestamp: 2, type: "Fetch",
+    response: { status: 202, mimeType: "application/json", encodedDataLength: 10 }
+  });
+  const responded = await harness.execute("networkRequests", {
+    tabId: 7, autoAttach: false, since: started.cursor.next
+  });
+  assert.equal(responded.count, 1);
+  assert.equal(responded.requests[0].cursor, 2);
+  assert.equal(responded.requests[0].status, 202);
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFinished", {
+    requestId: "lifecycle", timestamp: 3, encodedDataLength: 20
+  });
+  const completed = await harness.execute("networkRequests", {
+    tabId: 7, autoAttach: false, since: responded.cursor.next
+  });
+  assert.equal(completed.count, 1, "a poll after request start must observe the final mutation");
+  assert.equal(completed.requests[0].cursor, 3);
+  assert.equal(completed.requests[0].status, 202);
+  assert.equal(completed.requests[0].finishedAt, 3);
+  assert.equal(completed.cursor.next, 3);
+  assert.equal(completed.cursor.latest, 3);
+
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "failed", timestamp: 4, type: "Fetch",
+    request: { method: "GET", url: "https://example.com/fail" }, initiator: { type: "script" }
+  });
+  const failing = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: 3 });
+  assert.equal(failing.requests[0].cursor, 4);
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFailed", {
+    requestId: "failed", timestamp: 5, errorText: "blocked"
+  });
+  const failed = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: 4 });
+  assert.equal(failed.requests[0].cursor, 5);
+  assert.equal(failed.requests[0].failure, "blocked");
+});
+
+test("redirected request ids reset stale response state and move to the newest cursor", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "redirect", timestamp: 1, type: "Document",
+    request: { method: "GET", url: "https://example.com/old" }, initiator: { type: "parser" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.responseReceived", {
+    requestId: "redirect", timestamp: 2, type: "Document",
+    response: { status: 301, mimeType: "text/html", encodedDataLength: 99 }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFailed", {
+    requestId: "redirect", timestamp: 3, errorText: "old redirect failure"
+  });
+  const beforeRedirect = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "redirect", timestamp: 4, type: "Document",
+    request: { method: "GET", url: "https://example.com/new" }, initiator: { type: "redirect" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "other", timestamp: 5, type: "Fetch",
+    request: { method: "POST", url: "https://example.com/other" }, initiator: { type: "script" }
+  });
+  const afterRedirect = await harness.execute("networkRequests", {
+    tabId: 7, autoAttach: false, since: beforeRedirect.cursor.next
+  });
+  assert.equal(JSON.stringify(afterRedirect.requests.map((entry) => entry.requestId)), JSON.stringify(["redirect", "other"]));
+  assert.deepEqual(JSON.parse(JSON.stringify(afterRedirect.requests[0])), {
+    cursor: 4,
+    encodedLength: 0,
+    failure: null,
+    finishedAt: null,
+    initiatorType: "redirect",
+    method: "GET",
+    mimeType: "",
+    requestId: "redirect",
+    resourceType: "Document",
+    startedAt: 4,
+    status: null,
+    url: "https://example.com/new"
+  });
+  assert.equal(afterRedirect.requests[1].cursor, 5);
+});
+
+test("network cursor metadata reports discarded all-in-flight overflow", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  for (let index = 0; index <= 1_000; index += 1) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+      requestId: `in-flight-${index}`, timestamp: index, type: "Fetch",
+      request: { method: "GET", url: `https://example.com/${index}` }, initiator: { type: "script" }
+    });
+  }
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, limit: 1 });
+  assert.equal(result.cursor.overflowed, true);
+  assert.equal(result.cursor.dropped, 1);
+  assert.equal(result.cursor.latest, 1_001, "discarded incoming events still consume the high-water cursor");
+  await harness.execute("networkRequests", { tabId: 7, autoAttach: false, clear: true, limit: 1 });
+  const afterClear = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(afterClear.cursor.overflowed, false);
+  assert.equal(afterClear.cursor.dropped, 0);
+  assert.equal(afterClear.cursor.latest, 1_001, "clear must preserve the monotonic high-water cursor");
+});
+
+test("network cursor pagination advances only through the last returned entry", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  for (let index = 1; index <= 5; index += 1) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+      requestId: `page-${index}`, timestamp: index, type: "Fetch",
+      request: { method: "GET", url: `https://example.com/${index}` }, initiator: { type: "script" }
+    });
+  }
+  const seen = [];
+  let since = 0;
+  for (let page = 0; page < 3; page += 1) {
+    const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, limit: 2, since });
+    seen.push(...result.requests.map((entry) => entry.requestId));
+    assert.equal(result.cursor.latest, 5);
+    since = result.cursor.next;
+  }
+  assert.equal(JSON.stringify(seen), JSON.stringify(["page-1", "page-2", "page-3", "page-4", "page-5"]));
+  assert.equal(since, 5);
 });
 
 test("network request summaries filter stably, clear atomically, and coexist with debugger consumers", async () => {
@@ -1325,7 +1460,8 @@ test("network request summaries filter stably, clear atomically, and coexist wit
     limit: 10
   });
   assert.equal(JSON.stringify(filtered.requests.map((entry) => entry.requestId)), JSON.stringify(["c"]));
-  assert.equal(filtered.cursor.next, 3);
+  assert.equal(filtered.cursor.next, 9);
+  assert.equal(filtered.cursor.latest, 9);
   assert.equal(filtered.cursor.hasMore, false);
 
   const cleared = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, clear: true });
