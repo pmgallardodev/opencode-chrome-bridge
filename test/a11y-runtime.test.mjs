@@ -546,6 +546,20 @@ test("findElements bounds hostile nesting without overflowing the isolated world
   assert.equal(result.truncated, true);
 });
 
+test("findElements bounds hostile sibling collections before scanning or stacking them", () => {
+  const children = Array.from({ length: 10_000 }, (_value, index) =>
+    createElement("span", { text: index === 0 ? "bounded first child" : "" }));
+  const root = createElement("button", { children });
+  const harness = createA11yHarness([root]);
+  root.childNodes = hostileWideCollection(root.childNodes, 1_000_000, 1_000);
+  root.children = hostileWideCollection(root.children, 1_000_000, 10_000);
+
+  const result = harness.find({ query: "absent phrase", visibleOnly: false });
+
+  assert.equal(result.matches.length, 0);
+  assert.equal(result.truncated, true);
+});
+
 test("wait checks page text, selectors, and live refs without evaluating page JavaScript", () => {
   const button = createElement("button", { text: "Report ready" });
   const harness = createA11yHarness([button], { selectors: { "[data-ready]": button } });
@@ -737,6 +751,19 @@ function createElement(tagName, {
   };
   if (textNode) textNode.parentElement = element;
   return element;
+}
+
+function hostileWideCollection(items, logicalLength, maximumReadableIndex) {
+  return new Proxy(items, {
+    get(target, property, receiver) {
+      if (property === "length") return logicalLength;
+      if (typeof property === "string" && /^\d+$/u.test(property)
+        && Number(property) >= maximumReadableIndex) {
+        throw new Error(`collection read exceeded bounded index ${maximumReadableIndex}`);
+      }
+      return Reflect.get(target, property, receiver);
+    }
+  });
 }
 
 function attachElement(element, document, parentElement) {

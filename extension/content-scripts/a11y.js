@@ -122,6 +122,7 @@ if (!window.__opencodeA11yInstalled) {
     const parts = [];
     const stack = [{ element: root, depth: 0 }];
     let visited = 0;
+    let scannedChildNodes = 0;
     let length = 0;
     while (stack.length > 0 && visited < MAX_SAFE_TEXT_NODES && length <= max) {
       const { element, depth } = stack.pop();
@@ -129,7 +130,14 @@ if (!window.__opencodeA11yInstalled) {
       if (SKIP_TAGS.has(element.tagName)
         || isSensitiveField(element)
         || (omitHiddenDescendants && depth > 0 && !isVisible(element))) continue;
-      for (const node of element.childNodes ?? []) {
+      const childNodes = element.childNodes ?? [];
+      const childNodeCount = Math.min(
+        childNodes.length,
+        Math.max(0, MAX_SAFE_TEXT_NODES - scannedChildNodes)
+      );
+      for (let index = 0; index < childNodeCount; index += 1) {
+        const node = childNodes[index];
+        scannedChildNodes += 1;
         if (node.nodeType !== Node.TEXT_NODE) continue;
         const value = String(node.textContent ?? "").trim();
         if (!value) continue;
@@ -139,11 +147,15 @@ if (!window.__opencodeA11yInstalled) {
       }
       if (!includeDescendants || depth >= MAX_SAFE_TEXT_DEPTH || length > max) continue;
       const children = element.children ?? [];
-      for (let index = children.length - 1; index >= 0; index -= 1) {
+      const shadowChildren = shadowRootOf(element)?.children ?? [];
+      let remainingElements = Math.max(0, MAX_SAFE_TEXT_NODES - visited - stack.length);
+      const shadowCount = Math.min(shadowChildren.length, remainingElements);
+      remainingElements -= shadowCount;
+      const childCount = Math.min(children.length, remainingElements);
+      for (let index = childCount - 1; index >= 0; index -= 1) {
         stack.push({ element: children[index], depth: depth + 1 });
       }
-      const shadowChildren = shadowRootOf(element)?.children ?? [];
-      for (let index = shadowChildren.length - 1; index >= 0; index -= 1) {
+      for (let index = shadowCount - 1; index >= 0; index -= 1) {
         stack.push({ element: shadowChildren[index], depth: depth + 1 });
       }
     }
@@ -658,7 +670,11 @@ if (!window.__opencodeA11yInstalled) {
     let scanTruncated = false;
 
     function pushElements(stack, elements, sensitiveAncestor) {
-      for (let index = (elements?.length ?? 0) - 1; index >= 0; index -= 1) {
+      const elementCount = elements?.length ?? 0;
+      const remaining = Math.max(0, MAX_VISIBLE_TEXT_SCAN_NODES - documentOrder - stack.length);
+      const pushCount = Math.min(elementCount, remaining);
+      if (pushCount < elementCount) scanTruncated = true;
+      for (let index = pushCount - 1; index >= 0; index -= 1) {
         stack.push({ element: elements[index], sensitiveAncestor });
       }
     }

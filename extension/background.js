@@ -125,6 +125,14 @@ function connectNativeHost() {
     nativePort = chrome.runtime.connectNative(HOST_NAME);
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(() => {
+      const disconnectError = new Error("Native host disconnected");
+      for (const controller of activeNativeCommands.values()) controller.abort(disconnectError);
+      activeNativeCommands.clear();
+      for (const pending of pendingPings.values()) {
+        clearTimeout(pending.timer);
+        pending.resolve(null);
+      }
+      pendingPings.clear();
       nativePort = null;
       nativeHostReady = false;
       scheduleReconnect();

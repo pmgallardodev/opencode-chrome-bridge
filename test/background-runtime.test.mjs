@@ -853,6 +853,32 @@ test("native cancel ignores unknown or already completed command ids", async () 
   assert.equal(harness.activeNativeCommandCount(), 0);
 });
 
+test("native disconnect aborts active waits and releases debugger resources promptly", async () => {
+  const harness = createBackgroundHarness();
+  const commandHandling = harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "disconnect-active-wait",
+    method: "waitFor",
+    params: {
+      condition: { type: "networkIdle", idleMs: 30_000 },
+      pollIntervalMs: 1_000,
+      tabId: 7,
+      timeoutMs: 200
+    }
+  });
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+
+  const disconnectedAt = Date.now();
+  await harness.events.nativeOnDisconnect.emit();
+  await commandHandling;
+
+  assert.ok(Date.now() - disconnectedAt < 100, "disconnect cleanup must not wait for the command timeout");
+  assert.equal(harness.activeNativeCommandCount(), 0);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+});
+
 test("CDP unsubscription does not detach an active network-idle consumer", async () => {
   const harness = createBackgroundHarness();
   await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Network.responseReceived"] });
@@ -1514,6 +1540,7 @@ function createBackgroundHarness({
   const events = {
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent(),
+    nativeOnDisconnect: createEvent(),
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
@@ -1521,7 +1548,7 @@ function createBackgroundHarness({
     tabsOnUpdated: createEvent()
   };
   const nativePort = {
-    onDisconnect: createEvent(),
+    onDisconnect: events.nativeOnDisconnect,
     onMessage: events.nativeOnMessage,
     postMessage(message) {
       if (nativePostMessage) return nativePostMessage(message);
