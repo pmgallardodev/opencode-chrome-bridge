@@ -63,7 +63,13 @@ const MAX_NETWORK_FILTER_VALUES = 20;
 const MAX_NETWORK_URL_CHARS = 2_048;
 const MAX_NETWORK_FAILURE_CHARS = 500;
 const MAX_NETWORK_FILTER_CHARS = 500;
-const SENSITIVE_QUERY_KEY_RE = /(?:auth|code|cookie|credential|key|nonce|pass|secret|session|sig|token)/iu;
+const SENSITIVE_QUERY_KEYS = new Set([
+  "access", "accesstoken", "apikey", "assertion", "auth", "authorization", "authorizationcode",
+  "authtoken", "bearer", "clientsecret", "code", "cookie", "credential", "credentials", "idtoken",
+  "jwt", "key", "nonce", "oauth", "oauthtoken", "pass", "passwd", "password", "refresh",
+  "refreshtoken", "relaystate", "samlrequest", "samlresponse", "secret", "session", "sig",
+  "signature", "ticket", "token"
+]);
 const MAX_BATCH_ACTIONS = 25;
 const MAX_BATCH_PAYLOAD_BYTES = 100_000;
 const MIN_BATCH_TIMEOUT_MS = 50;
@@ -390,7 +396,7 @@ async function executeCommand(method, params, options = {}) {
     case "getConsoleLogs":
       return getConsoleLogs(params);
     case "networkRequests":
-      return getNetworkRequests(params);
+      return getNetworkRequests(params, options.signal);
     case "click":
       return dispatchClick(params, options.signal);
     case "doubleClick":
@@ -2058,7 +2064,8 @@ async function getConsoleLogs(params) {
   };
 }
 
-async function getNetworkRequests(params) {
+async function getNetworkRequests(params, signal) {
+  throwIfAborted(signal);
   assertNetworkRequestFields(params);
   const tabId = requireTabId(params);
   const clear = optionalStrictBoolean(params.clear, false, "clear");
@@ -2076,13 +2083,18 @@ async function getNetworkRequests(params) {
   }
   const since = strictNetworkInteger(params.since, 0, Number.MAX_SAFE_INTEGER, 0, "since");
   const limit = strictNetworkInteger(params.limit, 1, MAX_NETWORK_RESULT_LIMIT, 100, "limit");
-  if (autoAttach) await ensureNetworkCaptureDebugger(tabId);
+  if (autoAttach) await ensureNetworkCaptureDebugger(tabId, signal);
+  throwIfAborted(signal);
 
   const state = networkRequestStates.get(tabId);
+  const clearedThroughCursor = state?.clearedThroughCursor ?? 0;
   const all = state
-    ? [...state.requests.values()].map(publicNetworkEntry).sort((left, right) => left.cursor - right.cursor)
+    ? [...state.requests.values()]
+      .map(publicNetworkEntry)
+      .filter((entry) => entry.cursor > clearedThroughCursor)
+      .sort((left, right) => left.cursor - right.cursor)
     : [];
-  const matching = all.filter((entry) => entry.cursor > since
+  const matching = all.filter((entry) => entry.cursor > Math.max(since, clearedThroughCursor)
     && (methods.length === 0 || methods.includes(entry.method))
     && (resourceTypes.length === 0 || resourceTypes.includes(entry.resourceType))
     && (urlContains === null || entry.url.includes(urlContains))
@@ -2090,10 +2102,11 @@ async function getNetworkRequests(params) {
     && (statusMax === null || (entry.status !== null && entry.status <= statusMax))
     && (!failuresOnly || entry.failure !== null));
   const requests = matching.slice(0, limit);
-  const cursors = state ? [...state.requests.values()].map((entry) => entry.cursor) : [];
+  const cursors = all.map((entry) => entry.cursor);
   const latest = state ? state.nextCursor - 1 : 0;
   const hasMore = matching.length > requests.length;
   const cursor = {
+    clearedThroughCursor,
     dropped: state?.dropped ?? 0,
     hasMore,
     latest,
@@ -2102,11 +2115,16 @@ async function getNetworkRequests(params) {
     overflowed: state?.overflowed === true
   };
   if (clear && state) {
-    state.requests.clear();
-    state.bufferChars = 0;
-    state.dropped = 0;
-    state.overflowed = false;
+    state.clearedThroughCursor = latest;
+    for (const [requestId, entry] of state.requests) {
+      if (entry.inFlight !== true) removeNetworkEntry(state, requestId, false);
+    }
+    cursor.clearedThroughCursor = latest;
+    cursor.hasMore = false;
+    cursor.next = latest;
+    cursor.oldest = null;
   }
+  throwIfAborted(signal);
   return {
     attached: networkCaptureAttached.has(tabId),
     count: requests.length,
@@ -3063,29 +3081,42 @@ async function releaseNetworkWaitTracker(tabId) {
   });
 }
 
-async function ensureNetworkCaptureDebugger(tabId) {
+async function ensureNetworkCaptureDebugger(tabId, signal) {
   const target = { tabId };
   return withDebuggerLock(debuggerKey(target), async () => {
+    throwIfAborted(signal);
     if (networkCaptureAttached.has(tabId)) {
+      throwIfAborted(signal);
       return { attached: true, alreadyAttached: true, tabId };
     }
     const reused = isPersistentDebuggerAttached(tabId);
+    const hadNetworkDomain = cdpEnabledDomains.get(tabId)?.has("Network") === true;
+    const hadNetworkState = networkRequestStates.has(tabId);
+    const hadNetworkTracker = networkTrackerAttached.has(tabId);
     let attachedHere = false;
     try {
       if (!reused) {
+        throwIfAborted(signal);
         await chrome.debugger.attach(target, DEBUGGER_VERSION);
         attachedHere = true;
+        throwIfAborted(signal);
       }
       ensureNetworkRequestState(tabId);
       networkTrackerAttached.add(tabId);
       networkCaptureAttached.add(tabId);
-      await enableRequiredCdpDomain(target, "Network");
+      throwIfAborted(signal);
+      await enableRequiredCdpDomain(target, "Network", signal);
+      throwIfAborted(signal);
       return { attached: true, alreadyAttached: false, tabId };
     } catch (error) {
       networkCaptureAttached.delete(tabId);
-      if ((networkWaitConsumers.get(tabId) ?? 0) === 0) {
-        networkTrackerAttached.delete(tabId);
-        networkRequestStates.delete(tabId);
+      if (!hadNetworkTracker) networkTrackerAttached.delete(tabId);
+      if (!hadNetworkState) networkRequestStates.delete(tabId);
+      const enabled = cdpEnabledDomains.get(tabId);
+      if (!attachedHere && !hadNetworkDomain && enabled?.has("Network")) {
+        await chrome.debugger.sendCommand(target, "Network.disable", {}).catch(() => {});
+        enabled.delete("Network");
+        if (enabled.size === 0) cdpEnabledDomains.delete(tabId);
       }
       if (attachedHere) {
         cdpEnabledDomains.delete(tabId);
@@ -3102,6 +3133,7 @@ function ensureNetworkRequestState(tabId) {
   const trackingSince = Date.now();
   state = {
     bufferChars: 0,
+    clearedThroughCursor: 0,
     dropped: 0,
     lastActivityAt: trackingSince,
     nextCursor: 1,
@@ -3113,13 +3145,15 @@ function ensureNetworkRequestState(tabId) {
   return state;
 }
 
-async function enableRequiredCdpDomain(target, domain) {
+async function enableRequiredCdpDomain(target, domain, signal) {
   const tabId = target.tabId;
   const enabled = cdpEnabledDomains.get(tabId) ?? new Set();
   if (!enabled.has(domain)) {
+    throwIfAborted(signal);
     await chrome.debugger.sendCommand(target, `${domain}.enable`, {});
     enabled.add(domain);
     cdpEnabledDomains.set(tabId, enabled);
+    throwIfAborted(signal);
   }
 }
 
@@ -3202,12 +3236,18 @@ function redactNetworkUrl(value) {
     parsed.password = "";
     parsed.hash = "";
     for (const key of [...parsed.searchParams.keys()]) {
-      if (SENSITIVE_QUERY_KEY_RE.test(key)) parsed.searchParams.set(key, "[REDACTED]");
+      if (isSensitiveQueryKey(key)) parsed.searchParams.set(key, "[REDACTED]");
     }
     return truncateString(parsed.href, MAX_NETWORK_URL_CHARS);
   } catch {
     return "[invalid URL]";
   }
+}
+
+function isSensitiveQueryKey(key) {
+  if (typeof key !== "string") return false;
+  const normalized = key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/gu, "");
+  return SENSITIVE_QUERY_KEYS.has(normalized);
 }
 
 function sanitizeNetworkToken(value, maxChars, fallback) {
@@ -3244,12 +3284,12 @@ function updateNetworkEntrySize(state, entry) {
   state.bufferChars += entry.bufferChars;
 }
 
-function removeNetworkEntry(state, requestId) {
+function removeNetworkEntry(state, requestId, countAsDropped = true) {
   const entry = state.requests.get(requestId);
   if (!entry) return false;
   state.requests.delete(requestId);
   state.bufferChars -= entry.bufferChars ?? 0;
-  state.dropped += 1;
+  if (countAsDropped) state.dropped += 1;
   return true;
 }
 

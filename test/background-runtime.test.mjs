@@ -1393,9 +1393,131 @@ test("network cursor metadata reports discarded all-in-flight overflow", async (
   assert.equal(result.cursor.latest, 1_001, "discarded incoming events still consume the high-water cursor");
   await harness.execute("networkRequests", { tabId: 7, autoAttach: false, clear: true, limit: 1 });
   const afterClear = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
-  assert.equal(afterClear.cursor.overflowed, false);
-  assert.equal(afterClear.cursor.dropped, 0);
+  assert.equal(afterClear.cursor.overflowed, true, "clear must not erase unknown in-flight overflow");
+  assert.equal(afterClear.cursor.dropped, 1);
   assert.equal(afterClear.cursor.latest, 1_001, "clear must preserve the monotonic high-water cursor");
+  for (let index = 0; index < 1_000; index += 1) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFinished", {
+      requestId: `in-flight-${index}`, timestamp: 2_000 + index, encodedDataLength: 1
+    });
+  }
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "networkIdle", idleMs: 10 }, pollIntervalMs: 10, tabId: 7, timeoutMs: 50
+    }),
+    /timed out waiting for networkIdle/u,
+    "unknown overflow must remain fail-closed even after known requests finish"
+  );
+});
+
+test("network clear hides history but preserves in-flight requests for network-idle", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "still-running", timestamp: 1, type: "Fetch",
+    request: { method: "GET", url: "https://example.com/slow" }, initiator: { type: "script" }
+  });
+  const cleared = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, clear: true });
+  assert.equal(cleared.count, 1);
+  assert.equal(cleared.cursor.clearedThroughCursor, 1);
+  assert.equal(cleared.cursor.hasMore, false);
+  assert.equal(cleared.cursor.oldest, null);
+  const hidden = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(hidden.count, 0);
+  assert.equal(hidden.cursor.clearedThroughCursor, 1);
+
+  let settled = false;
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 30 }, pollIntervalMs: 10, tabId: 7, timeoutMs: 300
+  }).finally(() => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(settled, false, "clear must not make an active request disappear from network-idle");
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFinished", {
+    requestId: "still-running", timestamp: 2, encodedDataLength: 10
+  });
+  const result = await waiting;
+  assert.equal(result.inFlight, 0);
+  const finished = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: hidden.cursor.next });
+  assert.equal(finished.count, 1);
+  assert.equal(finished.cursor.clearedThroughCursor, 1);
+  assert.equal(finished.cursor.oldest, 2);
+});
+
+test("network capture cancellation during attach rolls back without late state", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  const harness = createBackgroundHarness({ debuggerAttach: async () => attachGate });
+  const controller = new AbortController();
+  const capture = harness.execute("networkRequests", { tabId: 7 }, { signal: controller.signal });
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  controller.abort(new Error("cancel attach"));
+  releaseAttach();
+  await assert.rejects(capture, /cancel|cancelled/u);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.equal(harness.networkTrackerState(7), null);
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "late", timestamp: 1, request: { method: "GET", url: "https://example.com/late" }
+  });
+  assert.equal((await harness.execute("networkRequests", { tabId: 7, autoAttach: false })).count, 0);
+});
+
+test("network capture cancellation during enable preserves prior debugger consumers", async () => {
+  let releaseEnable;
+  const enableGate = new Promise((resolve) => { releaseEnable = resolve; });
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Network.enable" ? enableGate : {}
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+  const controller = new AbortController();
+  const capture = harness.execute("networkRequests", { tabId: 7 }, { signal: controller.signal });
+  for (let attempt = 0; attempt < 50
+    && !harness.calls.debuggerCommands.some((entry) => entry.method === "Network.enable"); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  controller.abort(new Error("cancel enable"));
+  releaseEnable({});
+  await assert.rejects(capture, /cancel|cancelled/u);
+  assert.equal(harness.calls.debuggerDetach.length, 0, "a reused console debugger must remain attached");
+  assert.ok(harness.calls.debuggerCommands.some((entry) => entry.method === "Network.disable"));
+  assert.equal(harness.networkTrackerState(7), null);
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "late-after-enable", timestamp: 1,
+    request: { method: "GET", url: "https://example.com/late-enable" }
+  });
+  assert.equal(harness.networkTrackerState(7), null, "cancelled enable must not leave late capture active");
+
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Console.messageAdded", {
+    message: { level: "info", text: "console survived" }
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.attached, true);
+  assert.equal(logs.logs[0].text, "console survived");
+});
+
+test("network URL redaction normalizes encoded sensitive query names", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  const sensitiveKeys = [
+    "%53AML_Response", "saml-request", "Assertion", "JWT", "Bearer", "ticket",
+    "Relay-State", "oauth", "access_token", "refresh-token", "id.token",
+    "authorization%5Fcode", "client_secret", "api-key"
+  ];
+  for (const [index, key] of sensitiveKeys.entries()) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+      requestId: `sensitive-${index}`, timestamp: index, type: "Fetch",
+      request: { method: "GET", url: `https://example.com/api?${key}=private-${index}&query=visible-${index}` },
+      initiator: { type: "script" }
+    });
+  }
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, limit: 100 });
+  assert.equal(result.count, sensitiveKeys.length);
+  for (const [index, entry] of result.requests.entries()) {
+    assert.equal(entry.url.includes(`private-${index}`), false, `sensitive key ${sensitiveKeys[index]} leaked`);
+    assert.equal(entry.url.includes(`query=visible-${index}`), true, "benign query values must remain useful");
+    assert.equal(entry.url.includes("%5BREDACTED%5D"), true);
+  }
 });
 
 test("network cursor pagination advances only through the last returned entry", async () => {
@@ -2492,6 +2614,7 @@ test("browser batches bound action count and serialized payload size", async () 
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
+  debuggerAttach = async () => {},
   debuggerSendCommand = async () => ({}),
   consoleError = () => {},
   downloadsSearch = async () => [],
@@ -2552,7 +2675,10 @@ function createBackgroundHarness({
     },
     bookmarks: { search: async () => [] },
     debugger: {
-      attach: async (target) => { calls.debuggerAttach.push(target); },
+      attach: async (target) => {
+        calls.debuggerAttach.push(target);
+        return debuggerAttach(target);
+      },
       detach: async (target) => { calls.debuggerDetach.push(target); },
       getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
