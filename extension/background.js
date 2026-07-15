@@ -3,6 +3,7 @@ const BRIDGE_PROTOCOL_VERSION = "1.0.0";
 const BRIDGE_CAPABILITIES = Object.freeze([
   "bridge.handshake",
   "browser.accessibility",
+  "browser.batch",
   "browser.bookmarks",
   "browser.cdp",
   "browser.console",
@@ -52,6 +53,26 @@ const MAX_WAIT_POLL_MS = 1_000;
 const MIN_WAIT_POLL_MS = 10;
 const MAX_WAIT_VALUE_CHARS = 2_000;
 const MAX_NETWORK_REQUEST_STATES = 1_000;
+const MAX_BATCH_ACTIONS = 25;
+const MAX_BATCH_PAYLOAD_BYTES = 100_000;
+const MIN_BATCH_TIMEOUT_MS = 50;
+const MAX_BATCH_ACTION_TIMEOUT_MS = 30_000;
+const MAX_BATCH_TOTAL_TIMEOUT_MS = 120_000;
+const DEFAULT_BATCH_ACTION_TIMEOUT_MS = 10_000;
+const DEFAULT_BATCH_TOTAL_TIMEOUT_MS = 60_000;
+const BATCH_ACTION_METHODS = Object.freeze({
+  activateTab: "activateTab",
+  back: "back",
+  clickElement: "clickElement",
+  fillElement: "fillElement",
+  findElements: "findElements",
+  forward: "forward",
+  getTab: "getTab",
+  navigate: "navigate",
+  reload: "reload",
+  tabContext: "tabContext",
+  waitFor: "waitFor"
+});
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -430,6 +451,8 @@ async function executeCommand(method, params, options = {}) {
       return findElements(params);
     case "waitFor":
       return waitFor(params, options);
+    case "browserBatch":
+      return browserBatch(params, options);
     case "clickElement":
       return clickElement(params);
     case "fillElement":
@@ -1863,6 +1886,217 @@ function validateFindElementsResult(result) {
       throw new Error("find elements result is invalid");
     }
   }
+}
+
+async function browserBatch(params, { signal } = {}) {
+  const batch = await validateBrowserBatch(params);
+  const startedAt = Date.now();
+  const deadline = startedAt + batch.totalTimeoutMs;
+  const results = [];
+  let stoppedAt = null;
+
+  for (let index = 0; index < batch.actions.length; index += 1) {
+    throwIfAborted(signal);
+    const action = batch.actions[index];
+    try {
+      const result = await runBatchAction(action, index, deadline, batch.totalTimeoutMs, signal);
+      results.push({ index, ok: true, result, type: action.type });
+    } catch (error) {
+      throwIfAborted(signal);
+      results.push({
+        error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS),
+        index,
+        ok: false,
+        type: action.type
+      });
+      if (error?.batchActionTimeout === true || error?.batchTotalTimeout === true || batch.stopOnError) {
+        stoppedAt = index;
+        break;
+      }
+    }
+  }
+
+  return {
+    completed: results.length,
+    elapsedMs: Date.now() - startedAt,
+    ok: results.length === batch.actions.length && results.every((result) => result.ok),
+    results,
+    stoppedAt,
+    totalActions: batch.actions.length
+  };
+}
+
+async function validateBrowserBatch(params) {
+  if (!isRecord(params)) throw new Error("browser batch params must be an object");
+  assertBatchFields(params, ["actions", "stopOnError", "totalTimeoutMs"], "browser batch");
+  let serialized;
+  try {
+    serialized = JSON.stringify(params);
+  } catch {
+    throw new Error("browser batch payload must be JSON serializable");
+  }
+  if (new TextEncoder().encode(serialized).byteLength > MAX_BATCH_PAYLOAD_BYTES) {
+    throw new Error(`browser batch payload is too large; max ${MAX_BATCH_PAYLOAD_BYTES} bytes`);
+  }
+  if (!Array.isArray(params.actions) || params.actions.length === 0) {
+    throw new Error("browser batch requires at least one action");
+  }
+  if (params.actions.length > MAX_BATCH_ACTIONS) {
+    throw new Error(`browser batch supports at most ${MAX_BATCH_ACTIONS} actions`);
+  }
+  if (params.stopOnError != null && typeof params.stopOnError !== "boolean") {
+    throw new Error("browser batch stopOnError must be a boolean");
+  }
+  const totalTimeoutMs = strictBatchInteger(
+    params.totalTimeoutMs,
+    MIN_BATCH_TIMEOUT_MS,
+    MAX_BATCH_TOTAL_TIMEOUT_MS,
+    DEFAULT_BATCH_TOTAL_TIMEOUT_MS,
+    "browser batch totalTimeoutMs"
+  );
+  const actions = [];
+  for (let index = 0; index < params.actions.length; index += 1) {
+    actions.push(await validateBatchAction(params.actions[index], index));
+  }
+  return { actions, stopOnError: params.stopOnError !== false, totalTimeoutMs };
+}
+
+async function validateBatchAction(action, index) {
+  if (!isRecord(action)) throw new Error(`batch action ${index} must be an object`);
+  assertBatchFields(action, ["params", "timeoutMs", "type"], `batch action ${index}`);
+  if (typeof action.type !== "string" || !Object.prototype.hasOwnProperty.call(BATCH_ACTION_METHODS, action.type)) {
+    throw new Error(`batch action ${index} type ${String(action.type)} is not allowed`);
+  }
+  if (!isRecord(action.params)) throw new Error(`batch action ${index} params must be an object`);
+  const timeoutMs = strictBatchInteger(
+    action.timeoutMs,
+    MIN_BATCH_TIMEOUT_MS,
+    MAX_BATCH_ACTION_TIMEOUT_MS,
+    DEFAULT_BATCH_ACTION_TIMEOUT_MS,
+    `batch action ${index} timeoutMs`
+  );
+  const normalizedParams = await validateBatchActionParams(action.type, action.params, index);
+  return { params: normalizedParams, timeoutMs, type: action.type };
+}
+
+async function validateBatchActionParams(type, params, index) {
+  const label = `batch action ${index}`;
+  if (["getTab", "activateTab", "reload", "back", "forward"].includes(type)) {
+    assertBatchFields(params, ["tabId"], label);
+    requireTabId(params);
+    return { ...params };
+  }
+  if (type === "navigate") {
+    assertBatchFields(params, ["tabId", "url"], label);
+    requireTabId(params);
+    if (typeof params.url !== "string" || params.url.length === 0 || params.url.length > MAX_WAIT_VALUE_CHARS) {
+      throw new Error(`${label} url must be a non-empty string of at most ${MAX_WAIT_VALUE_CHARS} characters`);
+    }
+    await assertNavigationAllowed(params.url);
+    return { ...params };
+  }
+  if (type === "tabContext") {
+    assertBatchFields(params, ["maxChars", "maxSelectionChars", "tabId"], label);
+    requireTabId(params);
+    strictBatchInteger(params.maxChars, 100, 200_000, 50_000, `${label} maxChars`);
+    strictBatchInteger(params.maxSelectionChars, 1, 10_000, 2_000, `${label} maxSelectionChars`);
+    return { ...params };
+  }
+  if (type === "findElements") {
+    assertBatchFields(params, ["interactiveOnly", "limit", "query", "role", "tabId", "visibleOnly"], label);
+    requireTabId(params);
+    if (typeof params.query !== "string" || params.query.trim().length === 0 || params.query.length > MAX_FIND_QUERY_CHARS) {
+      throw new Error(`${label} query must be a non-empty string of at most ${MAX_FIND_QUERY_CHARS} characters`);
+    }
+    if (params.role != null
+      && (typeof params.role !== "string" || params.role.trim().length === 0 || params.role.length > MAX_FIND_ROLE_CHARS)) {
+      throw new Error(`${label} role must be a non-empty string of at most ${MAX_FIND_ROLE_CHARS} characters`);
+    }
+    optionalBatchBoolean(params.interactiveOnly, `${label} interactiveOnly`);
+    optionalBatchBoolean(params.visibleOnly, `${label} visibleOnly`);
+    strictBatchInteger(params.limit, 1, MAX_FIND_RESULTS, 20, `${label} limit`);
+    return { ...params };
+  }
+  if (type === "waitFor") {
+    assertBatchFields(params, ["condition", "pollIntervalMs", "tabId", "timeoutMs"], label);
+    const condition = validateWaitCondition(params.condition);
+    if (condition.type !== "download") requireTabId(params);
+    strictBatchInteger(params.timeoutMs, MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS, 10_000, `${label} wait timeoutMs`);
+    strictBatchInteger(params.pollIntervalMs, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, 100, `${label} pollIntervalMs`);
+    return { ...params, condition };
+  }
+  if (type === "clickElement") {
+    assertBatchFields(params, ["button", "modifiers", "ref", "tabId"], label);
+    requireTabId(params);
+    requireElementRef(params);
+    requireButton(params.button);
+    resolveModifiers(params.modifiers);
+    return { ...params };
+  }
+  assertBatchFields(params, ["clear", "ref", "tabId", "text"], label);
+  requireTabId(params);
+  requireElementRef(params);
+  if (typeof params.text !== "string") throw new Error(`${label} text must be a string`);
+  if (params.text.length > MAX_TEXT_CHARS) {
+    throw new Error(`${label} text is too large; max ${MAX_TEXT_CHARS} characters`);
+  }
+  optionalBatchBoolean(params.clear, `${label} clear`);
+  return { ...params };
+}
+
+function runBatchAction(action, index, deadline, totalTimeoutMs, signal) {
+  throwIfAborted(signal);
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    const error = new Error(`browser batch total timeout reached after ${totalTimeoutMs}ms at action ${index}`);
+    error.batchTotalTimeout = true;
+    throw error;
+  }
+  const totalTimeoutWins = remainingMs <= action.timeoutMs;
+  const timeoutMs = Math.min(action.timeoutMs, remainingMs);
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener("abort", onParentAbort, { once: true });
+  let onActionAbort;
+  const abortPromise = new Promise((_, reject) => {
+    onActionAbort = () => reject(controller.signal.reason);
+    controller.signal.addEventListener("abort", onActionAbort, { once: true });
+  });
+  const timer = setTimeout(() => {
+    const error = totalTimeoutWins
+      ? new Error(`browser batch total timeout reached after ${totalTimeoutMs}ms at action ${index}`)
+      : new Error(`browser batch action ${index} timed out after ${action.timeoutMs}ms`);
+    error.batchActionTimeout = !totalTimeoutWins;
+    error.batchTotalTimeout = totalTimeoutWins;
+    controller.abort(error);
+  }, timeoutMs);
+  const execution = Promise.resolve().then(() => executeCommand(
+    BATCH_ACTION_METHODS[action.type],
+    action.params,
+    { signal: controller.signal }
+  ));
+  return Promise.race([execution, abortPromise]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onParentAbort);
+    controller.signal.removeEventListener("abort", onActionAbort);
+  });
+}
+
+function assertBatchFields(value, allowedFields, label) {
+  const unsupported = Object.keys(value).filter((field) => !allowedFields.includes(field));
+  if (unsupported.length > 0) throw new Error(`${label} contains unsupported fields: ${unsupported.join(", ")}`);
+}
+
+function strictBatchInteger(value, min, max, fallback, label) {
+  if (value == null) return fallback;
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${label} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+function optionalBatchBoolean(value, label) {
+  if (value != null && typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
 }
 
 async function waitFor(params, { signal } = {}) {

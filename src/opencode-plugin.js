@@ -15,10 +15,24 @@ import {
 
 const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
 
+const BATCH_ACTION_CAPABILITIES = Object.freeze({
+  activateTab: ["browser.tabs", "browser.windows"],
+  back: ["browser.navigation", "browser.tabs"],
+  clickElement: ["browser.accessibility", "browser.cdp", "browser.tabs"],
+  fillElement: ["browser.accessibility", "browser.cdp", "browser.tabs"],
+  findElements: ["browser.find", "browser.tabs"],
+  forward: ["browser.navigation", "browser.tabs"],
+  getTab: ["browser.tabs"],
+  navigate: ["browser.navigation", "browser.tabs"],
+  reload: ["browser.navigation", "browser.tabs"],
+  tabContext: ["browser.page-context", "browser.tabs"]
+});
+
 export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_accessibility_tree: capabilities("browser.accessibility", "browser.tabs"),
   chrome_activate_tab: capabilities("browser.tabs", "browser.windows"),
   chrome_back: capabilities("browser.navigation", "browser.tabs"),
+  chrome_batch: capabilities("browser.batch"),
   chrome_blocked_urls: capabilities("browser.navigation"),
   chrome_bookmarks: capabilities("browser.bookmarks"),
   chrome_cdp: capabilities("browser.cdp"),
@@ -84,6 +98,82 @@ export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
   const schema = tool.schema;
+  const waitConditionSchema = schema.strictObject({
+    type: schema.enum(["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]),
+    value: schema.string().min(1).max(2000).optional(),
+    match: schema.enum(["contains", "exact"]).optional(),
+    caseSensitive: schema.boolean().optional(),
+    ref: schema.string().min(1).max(50).optional(),
+    selector: schema.string().min(1).max(2000).optional(),
+    visibleOnly: schema.boolean().optional(),
+    idleMs: schema.number().int().min(10).max(30000).optional(),
+    downloadId: schema.number().int().min(0).optional()
+  });
+  const batchActionTimeoutMs = schema.number().int().min(50).max(30000).optional();
+  const batchTabIdParams = schema.strictObject({ tabId: schema.number().int() });
+  const batchAction = schema.discriminatedUnion("type", [
+    schema.strictObject({ type: schema.literal("getTab"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("activateTab"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({
+      type: schema.literal("navigate"),
+      params: schema.strictObject({ tabId: schema.number().int(), url: schema.string().min(1).max(2000) }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({ type: schema.literal("reload"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("back"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("forward"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({
+      type: schema.literal("tabContext"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        maxChars: schema.number().int().min(100).max(200000).optional(),
+        maxSelectionChars: schema.number().int().min(1).max(10000).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("findElements"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        query: schema.string().min(1).max(500),
+        role: schema.string().min(1).max(50).optional(),
+        interactiveOnly: schema.boolean().optional(),
+        visibleOnly: schema.boolean().optional(),
+        limit: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("waitFor"),
+      params: schema.strictObject({
+        tabId: schema.number().int().optional(),
+        condition: waitConditionSchema,
+        timeoutMs: schema.number().int().min(50).max(120000).optional(),
+        pollIntervalMs: schema.number().int().min(10).max(1000).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("clickElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        ref: schema.string().min(1).max(50),
+        button: schema.enum(["left", "middle", "right"]).optional(),
+        modifiers: schema.array(schema.enum(["Alt", "Control", "ControlOrMeta", "Meta", "Shift"])).max(5).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("fillElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        ref: schema.string().min(1).max(50),
+        text: schema.string().max(100000),
+        clear: schema.boolean().optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    })
+  ]);
 
   return {
     tool: requireApprovals({
@@ -303,17 +393,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "Wait deterministically for exactly one typed condition: URL, navigation, text, ref, selector, network idle, or download completion.",
         args: {
           tabId: schema.number().int().optional().describe("Chrome tab id. Required for every condition except download."),
-          condition: schema.object({
-            type: schema.enum(["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]),
-            value: schema.string().min(1).max(2000).optional(),
-            match: schema.enum(["contains", "exact"]).optional(),
-            caseSensitive: schema.boolean().optional(),
-            ref: schema.string().min(1).max(50).optional(),
-            selector: schema.string().min(1).max(2000).optional(),
-            visibleOnly: schema.boolean().optional(),
-            idleMs: schema.number().int().min(10).max(30000).optional(),
-            downloadId: schema.number().int().min(0).optional()
-          }).describe("One typed wait condition. Fields not belonging to the selected type are rejected."),
+          condition: waitConditionSchema.describe("One typed wait condition. Fields not belonging to the selected type are rejected."),
           timeoutMs: schema.number().int().min(50).max(120000).default(10000).describe("Overall wait timeout."),
           pollIntervalMs: schema.number().int().min(10).max(1000).default(100).describe("Polling interval for deterministic checks.")
         },
@@ -321,6 +401,20 @@ export default async function OpenCodeChromeBridgePlugin() {
           const timeoutMs = args.timeoutMs ?? 10_000;
           return JSON.stringify(await bridgeCommand("waitFor", args, {
             timeoutMs: Math.min(125_000, timeoutMs + 5_000)
+          }), null, 2);
+        }
+      }),
+      chrome_batch: tool({
+        description: "Run a bounded batch of typed high-level browser actions sequentially after one OpenCode approval, with ordered action-indexed results.",
+        args: {
+          actions: schema.array(batchAction).min(1).max(25).describe("One to 25 typed actions. Nested batches, workflow/scheduler meta-actions, and raw CDP are not allowed."),
+          stopOnError: schema.boolean().default(true).describe("Stop after the first failed action. Set false to continue after ordinary action errors."),
+          totalTimeoutMs: schema.number().int().min(50).max(120000).default(60000).describe("Overall batch execution budget in milliseconds.")
+        },
+        async execute(args) {
+          const totalTimeoutMs = args.totalTimeoutMs ?? 60_000;
+          return JSON.stringify(await bridgeCommand("browserBatch", args, {
+            timeoutMs: Math.min(125_000, totalTimeoutMs + 5_000)
           }), null, 2);
         }
       }),
@@ -879,6 +973,13 @@ export default async function OpenCodeChromeBridgePlugin() {
 const APPROVAL_EXEMPT_TOOLS = new Set(["chrome_status"]);
 
 const APPROVAL_METADATA = {
+  chrome_batch: (args) => ({
+    action: "Run one prevalidated sequential browser batch",
+    actionCount: Array.isArray(args.actions) ? args.actions.length : 0,
+    actionTypes: Array.isArray(args.actions) ? args.actions.slice(0, 25).map((entry) => entry?.type) : [],
+    stopOnError: args.stopOnError,
+    totalTimeoutMs: args.totalTimeoutMs
+  }),
   chrome_cdp: (args) => ({ action: "Run a full Chrome DevTools Protocol command", method: args.method, tabId: args.tabId, targetId: args.targetId }),
   chrome_evaluate: (args) => ({ action: "Evaluate JavaScript in the page", tabId: args.tabId, expression: previewText(args.expression) }),
   chrome_wizard_step: (args) => ({ action: "Click, then optionally evaluate JavaScript and screenshot", tabId: args.tabId, expression: previewText(args.expression) }),
@@ -940,6 +1041,16 @@ function requireApprovals(tools) {
 export function requiredCapabilitiesForTool(name, args) {
   const required = TOOL_CAPABILITY_REQUIREMENTS[name];
   if (!required) throw new Error(`Browser tool ${name} is missing an explicit capability declaration`);
+  if (name === "chrome_batch") {
+    if (!Array.isArray(args?.actions) || args.actions.length === 0 || args.actions.length > 25) {
+      throw new Error("chrome_batch requires between 1 and 25 typed actions");
+    }
+    const union = new Set(required);
+    for (const action of args.actions) {
+      for (const capability of requiredCapabilitiesForBatchAction(action)) union.add(capability);
+    }
+    return [...union].sort();
+  }
   if (name === "chrome_read_page" && args?.includeScreenshot !== true) {
     return required.filter((capability) => capability !== "browser.screenshots" && capability !== "browser.windows");
   }
@@ -952,6 +1063,18 @@ export function requiredCapabilitiesForTool(name, args) {
     }
     return required.filter((capability) => capability !== "browser.downloads");
   }
+  return required;
+}
+
+function requiredCapabilitiesForBatchAction(action) {
+  if (action?.type === "waitFor") {
+    const conditionType = action.params?.condition?.type;
+    if (conditionType === "download") return ["browser.downloads", "browser.wait"];
+    if (conditionType === "networkIdle") return ["browser.cdp", "browser.tabs", "browser.wait"];
+    return ["browser.tabs", "browser.wait"];
+  }
+  const required = BATCH_ACTION_CAPABILITIES[action?.type];
+  if (!required) throw new Error(`chrome_batch action type ${String(action?.type)} is not allowed`);
   return required;
 }
 

@@ -213,7 +213,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   const result = await harness.execute("handshake", {});
 
   assert.equal(result.extensionId, "test-extension");
-  assert.equal(result.extensionVersion, "1.1.0");
+  assert.equal(result.extensionVersion, "1.2.0");
   assert.equal(result.hostName, "com.opencode.chrome_bridge");
   assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
   assert.ok(result.capabilities.includes("bridge.handshake"));
@@ -1515,6 +1515,169 @@ test("window creation rejects empty lease identifiers before opening a window", 
   assert.equal(createCalls, 0);
 });
 
+test("typed browser batches execute actions sequentially and preserve result order", async () => {
+  const order = [];
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      order.push(`get:${tabId}`);
+      return { active: true, id: tabId, index: 0, title: `Tab ${tabId}`, url: "https://example.com", windowId: 1 };
+    },
+    tabsUpdate: async (tabId, update) => {
+      order.push(`navigate:${tabId}`);
+      return { active: true, id: tabId, index: 0, title: "Navigated", url: update.url, windowId: 1 };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 } },
+      { type: "navigate", params: { tabId: 8, url: "https://example.com/next" } },
+      { type: "getTab", params: { tabId: 9 } }
+    ],
+    stopOnError: true,
+    totalTimeoutMs: 5_000
+  });
+
+  assert.deepEqual(order, ["get:7", "navigate:8", "get:9"]);
+  assert.equal(result.ok, true);
+  assert.equal(result.completed, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.results.map(({ index, type, ok }) => ({ index, type, ok })))), [
+    { index: 0, type: "getTab", ok: true },
+    { index: 1, type: "navigate", ok: true },
+    { index: 2, type: "getTab", ok: true }
+  ]);
+});
+
+test("browser batches continue or stop on action-indexed failures", async () => {
+  const calls = [];
+  const makeHarness = () => createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      calls.push(tabId);
+      if (tabId === 7) throw new Error("tab unavailable");
+      return { active: true, id: tabId, index: 0, title: "Ready", url: "https://example.com", windowId: 1 };
+    }
+  });
+  const actions = [
+    { type: "getTab", params: { tabId: 7 } },
+    { type: "getTab", params: { tabId: 8 } }
+  ];
+
+  const stopped = await makeHarness().execute("browserBatch", { actions, stopOnError: true });
+  assert.deepEqual(calls, [7]);
+  assert.equal(stopped.ok, false);
+  assert.equal(stopped.stoppedAt, 0);
+  assert.equal(stopped.results[0].index, 0);
+  assert.equal(stopped.results[0].ok, false);
+  assert.match(stopped.results[0].error, /tab unavailable/u);
+
+  calls.length = 0;
+  const continued = await makeHarness().execute("browserBatch", { actions, stopOnError: false });
+  assert.deepEqual(calls, [7, 8]);
+  assert.equal(continued.ok, false);
+  assert.equal(continued.stoppedAt, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(continued.results.map(({ index, ok }) => ({ index, ok })))), [
+    { index: 0, ok: false },
+    { index: 1, ok: true }
+  ]);
+});
+
+test("browser batches enforce per-action and total timeouts", async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve({ id: 7 }), 500));
+  const harness = createBackgroundHarness({ tabsGet: async () => pending });
+
+  const perActionStarted = Date.now();
+  const perAction = await harness.execute("browserBatch", {
+    actions: [{ type: "getTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    totalTimeoutMs: 1_000
+  });
+  assert.ok(Date.now() - perActionStarted < 300, "per-action timeout should not await a late Chrome callback");
+  assert.equal(perAction.results[0].index, 0);
+  assert.match(perAction.results[0].error, /action 0.*timed out.*50ms/iu);
+
+  const totalStarted = Date.now();
+  const total = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 }, timeoutMs: 1_000 },
+      { type: "getTab", params: { tabId: 8 }, timeoutMs: 1_000 }
+    ],
+    stopOnError: false,
+    totalTimeoutMs: 50
+  });
+  assert.ok(Date.now() - totalStarted < 300, "total timeout should bound the batch");
+  assert.equal(total.results.length, 1);
+  assert.equal(total.results[0].index, 0);
+  assert.match(total.results[0].error, /total timeout.*50ms/iu);
+  assert.equal(total.stoppedAt, 0);
+});
+
+test("a timed-out batch action never overlaps a later action", async () => {
+  const calls = [];
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      calls.push(tabId);
+      if (tabId === 7) return new Promise((resolve) => setTimeout(() => resolve({ id: tabId }), 500));
+      return { id: tabId };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 }, timeoutMs: 50 },
+      { type: "getTab", params: { tabId: 8 }, timeoutMs: 1_000 }
+    ],
+    stopOnError: false,
+    totalTimeoutMs: 1_000
+  });
+
+  assert.deepEqual(calls, [7]);
+  assert.equal(result.stoppedAt, 0);
+  assert.match(result.results[0].error, /action 0.*timed out/iu);
+});
+
+test("browser batches reject forbidden and malformed actions before side effects", async () => {
+  let getCalls = 0;
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      getCalls += 1;
+      return { id: tabId };
+    }
+  });
+  for (const type of ["browserBatch", "workflow", "scheduler", "meta", "cdpCommand"]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type, params: {} }
+        ]
+      }),
+      /batch action 1.*not allowed/iu
+    );
+  }
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: [{ type: "getTab", params: { tabId: 7, unexpected: true } }]
+    }),
+    /batch action 0.*unsupported fields.*unexpected/iu
+  );
+  assert.equal(getCalls, 0, "the complete batch must validate before its first action");
+});
+
+test("browser batches bound action count and serialized payload size", async () => {
+  const harness = createBackgroundHarness();
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: Array.from({ length: 26 }, () => ({ type: "getTab", params: { tabId: 7 } }))
+    }),
+    /at most 25 actions/iu
+  );
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: [{ type: "fillElement", params: { tabId: 7, ref: "e1", text: "x".repeat(100_001) } }]
+    }),
+    /payload is too large|text is too large/iu
+  );
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
@@ -1587,7 +1750,7 @@ function createBackgroundHarness({
     history: { search: async () => [] },
     runtime: {
       connectNative: () => nativePort,
-      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.1.0" }),
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.2.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,

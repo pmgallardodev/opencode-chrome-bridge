@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.1.0-0f766e?style=flat-square" alt="Version v1.1.0" />
+  <img src="https://img.shields.io/badge/Version-v1.2.0-0f766e?style=flat-square" alt="Version v1.2.0" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -15,7 +15,7 @@
 
 Control your real Chrome browser from OpenCode.
 
-OpenCode Chrome Bridge combines an unpacked Chrome extension, a local native messaging host, and an OpenCode plugin that exposes browser tools for tabs, screenshots, page text, history, bookmarks, and full Chrome DevTools Protocol access.
+OpenCode Chrome Bridge combines an unpacked Chrome extension, a local native messaging host, and an OpenCode plugin that exposes browser tools for tabs, bounded page intelligence, screenshots, history, bookmarks, and full Chrome DevTools Protocol access.
 
 ```text
 OpenCode tool -> local HTTP bridge -> Chrome native host -> Chrome extension -> real Chrome profile
@@ -251,6 +251,64 @@ chrome_cdp_targets
 | `chrome_dom_content` | Get the full HTML source or text content of a tab |
 | `chrome_screenshot` | Capture a tab viewport to a PNG or JPEG file |
 | `chrome_screenshot_region` | Capture a CSS-pixel rectangle of a page (defaults to JPEG, can extend beyond the viewport) |
+
+### Browser Intelligence
+
+| Tool | Description |
+| --- | --- |
+| `chrome_tab_context` | Read bounded visible text, page metadata, current selection, selected element refs, MIME type, and dimensions |
+| `chrome_read_page` | Read one coherent context + accessibility snapshot and optionally save a viewport screenshot |
+| `chrome_find` | Rank bounded page matches deterministically by ref, role, accessible name, label, placeholder, and visible text |
+| `chrome_wait_for` | Wait for exactly one typed URL, navigation, text, ref, selector, network-idle, or download condition |
+| `chrome_batch` | Run a prevalidated sequence of typed high-level browser actions and receive ordered, action-indexed results |
+
+Visible text and selections are bounded and sensitive password, payment, hidden, script,
+style, and template content is excluded or redacted. `chrome_find` returns at most 100
+matches; page readers return at most 200,000 text characters and 2,000 accessibility
+nodes. `chrome_wait_for` has a 120,000 ms ceiling and does not evaluate arbitrary page
+JavaScript.
+
+For `chrome_tab_context` and `chrome_read_page`, `outputDirectory` must be a
+project-relative directory. Oversized text and requested screenshots are written below
+the project using atomic, collision-safe files; symlinks and path escapes are rejected.
+Inline previews remain bounded, while the returned artifact paths point to the complete
+saved result.
+
+Every Browser Intelligence tool uses OpenCode's native **allow once / allow always /
+deny** permission prompt. A `chrome_batch` invocation asks for one OpenCode approval for
+the complete action list, then validates every action before the first browser side
+effect. The allowlist is limited to `getTab`, `activateTab`, `navigate`, `reload`,
+`back`, `forward`, `tabContext`, `findElements`, `waitFor`, `clickElement`, and
+`fillElement`. Nested batches, workflow or scheduler meta-actions, and raw CDP are not
+accepted through this tool; use the separately approved `chrome_cdp` tool when full CDP
+is intentionally required.
+
+A batch accepts at most 25 actions. Each action has a maximum 30,000 ms budget and the
+whole batch has a maximum 120,000 ms budget. `stopOnError` defaults to `true`; setting it
+to `false` continues after ordinary action errors, while validation and timeout
+failures always stop before another action starts. A timeout cannot roll back a browser
+side effect that Chrome already completed.
+
+```json
+{
+  "actions": [
+    {
+      "type": "findElements",
+      "params": { "tabId": 42, "query": "Checkout", "interactiveOnly": true }
+    },
+    {
+      "type": "waitFor",
+      "params": {
+        "tabId": 42,
+        "condition": { "type": "text", "value": "Order confirmed" },
+        "timeoutMs": 10000
+      }
+    }
+  ],
+  "stopOnError": true,
+  "totalTimeoutMs": 20000
+}
+```
 
 ### Element-based interaction
 

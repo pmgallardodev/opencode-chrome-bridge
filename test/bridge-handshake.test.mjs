@@ -32,6 +32,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_accessibility_tree: caps("browser.accessibility", "browser.tabs"),
   chrome_activate_tab: caps("browser.tabs", "browser.windows"),
   chrome_back: caps("browser.navigation", "browser.tabs"),
+  chrome_batch: caps("browser.batch"),
   chrome_blocked_urls: caps("browser.navigation"),
   chrome_bookmarks: caps("browser.bookmarks"),
   chrome_cdp: caps("browser.cdp"),
@@ -391,7 +392,9 @@ test("every browser tool fails before execution when its negotiated capability i
   };
   try {
     for (const name of Object.keys(EXPECTED_TOOL_CAPABILITIES)) {
-      const args = {};
+      const args = name === "chrome_batch"
+        ? { actions: [{ type: "getTab", params: { tabId: 7 } }] }
+        : {};
       const negotiated = pluginModule.requiredCapabilitiesForTool(name, args);
       let asked = 0;
       await assert.rejects(

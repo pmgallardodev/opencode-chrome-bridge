@@ -556,6 +556,66 @@ test("OpenCode plugin exposes one typed deterministic wait tool and capability",
   }
 });
 
+test("OpenCode plugin exposes one approved typed batch with negotiated action capabilities", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  assert.ok(plugin.tool.chrome_batch, "chrome_batch tool missing");
+  assert.match(plugin.tool.chrome_batch.description, /sequential|batch/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_batch],
+    ["bridge.handshake", "browser.batch"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_batch", {
+      actions: [
+        { type: "getTab", params: { tabId: 7 } },
+        { type: "findElements", params: { tabId: 7, query: "Checkout" } },
+        { type: "waitFor", params: { tabId: 7, condition: { type: "text", value: "Done" } } }
+      ]
+    }),
+    ["bridge.handshake", "browser.batch", "browser.find", "browser.tabs", "browser.wait"]
+  );
+
+  const asks = [];
+  await assert.rejects(
+    plugin.tool.chrome_batch.execute({
+      actions: [
+        { type: "getTab", params: { tabId: 7 } },
+        { type: "getTab", params: { tabId: 8 } }
+      ]
+    }, {
+      directory: repoRoot,
+      ask: async (request) => {
+        asks.push(request);
+        throw new Error("approval probe");
+      }
+    }),
+    /approval probe/u
+  );
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0].permission, "chrome_batch");
+  assert.equal(asks[0].metadata.actionCount, 2);
+});
+
+test("chrome_batch publishes a strict bounded allowlist without raw CDP or meta-actions", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  for (const type of [
+    "getTab", "activateTab", "navigate", "reload", "back", "forward",
+    "tabContext", "findElements", "waitFor", "clickElement", "fillElement"
+  ]) {
+    assert.match(source, new RegExp(`batchAction[\\s\\S]{0,12000}\"${type}\"`, "u"), `batch schema missing ${type}`);
+  }
+  assert.match(source, /actions:[\s\S]{0,300}\.min\(1\)\.max\(25\)/u);
+  assert.match(source, /totalTimeoutMs:[\s\S]{0,200}\.min\(50\)\.max\(120000\)/u);
+  assert.doesNotMatch(source, /batchAction[\s\S]{0,12000}literal\("(?:cdpCommand|browserBatch|workflow|scheduler|meta)"\)/u);
+  const actionsSchema = plugin.tool.chrome_batch.args.actions;
+  const getTab = (timeoutMs) => [{ type: "getTab", params: { tabId: 7 }, timeoutMs }];
+  assert.equal(actionsSchema.safeParse(getTab(50)).success, true);
+  assert.equal(actionsSchema.safeParse(getTab(30_000)).success, true);
+  assert.equal(actionsSchema.safeParse(getTab(49)).success, false);
+  assert.equal(actionsSchema.safeParse(getTab(30_001)).success, false);
+});
+
 test("dangerous and private-data tools require user approval before running", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const gatedTools = Object.keys(plugin.tool).filter((name) => name !== "chrome_status");
