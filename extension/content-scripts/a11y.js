@@ -60,6 +60,8 @@ if (!window.__opencodeA11yInstalled) {
   ]);
 
   const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "NOSCRIPT", "TEMPLATE"]);
+  const MAX_SELECTED_ELEMENT_REFS = 100;
+  const MAX_SELECTION_SCAN_ELEMENTS = 10000;
 
   function roleFor(element) {
     const explicit = element.getAttribute("role");
@@ -189,7 +191,11 @@ if (!window.__opencodeA11yInstalled) {
       url.password = "";
       url.hash = "";
       for (const key of [...url.searchParams.keys()]) {
-        if (/^(?:access[_-]?token|api[_-]?key|auth|authorization|code|credential|key|pass|password|secret|session|token)$/iu.test(key)) {
+        const normalizedKey = key.toLowerCase().replace(/[_-]/gu, "");
+        if (["apikey", "auth", "authorization", "code", "credential", "key", "pass", "password", "session"].includes(normalizedKey)
+          || normalizedKey.endsWith("token")
+          || normalizedKey.endsWith("secret")
+          || normalizedKey.includes("password")) {
           url.searchParams.set(key, "[redacted]");
         }
       }
@@ -276,6 +282,76 @@ if (!window.__opencodeA11yInstalled) {
     return false;
   }
 
+  function isMeaningfulSelectionElement(element) {
+    if (!element?.tagName || SKIP_TAGS.has(element.tagName)) return false;
+    if (typeof element.getClientRects === "function" && !isVisible(element)) return false;
+    const role = roleFor(element);
+    return isSensitiveField(element)
+      || INTERACTIVE_ROLES.has(role)
+      || ownText(element).length > 0
+      || ((element.children?.length ?? 0) === 0 && String(element.textContent ?? "").trim().length > 0);
+  }
+
+  function rangeSelectionDetails(browserSelection) {
+    if (typeof browserSelection.getRangeAt !== "function") {
+      return { intersected: false, refs: [], sensitive: false };
+    }
+    const ranges = [];
+    for (let index = 0; index < browserSelection.rangeCount; index += 1) {
+      try {
+        const range = browserSelection.getRangeAt(index);
+        if (range && typeof range.intersectsNode === "function") ranges.push(range);
+      } catch {}
+    }
+    if (ranges.length === 0) return { intersected: false, refs: [], sensitive: false };
+
+    const refs = [];
+    const seenRefs = new Set();
+    let intersected = false;
+    let sensitive = false;
+    let visited = 0;
+
+    function walk(root) {
+      for (const element of root?.children ?? []) {
+        visited += 1;
+        if (visited > MAX_SELECTION_SCAN_ELEMENTS) {
+          // Fail closed if a hostile page makes the selected range too large
+          // to inspect completely.
+          sensitive = true;
+          return false;
+        }
+        if (SKIP_TAGS.has(element.tagName)) continue;
+        let selected = false;
+        for (const range of ranges) {
+          try {
+            if (range.intersectsNode(element)) {
+              selected = true;
+              break;
+            }
+          } catch {}
+        }
+        if (selected) {
+          intersected = true;
+          if (hasSensitiveAncestor(element)) sensitive = true;
+          if (refs.length < MAX_SELECTED_ELEMENT_REFS && isMeaningfulSelectionElement(element)) {
+            const ref = refFor(element);
+            if (!seenRefs.has(ref)) {
+              seenRefs.add(ref);
+              refs.push(ref);
+            }
+          }
+        }
+        const shadow = shadowRootOf(element);
+        if (shadow && walk(shadow) === false) return false;
+        if (walk(element) === false) return false;
+      }
+      return true;
+    }
+
+    walk(document.body ?? document.documentElement);
+    return { intersected, refs, sensitive };
+  }
+
   function selectionContext(maxSelectionChars) {
     const active = document.activeElement;
     const tag = String(active?.tagName ?? "").toLowerCase();
@@ -283,7 +359,7 @@ if (!window.__opencodeA11yInstalled) {
       && Number.isInteger(active.selectionStart)
       && Number.isInteger(active.selectionEnd)
       && active.selectionEnd > active.selectionStart) {
-      const selection = isSensitiveField(active)
+      const selection = hasSensitiveAncestor(active)
         ? { text: "[redacted]", truncated: false }
         : boundedText(String(active.value ?? "").slice(active.selectionStart, active.selectionEnd), maxSelectionChars);
       const ref = refFor(active);
@@ -298,8 +374,12 @@ if (!window.__opencodeA11yInstalled) {
       elementFromSelectionNode(browserSelection.anchorNode),
       elementFromSelectionNode(browserSelection.focusNode)
     ].filter(Boolean);
-    const refs = [...new Set(selectedElements.map((element) => refFor(element)))];
-    const sensitive = selectedElements.some((element) => hasSensitiveAncestor(element));
+    const rangeDetails = rangeSelectionDetails(browserSelection);
+    const refs = rangeDetails.intersected
+      ? rangeDetails.refs
+      : [...new Set(selectedElements.map((element) => refFor(element)))].slice(0, MAX_SELECTED_ELEMENT_REFS);
+    const sensitive = rangeDetails.sensitive
+      || selectedElements.some((element) => hasSensitiveAncestor(element));
     const selection = sensitive
       ? { text: "[redacted]", truncated: false }
       : boundedText(browserSelection.toString(), maxSelectionChars);
@@ -309,6 +389,10 @@ if (!window.__opencodeA11yInstalled) {
   function finiteDimension(...values) {
     const finite = values.filter((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
     return finite.length > 0 ? Math.round(Math.max(...finite)) : 0;
+  }
+
+  function finiteNumber(value, fallback) {
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
   }
 
   window.__opencodeTabContext = function (options) {
@@ -334,9 +418,11 @@ if (!window.__opencodeA11yInstalled) {
         viewport: {
           width: finiteDimension(window.innerWidth, documentElement.clientWidth),
           height: finiteDimension(window.innerHeight, documentElement.clientHeight),
-          scrollX: finiteDimension(window.scrollX),
-          scrollY: finiteDimension(window.scrollY),
-          deviceScaleFactor: finiteDimension(window.devicePixelRatio) || 1
+          scrollX: finiteNumber(window.scrollX, 0),
+          scrollY: finiteNumber(window.scrollY, 0),
+          deviceScaleFactor: finiteNumber(window.devicePixelRatio, 1) > 0
+            ? finiteNumber(window.devicePixelRatio, 1)
+            : 1
         },
         document: {
           width: finiteDimension(documentElement.scrollWidth, documentElement.clientWidth, body.scrollWidth, body.clientWidth),

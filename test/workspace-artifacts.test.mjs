@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   rm,
   symlink
 } from "node:fs/promises";
@@ -123,6 +124,49 @@ test("workspace artifacts reject path traversal, absolute output directories, an
   assert.deepEqual(await readdir(outsideDirectory), []);
 });
 
+test("workspace artifact writing aborts and cleans up when the output directory is replaced", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-race-project-"));
+  const outsideDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-race-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { force: true, recursive: true }),
+    rm(outsideDirectory, { force: true, recursive: true })
+  ]));
+  const { writeWorkspaceTextArtifact } = await loadArtifacts();
+  const parentDirectory = path.join(projectDirectory, "artifacts");
+  const outputDirectory = path.join(parentDirectory, "browser");
+  const movedDirectory = path.join(parentDirectory, "browser-moved");
+  await mkdir(outputDirectory, { recursive: true });
+
+  const writing = writeWorkspaceTextArtifact({
+    outputDirectory: "artifacts/browser",
+    prefix: "tab-context",
+    projectDirectory,
+    text: "x".repeat(2 * 1024 * 1024)
+  });
+  // Attach a rejection handler immediately while polling for the exclusive
+  // temporary file so a fast failure cannot become an unhandled rejection.
+  void writing.catch(() => {});
+  let observedTemporary = false;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const entries = [
+      ...await readdir(projectDirectory),
+      ...await readdir(outputDirectory)
+    ];
+    if (entries.some((entry) => entry.endsWith(".tmp"))) {
+      observedTemporary = true;
+      break;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(observedTemporary, true, "exclusive temporary file was not observed");
+  await rename(outputDirectory, movedDirectory);
+  await symlink(outsideDirectory, outputDirectory, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(writing, /output directory changed during artifact write/u);
+  assert.deepEqual(await readdir(outsideDirectory), []);
+  assert.deepEqual(await readdir(movedDirectory), []);
+  assert.equal((await readdir(projectDirectory)).some((entry) => entry.endsWith(".tmp")), false);
+});
+
 test("oversized context text is replaced with a preview and a workspace artifact", async (t) => {
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-preview-"));
   t.after(() => rm(projectDirectory, { force: true, recursive: true }));
@@ -138,10 +182,14 @@ test("oversized context text is replaced with a preview and a workspace artifact
   });
 
   assert.equal(result.context.visibleText.length, 100);
+  assert.equal(result.context.returnedChars, 100);
+  assert.equal(result.context.totalChars, null);
+  assert.equal(result.context.truncated.visibleText, true);
   assert.equal(result.artifact.preview, result.context.visibleText);
   assert.equal(result.artifact.originalChars, visibleText.length);
-  assert.equal(result.artifact.returnedChars, visibleText.length);
-  assert.equal(result.artifact.totalChars, null);
+  assert.equal(result.artifact.originalReturnedChars, visibleText.length);
+  assert.equal(result.artifact.originalTotalChars, null);
+  assert.equal(result.artifact.originalTruncated, false);
   assert.equal(await readFile(result.artifact.path, "utf8"), visibleText);
   assert.match(result.artifact.relativePath, /^browser-output[\\/]tab-context-[a-z0-9-]+\.txt$/u);
 });
@@ -159,7 +207,12 @@ test("combined page artifacts replace raw data URLs with safe text and image pat
     projectDirectory,
     result: {
       accessibility: { nodeCount: 1, tree: '[e1] button "Continue"' },
-      context: { returnedChars: fullText.length, totalChars: null, visibleText: fullText },
+      context: {
+        returnedChars: fullText.length,
+        totalChars: fullText.length,
+        truncated: { selection: false, visibleText: false },
+        visibleText: fullText
+      },
       screenshot: { dataUrl: "data:image/png;base64,iVBORw0KGgo=", format: "png" },
       tabId: 7
     }
@@ -167,6 +220,12 @@ test("combined page artifacts replace raw data URLs with safe text and image pat
 
   assert.equal(JSON.stringify(output).includes("dataUrl"), false);
   assert.equal(output.context.visibleText.length, 100);
+  assert.equal(output.context.returnedChars, 100);
+  assert.equal(output.context.totalChars, fullText.length);
+  assert.equal(output.context.truncated.visibleText, true);
+  assert.equal(output.context.visibleTextArtifact.originalReturnedChars, fullText.length);
+  assert.equal(output.context.visibleTextArtifact.originalTotalChars, fullText.length);
+  assert.equal(output.context.visibleTextArtifact.originalTruncated, false);
   assert.equal(await readFile(output.context.visibleTextArtifact.path, "utf8"), fullText);
   assert.deepEqual(await readFile(output.screenshot.path), Buffer.from("89504e470d0a1a0a", "hex"));
 });

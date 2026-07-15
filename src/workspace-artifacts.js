@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import {
   link,
@@ -74,6 +75,11 @@ export async function materializeContextText({
   }
   const fullText = context.visibleText;
   const preview = fullText.slice(0, previewChars);
+  const originalReturnedChars = Number.isInteger(context.returnedChars)
+    ? context.returnedChars
+    : fullText.length;
+  const originalTotalChars = Number.isInteger(context.totalChars) ? context.totalChars : null;
+  const originalTruncated = context.truncated?.visibleText === true;
   const artifact = await writeWorkspaceTextArtifact({
     outputDirectory,
     prefix: "tab-context",
@@ -81,12 +87,21 @@ export async function materializeContextText({
     text: fullText
   });
   return {
-    context: { ...context, visibleText: preview },
+    context: {
+      ...context,
+      visibleText: preview,
+      returnedChars: preview.length,
+      truncated: {
+        ...(context.truncated ?? {}),
+        visibleText: originalTruncated || fullText.length > preview.length
+      }
+    },
     artifact: {
       ...artifact,
       originalChars: fullText.length,
-      returnedChars: fullText.length,
-      totalChars: Number.isInteger(context.totalChars) ? context.totalChars : null,
+      originalReturnedChars,
+      originalTotalChars,
+      originalTruncated,
       preview
     }
   };
@@ -179,24 +194,39 @@ async function writeWorkspaceArtifact({
   projectDirectory
 }) {
   const safePrefix = requireSafePrefix(prefix);
-  const { projectRoot, resolvedDirectory } = await resolveWorkspaceDirectory(projectDirectory, outputDirectory);
+  const directory = await resolveWorkspaceDirectory(projectDirectory, outputDirectory);
+  const { projectRoot, resolvedDirectory } = directory;
   for (let attempt = 0; attempt < MAX_ATOMIC_NAME_ATTEMPTS; attempt += 1) {
     const suffix = `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}`;
     const filename = `${safePrefix}-${suffix}.${extension}`;
     const finalPath = path.join(resolvedDirectory, filename);
-    const temporaryPath = path.join(resolvedDirectory, `.${filename}.${randomBytes(6).toString("hex")}.tmp`);
+    // Keep the temporary in the verified project root. If the requested
+    // output directory is renamed or replaced while bytes are written, the
+    // cleanup path remains stable and no link is attempted until identity is
+    // checked again. Portable Node cannot make the final link relative to an
+    // already-open directory descriptor, so the checks narrow and detect the
+    // race rather than claiming absolute immunity to an adversarial rename.
+    const temporaryPath = path.join(projectRoot, `.opencode-artifact-${randomBytes(12).toString("hex")}.tmp`);
     let finalPublished = false;
+    let temporaryIdentity = null;
+    let handle = null;
     try {
-      const handle = await open(temporaryPath, "wx", 0o600);
-      try {
-        await handle.writeFile(data);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      await assertWorkspaceDirectoryIdentity(directory);
+      handle = await open(temporaryPath, exclusiveNoFollowWriteFlags(), 0o600);
+      temporaryIdentity = await validateTemporaryFile(handle, temporaryPath, directory);
+      await assertWorkspaceDirectoryIdentity(directory);
+      await handle.writeFile(data);
+      await handle.sync();
+      await assertWorkspaceDirectoryIdentity(directory);
+      await handle.close();
+      handle = null;
+      await assertWorkspaceDirectoryIdentity(directory);
       await link(temporaryPath, finalPath);
       finalPublished = true;
+      await validatePublishedFile(finalPath, temporaryIdentity, directory);
+      await assertWorkspaceDirectoryIdentity(directory);
       await unlink(temporaryPath);
+      temporaryIdentity = null;
       return {
         bytes: data.length,
         mimeType,
@@ -204,10 +234,23 @@ async function writeWorkspaceArtifact({
         relativePath: path.relative(projectRoot, finalPath)
       };
     } catch (error) {
-      await unlink(temporaryPath).catch(() => {});
-      if (finalPublished) await unlink(finalPath).catch(() => {});
+      await handle?.close().catch(() => {});
+      let failure = error;
+      try {
+        await assertWorkspaceDirectoryIdentity(directory);
+      } catch (identityError) {
+        failure = identityError;
+      }
+      if (temporaryIdentity) {
+        await unlinkIfIdentityMatches(temporaryPath, temporaryIdentity);
+      } else {
+        await unlink(temporaryPath).catch(() => {});
+      }
+      if (finalPublished && temporaryIdentity) {
+        await unlinkIfIdentityMatches(finalPath, temporaryIdentity);
+      }
       if (error?.code === "EEXIST" && !finalPublished) continue;
-      throw error;
+      throw failure;
     }
   }
   throw new Error("Could not allocate a collision-safe workspace artifact name");
@@ -239,7 +282,80 @@ async function resolveWorkspaceDirectory(projectDirectory, outputDirectory) {
   assertPathWithin(projectRoot, resolvedDirectory);
   const directoryInfo = await lstat(resolvedDirectory);
   if (!directoryInfo.isDirectory()) throw new Error("outputDirectory must resolve to a directory");
-  return { projectRoot, resolvedDirectory };
+  const projectInfo = await lstat(projectRoot);
+  return {
+    directoryIdentity: identityOf(directoryInfo),
+    projectIdentity: identityOf(projectInfo),
+    projectRoot,
+    requestedDirectory: candidate,
+    resolvedDirectory
+  };
+}
+
+async function assertWorkspaceDirectoryIdentity(directory) {
+  try {
+    const projectInfo = await lstat(directory.projectRoot);
+    if (!projectInfo.isDirectory() || identityOf(projectInfo) !== directory.projectIdentity) throw new Error();
+    const requestedInfo = await lstat(directory.requestedDirectory);
+    if (!requestedInfo.isDirectory() || requestedInfo.isSymbolicLink()) throw new Error();
+    await assertNoSymbolicLinkComponents(directory.projectRoot, directory.requestedDirectory);
+    const currentRealPath = await realpath(directory.requestedDirectory);
+    if (!samePath(currentRealPath, directory.resolvedDirectory)) throw new Error();
+    const currentInfo = await lstat(directory.resolvedDirectory);
+    if (!currentInfo.isDirectory() || currentInfo.isSymbolicLink()
+      || identityOf(currentInfo) !== directory.directoryIdentity) throw new Error();
+  } catch {
+    throw new Error("output directory changed during artifact write");
+  }
+}
+
+async function validateTemporaryFile(handle, temporaryPath, directory) {
+  const handleInfo = await handle.stat();
+  const pathInfo = await lstat(temporaryPath);
+  const temporaryRealPath = await realpath(temporaryPath);
+  if (!handleInfo.isFile()
+    || !pathInfo.isFile()
+    || pathInfo.isSymbolicLink()
+    || identityOf(handleInfo) !== identityOf(pathInfo)
+    || !samePath(temporaryRealPath, temporaryPath)) {
+    throw new Error("temporary artifact file identity is invalid");
+  }
+  assertPathWithin(directory.projectRoot, temporaryRealPath);
+  return identityOf(handleInfo);
+}
+
+async function validatePublishedFile(finalPath, temporaryIdentity, directory) {
+  const finalInfo = await lstat(finalPath);
+  const finalRealPath = await realpath(finalPath);
+  if (!finalInfo.isFile()
+    || finalInfo.isSymbolicLink()
+    || identityOf(finalInfo) !== temporaryIdentity
+    || !samePath(path.dirname(finalRealPath), directory.resolvedDirectory)) {
+    throw new Error("published artifact file identity is invalid");
+  }
+  assertPathWithin(directory.projectRoot, finalRealPath);
+}
+
+async function unlinkIfIdentityMatches(candidatePath, expectedIdentity) {
+  try {
+    const info = await lstat(candidatePath);
+    if (!info.isSymbolicLink() && identityOf(info) === expectedIdentity) await unlink(candidatePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function exclusiveNoFollowWriteFlags() {
+  const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
+  return fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow;
+}
+
+function identityOf(info) {
+  return `${String(info.dev)}:${String(info.ino)}`;
+}
+
+function samePath(left, right) {
+  return path.resolve(left) === path.resolve(right);
 }
 
 async function assertNoSymbolicLinkComponents(projectRoot, candidate) {

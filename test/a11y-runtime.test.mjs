@@ -153,6 +153,96 @@ test("tab context redacts custom sensitive fields and selections inside their de
   assert.doesNotMatch(JSON.stringify(context), /5555444433331111/u);
 });
 
+test("tab context redacts an active control nested inside a sensitive ancestor", () => {
+  const nestedInput = createElement("input", {
+    attributes: { type: "text" },
+    selectionEnd: 16,
+    selectionStart: 0,
+    value: "5555444433331111"
+  });
+  const sensitiveContainer = createElement("div", {
+    attributes: { autocomplete: "cc-number" },
+    children: [nestedInput]
+  });
+  const harness = createA11yHarness([sensitiveContainer], { activeElement: nestedInput });
+
+  const context = harness.tabContext({ maxChars: 500 });
+
+  assert.equal(context.selection.text, "[redacted]");
+  assert.doesNotMatch(JSON.stringify(context), /5555444433331111/u);
+});
+
+test("tab context redacts a range that crosses a sensitive intermediate element", () => {
+  const first = createElement("button", { text: "Start" });
+  const sensitive = createElement("input", {
+    attributes: { autocomplete: "new-password", type: "text" },
+    value: "intermediate-secret"
+  });
+  const last = createElement("button", { text: "Finish" });
+  const harness = createA11yHarness([first, sensitive, last], {
+    selection: {
+      anchorNode: first.childNodes[0],
+      focusNode: last.childNodes[0],
+      intersectedElements: [first, sensitive, last],
+      text: "Start intermediate-secret Finish"
+    }
+  });
+
+  const context = harness.tabContext({ maxChars: 500 });
+
+  assert.equal(context.selection.text, "[redacted]");
+  assert.doesNotMatch(JSON.stringify(context), /intermediate-secret/u);
+});
+
+test("tab context returns meaningful selected refs in DOM order with a strict cap", () => {
+  const elements = Array.from({ length: 105 }, (_, index) => createElement("button", { text: `Choice ${index}` }));
+  const harness = createA11yHarness(elements, {
+    selection: {
+      anchorNode: elements[0].childNodes[0],
+      focusNode: elements.at(-1).childNodes[0],
+      intersectedElements: elements,
+      text: "all choices"
+    }
+  });
+
+  const context = harness.tabContext({ maxChars: 20000 });
+
+  assert.equal(context.selectedElementRefs.length, 100);
+  assert.deepEqual([...context.selectedElementRefs.slice(0, 3)], ["e1", "e2", "e3"]);
+  assert.equal(context.selection.refs.at(-1), "e100");
+});
+
+test("tab context preserves fractional DPR and negative scroll offsets", () => {
+  const harness = createA11yHarness([createElement("main", { text: "Page" })], {
+    deviceScaleFactor: 1.25,
+    scrollX: -8.5,
+    scrollY: -12.25
+  });
+
+  const context = harness.tabContext({ maxChars: 500 });
+
+  assert.equal(context.dimensions.viewport.deviceScaleFactor, 1.25);
+  assert.equal(context.dimensions.viewport.scrollX, -8.5);
+  assert.equal(context.dimensions.viewport.scrollY, -12.25);
+});
+
+test("tab context redacts credential query variants and URL credentials", () => {
+  const harness = createA11yHarness([createElement("main", { text: "Page" })], {
+    url: "https://user:pass@example.test/?client_secret=a&refresh-token=b&id_token=c&password_reset_token=d&safe=value#private"
+  });
+
+  const context = harness.tabContext({ maxChars: 500 });
+  const sanitized = new URL(context.url);
+
+  assert.equal(sanitized.username, "");
+  assert.equal(sanitized.password, "");
+  assert.equal(sanitized.hash, "");
+  for (const key of ["client_secret", "refresh-token", "id_token", "password_reset_token"]) {
+    assert.equal(sanitized.searchParams.get(key), "[redacted]");
+  }
+  assert.equal(sanitized.searchParams.get("safe"), "value");
+});
+
 test("tab context reports visible text and selection truncation", () => {
   const selected = createElement("p", { text: "s".repeat(400) });
   const harness = createA11yHarness([
@@ -179,9 +269,13 @@ test("tab context reports visible text and selection truncation", () => {
 function createA11yHarness(elements, {
   activeElement = null,
   contentType = "text/html",
+  deviceScaleFactor = 1,
   documentHeight = 900,
   documentWidth = 1200,
+  scrollX = 0,
+  scrollY = 0,
   selection = null,
+  url = "https://example.test/",
   viewportHeight = 768,
   viewportWidth = 1024
 } = {}) {
@@ -210,13 +304,16 @@ function createA11yHarness(elements, {
   };
   for (const element of elements) attachElement(element, document, null);
   const window = {
-    devicePixelRatio: 1,
+    devicePixelRatio: deviceScaleFactor,
     getComputedStyle: () => ({ display: "block", opacity: "1", visibility: "visible" }),
     getSelection: () => selection
       ? {
           addRange() {},
           anchorNode: selection.anchorNode,
           focusNode: selection.focusNode,
+          getRangeAt: () => ({
+            intersectsNode: (element) => (selection.intersectedElements ?? []).includes(element)
+          }),
           rangeCount: 1,
           removeAllRanges() {},
           toString: () => selection.text
@@ -224,14 +321,14 @@ function createA11yHarness(elements, {
       : { addRange() {}, anchorNode: null, focusNode: null, rangeCount: 0, removeAllRanges() {}, toString: () => "" },
     innerHeight: viewportHeight,
     innerWidth: viewportWidth,
-    scrollX: 0,
-    scrollY: 0
+    scrollX,
+    scrollY
   };
   const context = vm.createContext({
     chrome: {},
     CSS: { escape: (value) => String(value) },
     document,
-    location: { href: "https://example.test/" },
+    location: { href: url },
     Node: { TEXT_NODE: 3 },
     URL,
     WeakRef,

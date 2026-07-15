@@ -389,6 +389,9 @@ test("every browser tool fails before execution when its negotiated capability i
   };
   try {
     for (const [name, required] of Object.entries(EXPECTED_TOOL_CAPABILITIES)) {
+      const negotiated = name === "chrome_read_page"
+        ? required.filter((capability) => !["browser.screenshots", "browser.windows"].includes(capability))
+        : required;
       let asked = 0;
       await assert.rejects(
         () => plugin.tool[name].execute({}, {
@@ -396,7 +399,7 @@ test("every browser tool fails before execution when its negotiated capability i
           directory: repoRoot
         }),
         (error) => {
-          const missing = required.filter((capability) => capability !== "bridge.handshake");
+          const missing = negotiated.filter((capability) => capability !== "bridge.handshake");
           assert.match(error.message, /Missing capabilities:/u, name);
           for (const capability of missing) assert.match(error.message, new RegExp(capability.replaceAll(".", "\\."), "u"), name);
           return true;
@@ -404,10 +407,50 @@ test("every browser tool fails before execution when its negotiated capability i
         name
       );
       assert.equal(asked, 1, `${name} must ask exactly once before capability preflight`);
-      assert.equal(requestedCapabilities.at(-1), required.join(","), `${name} must negotiate only its declared capabilities`);
+      assert.equal(requestedCapabilities.at(-1), negotiated.join(","), `${name} must negotiate only its required capabilities for the call`);
     }
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.equal(statusRequests, Object.keys(EXPECTED_TOOL_CAPABILITIES).length);
+});
+
+test("chrome_read_page negotiates screenshot and window capabilities only when capturing", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const statusWithoutToolCapabilities = compatibleStatus({
+    extension: {
+      ...compatibleStatus().extension,
+      capabilities: ["bridge.handshake"]
+    }
+  });
+  const originalFetch = globalThis.fetch;
+  const requestedCapabilities = [];
+  globalThis.fetch = async (_url, options) => {
+    requestedCapabilities.push(options?.headers?.["X-OpenCode-Bridge-Capabilities"]);
+    return new Response(JSON.stringify(statusWithoutToolCapabilities), {
+      headers: { "Content-Type": "application/json" },
+      status: 200
+    });
+  };
+  try {
+    await assert.rejects(
+      plugin.tool.chrome_read_page.execute({ includeScreenshot: false }, { ask: async () => {}, directory: repoRoot }),
+      /Missing capabilities:/u
+    );
+    await assert.rejects(
+      plugin.tool.chrome_read_page.execute(
+        { includeScreenshot: true, outputDirectory: "browser-output" },
+        { ask: async () => {}, directory: repoRoot }
+      ),
+      /Missing capabilities:/u
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(
+    requestedCapabilities[0],
+    caps("browser.accessibility", "browser.page-context", "browser.tabs").join(",")
+  );
+  assert.equal(requestedCapabilities[1], EXPECTED_TOOL_CAPABILITIES.chrome_read_page.join(","));
 });

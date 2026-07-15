@@ -870,7 +870,6 @@ function requireApprovals(tools) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
-    const requiredCapabilities = requiredCapabilitiesForTool(name);
     const describe = APPROVAL_METADATA[name]
       ?? (() => ({ action: definition.description ?? `Run ${name}` }));
     const run = definition.execute;
@@ -886,6 +885,7 @@ function requireApprovals(tools) {
           always: [name],
           metadata: describe(args)
         });
+        const requiredCapabilities = requiredCapabilitiesForTool(name, args);
         await requireBridgeCapabilities(requiredCapabilities);
         return run(args, context);
       }
@@ -894,9 +894,12 @@ function requireApprovals(tools) {
   return guarded;
 }
 
-function requiredCapabilitiesForTool(name) {
+function requiredCapabilitiesForTool(name, args) {
   const required = TOOL_CAPABILITY_REQUIREMENTS[name];
   if (!required) throw new Error(`Browser tool ${name} is missing an explicit capability declaration`);
+  if (name === "chrome_read_page" && args?.includeScreenshot !== true) {
+    return required.filter((capability) => capability !== "browser.screenshots" && capability !== "browser.windows");
+  }
   return required;
 }
 

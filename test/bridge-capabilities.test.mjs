@@ -539,7 +539,7 @@ test("approved browser tools preflight negotiated capabilities before execution"
   const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
 
   assert.match(source, /requireBridgeCapabilities/u);
-  assert.match(source, /requiredCapabilitiesForTool\(name\)/u);
+  assert.match(source, /requiredCapabilitiesForTool\(name, args\)/u);
   assert.match(source, /await context\.ask[\s\S]*await requireBridgeCapabilities/u);
 });
 
