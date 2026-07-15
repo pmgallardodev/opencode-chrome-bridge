@@ -66,6 +66,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_hover: capabilities("browser.cdp", "browser.tabs"),
   chrome_keypress: capabilities("browser.cdp", "browser.tabs"),
   chrome_move: capabilities("browser.cdp", "browser.tabs"),
+  chrome_network_requests: capabilities("browser.cdp", "browser.network", "browser.tabs"),
   chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
   chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
@@ -900,8 +901,34 @@ export default async function OpenCodeChromeBridgePlugin() {
           }), null, 2);
         }
       }),
+      chrome_network_requests: tool({
+        description: "Read bounded high-level network request summaries for a Chrome tab. URLs redact credentials, fragments, and sensitive query values; response/request bodies, cookies, and authorization headers are never captured.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          methods: schema.array(schema.string().min(1).max(20)).max(20).optional().describe("Optional exact HTTP method allowlist."),
+          resourceTypes: schema.array(schema.string().min(1).max(50)).max(20).optional().describe("Optional exact CDP resource type allowlist."),
+          statusMin: schema.number().int().min(0).max(999).optional().describe("Optional minimum HTTP status."),
+          statusMax: schema.number().int().min(0).max(999).optional().describe("Optional maximum HTTP status."),
+          urlContains: schema.string().min(1).max(500).optional().describe("Optional substring matched against the redacted URL."),
+          failuresOnly: schema.boolean().optional().describe("Only return requests with a loading failure."),
+          since: schema.number().int().min(0).optional().describe("Only return entries with a cursor greater than this value."),
+          limit: schema.number().int().min(1).max(500).optional().describe("Maximum entries to return; defaults to 100."),
+          clear: schema.boolean().optional().describe("Clear the tab's network buffer after taking this snapshot."),
+          autoAttach: schema.boolean().optional().describe("Auto-attach and enable Network capture when needed; defaults to true.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("networkRequests", {
+            ...args,
+            autoAttach: args.autoAttach !== false,
+            clear: args.clear === true,
+            failuresOnly: args.failuresOnly === true,
+            limit: args.limit ?? 100,
+            since: args.since ?? 0
+          }), null, 2);
+        }
+      }),
       chrome_release_debuggers: tool({
-        description: "Release persistent Chrome debugger attachments created by console logging or CDP event subscriptions.",
+        description: "Release persistent Chrome debugger attachments and buffered state created by console logging, network capture, or CDP event subscriptions.",
         args: {
           tabIds: schema.array(schema.number().int()).optional().describe("Specific tab ids to release. Omit to release all persistent debugger attachments.")
         },
@@ -1036,6 +1063,7 @@ const APPROVAL_METADATA = {
   chrome_find: (args) => ({ action: "Find ranked page elements", tabId: args.tabId, query: previewText(args.query), role: args.role }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
+  chrome_network_requests: (args) => ({ action: "Read bounded page network request summaries", tabId: args.tabId, clear: args.clear }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })

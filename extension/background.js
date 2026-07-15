@@ -12,6 +12,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.find",
   "browser.history",
   "browser.navigation",
+  "browser.network",
   "browser.page-context",
   "browser.screenshots",
   "browser.tab-groups",
@@ -56,6 +57,13 @@ const MAX_WAIT_POLL_MS = 1_000;
 const MIN_WAIT_POLL_MS = 10;
 const MAX_WAIT_VALUE_CHARS = 2_000;
 const MAX_NETWORK_REQUEST_STATES = 1_000;
+const MAX_NETWORK_BUFFER_CHARS = 2_000_000;
+const MAX_NETWORK_RESULT_LIMIT = 500;
+const MAX_NETWORK_FILTER_VALUES = 20;
+const MAX_NETWORK_URL_CHARS = 2_048;
+const MAX_NETWORK_FAILURE_CHARS = 500;
+const MAX_NETWORK_FILTER_CHARS = 500;
+const SENSITIVE_QUERY_KEY_RE = /(?:auth|code|cookie|credential|key|nonce|pass|secret|session|sig|token)/iu;
 const MAX_BATCH_ACTIONS = 25;
 const MAX_BATCH_PAYLOAD_BYTES = 100_000;
 const MIN_BATCH_TIMEOUT_MS = 50;
@@ -103,6 +111,7 @@ const cdpEnabledDomains = new Map();
 // high-level network summaries added in the next roadmap phase.
 const networkRequestStates = new Map();
 const networkTrackerAttached = new Set();
+const networkCaptureAttached = new Set();
 const networkWaitConsumers = new Map();
 const navigationSequences = new Map();
 const activeNativeCommands = new Map();
@@ -380,6 +389,8 @@ async function executeCommand(method, params, options = {}) {
       return captureScreenshotRegion(params);
     case "getConsoleLogs":
       return getConsoleLogs(params);
+    case "networkRequests":
+      return getNetworkRequests(params);
     case "click":
       return dispatchClick(params, options.signal);
     case "doubleClick":
@@ -1812,6 +1823,7 @@ async function releaseDebuggers(params = {}) {
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
       networkTrackerAttached.delete(tabId);
+      networkCaptureAttached.delete(tabId);
       networkWaitConsumers.delete(tabId);
       networkRequestStates.delete(tabId);
       cdpSubscriptions.delete(tabId);
@@ -1968,6 +1980,7 @@ function registerBrowserEventListeners() {
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
       networkTrackerAttached.delete(tabId);
+      networkCaptureAttached.delete(tabId);
       networkWaitConsumers.delete(tabId);
       networkRequestStates.delete(tabId);
       cdpEnabledDomains.delete(tabId);
@@ -2043,6 +2056,102 @@ async function getConsoleLogs(params) {
     attached: consoleLogAttached.has(tabId),
     logs
   };
+}
+
+async function getNetworkRequests(params) {
+  assertNetworkRequestFields(params);
+  const tabId = requireTabId(params);
+  const clear = optionalStrictBoolean(params.clear, false, "clear");
+  const autoAttach = optionalStrictBoolean(params.autoAttach, true, "autoAttach");
+  const failuresOnly = optionalStrictBoolean(params.failuresOnly, false, "failuresOnly");
+  const methods = optionalNetworkStringArray(params.methods, "methods", 20, true);
+  const resourceTypes = optionalNetworkStringArray(params.resourceTypes, "resourceTypes", 50, false);
+  const urlContains = params.urlContains == null
+    ? null
+    : requireBoundedNetworkString(params.urlContains, "urlContains", MAX_NETWORK_FILTER_CHARS);
+  const statusMin = optionalNetworkStatus(params.statusMin, "statusMin");
+  const statusMax = optionalNetworkStatus(params.statusMax, "statusMax");
+  if (statusMin !== null && statusMax !== null && statusMin > statusMax) {
+    throw new Error("statusMin must be less than or equal to statusMax");
+  }
+  const since = strictNetworkInteger(params.since, 0, Number.MAX_SAFE_INTEGER, 0, "since");
+  const limit = strictNetworkInteger(params.limit, 1, MAX_NETWORK_RESULT_LIMIT, 100, "limit");
+  if (autoAttach) await ensureNetworkCaptureDebugger(tabId);
+
+  const state = networkRequestStates.get(tabId);
+  const all = state ? [...state.requests.values()].map(publicNetworkEntry) : [];
+  const matching = all.filter((entry) => entry.cursor > since
+    && (methods.length === 0 || methods.includes(entry.method))
+    && (resourceTypes.length === 0 || resourceTypes.includes(entry.resourceType))
+    && (urlContains === null || entry.url.includes(urlContains))
+    && (statusMin === null || (entry.status !== null && entry.status >= statusMin))
+    && (statusMax === null || (entry.status !== null && entry.status <= statusMax))
+    && (!failuresOnly || entry.failure !== null));
+  const requests = matching.slice(0, limit);
+  const cursors = state ? [...state.requests.values()].map((entry) => entry.cursor) : [];
+  const cursor = {
+    dropped: state?.dropped ?? 0,
+    hasMore: matching.length > requests.length,
+    next: state ? state.nextCursor - 1 : 0,
+    oldest: cursors.length > 0 ? Math.min(...cursors) : null
+  };
+  if (clear && state) {
+    state.requests.clear();
+    state.bufferChars = 0;
+  }
+  return {
+    attached: networkCaptureAttached.has(tabId),
+    count: requests.length,
+    cursor,
+    requests,
+    tabId
+  };
+}
+
+function assertNetworkRequestFields(params) {
+  const allowed = [
+    "tabId", "methods", "resourceTypes", "statusMin", "statusMax", "urlContains",
+    "failuresOnly", "since", "limit", "clear", "autoAttach"
+  ];
+  const unsupported = Object.keys(params).filter((field) => !allowed.includes(field));
+  if (unsupported.length > 0) throw new Error(`networkRequests contains unsupported fields: ${unsupported.join(", ")}`);
+}
+
+function optionalStrictBoolean(value, fallback, name) {
+  if (value == null) return fallback;
+  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value;
+}
+
+function optionalNetworkStringArray(value, name, maxChars, uppercase) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > MAX_NETWORK_FILTER_VALUES) {
+    throw new Error(`${name} must be an array of at most ${MAX_NETWORK_FILTER_VALUES} strings`);
+  }
+  return value.map((entry) => {
+    const normalized = requireBoundedNetworkString(entry, name, maxChars);
+    return uppercase ? normalized.toUpperCase() : normalized;
+  });
+}
+
+function requireBoundedNetworkString(value, name, maxChars) {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxChars) {
+    throw new Error(`${name} must be a non-empty string of at most ${maxChars} characters`);
+  }
+  return value;
+}
+
+function optionalNetworkStatus(value, name) {
+  if (value == null) return null;
+  return strictNetworkInteger(value, 0, 999, null, name);
+}
+
+function strictNetworkInteger(value, min, max, fallback, name) {
+  if (value == null) return fallback;
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  }
+  return value;
 }
 
 async function setCursorState(params) {
@@ -2910,13 +3019,7 @@ async function acquireNetworkWaitTracker(tabId) {
         await chrome.debugger.attach(target, DEBUGGER_VERSION);
         attachedHere = true;
       }
-      const trackingSince = Date.now();
-      networkRequestStates.set(tabId, {
-        lastActivityAt: trackingSince,
-        overflowed: false,
-        requests: new Map(),
-        trackingSince
-      });
+      ensureNetworkRequestState(tabId);
       networkTrackerAttached.add(tabId);
       networkWaitConsumers.set(tabId, 1);
       await enableRequiredCdpDomain(target, "Network");
@@ -2942,6 +3045,7 @@ async function releaseNetworkWaitTracker(tabId) {
       return;
     }
     networkWaitConsumers.delete(tabId);
+    if (networkCaptureAttached.has(tabId)) return;
     networkTrackerAttached.delete(tabId);
     networkRequestStates.delete(tabId);
     if (!isPersistentDebuggerAttached(tabId)) {
@@ -2949,6 +3053,56 @@ async function releaseNetworkWaitTracker(tabId) {
       await chrome.debugger.detach(target).catch(() => {});
     }
   });
+}
+
+async function ensureNetworkCaptureDebugger(tabId) {
+  const target = { tabId };
+  return withDebuggerLock(debuggerKey(target), async () => {
+    if (networkCaptureAttached.has(tabId)) {
+      return { attached: true, alreadyAttached: true, tabId };
+    }
+    const reused = isPersistentDebuggerAttached(tabId);
+    let attachedHere = false;
+    try {
+      if (!reused) {
+        await chrome.debugger.attach(target, DEBUGGER_VERSION);
+        attachedHere = true;
+      }
+      ensureNetworkRequestState(tabId);
+      networkTrackerAttached.add(tabId);
+      networkCaptureAttached.add(tabId);
+      await enableRequiredCdpDomain(target, "Network");
+      return { attached: true, alreadyAttached: false, tabId };
+    } catch (error) {
+      networkCaptureAttached.delete(tabId);
+      if ((networkWaitConsumers.get(tabId) ?? 0) === 0) {
+        networkTrackerAttached.delete(tabId);
+        networkRequestStates.delete(tabId);
+      }
+      if (attachedHere) {
+        cdpEnabledDomains.delete(tabId);
+        await chrome.debugger.detach(target).catch(() => {});
+      }
+      throw error;
+    }
+  });
+}
+
+function ensureNetworkRequestState(tabId) {
+  let state = networkRequestStates.get(tabId);
+  if (state) return state;
+  const trackingSince = Date.now();
+  state = {
+    bufferChars: 0,
+    dropped: 0,
+    lastActivityAt: trackingSince,
+    nextCursor: 1,
+    overflowed: false,
+    requests: new Map(),
+    trackingSince
+  };
+  networkRequestStates.set(tabId, state);
+  return state;
 }
 
 async function enableRequiredCdpDomain(target, domain) {
@@ -2962,7 +3116,7 @@ async function enableRequiredCdpDomain(target, domain) {
 }
 
 function trackNetworkEvent(tabId, method, params) {
-  if (!["Network.requestWillBeSent", "Network.loadingFinished", "Network.loadingFailed"].includes(method)) return;
+  if (!["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished", "Network.loadingFailed"].includes(method)) return;
   const state = networkRequestStates.get(tabId);
   const requestId = typeof params?.requestId === "string" ? params.requestId : "";
   if (!state || requestId.length === 0 || requestId.length > 500) return;
@@ -2973,26 +3127,139 @@ function trackNetworkEvent(tabId, method, params) {
     let entry = state.requests.get(requestId);
     if (!entry && state.requests.size >= MAX_NETWORK_REQUEST_STATES) {
       const completedId = [...state.requests].find(([, candidate]) => candidate.inFlight === false)?.[0];
-      if (completedId) state.requests.delete(completedId);
+      if (completedId) removeNetworkEntry(state, completedId);
       else {
         state.overflowed = true;
         return;
       }
     }
-    entry = entry ?? { requestId };
+    if (!entry) {
+      entry = {
+        cursor: state.nextCursor++,
+        encodedLength: 0,
+        failure: null,
+        finishedAt: null,
+        initiatorType: "other",
+        method: "GET",
+        mimeType: "",
+        requestId,
+        resourceType: "Other",
+        startedAt: finiteNetworkNumber(params.timestamp, now),
+        status: null,
+        url: ""
+      };
+    } else {
+      state.bufferChars -= entry.bufferChars ?? 0;
+    }
     entry.inFlight = true;
-    entry.startedAt = now;
+    entry.startedAt = finiteNetworkNumber(params.timestamp, now);
     entry.finishedAt = null;
+    entry.failure = null;
+    entry.method = sanitizeNetworkToken(params?.request?.method, 20, "GET").toUpperCase();
+    entry.url = redactNetworkUrl(params?.request?.url);
+    entry.resourceType = sanitizeNetworkToken(params?.type, 50, "Other");
+    entry.initiatorType = sanitizeNetworkToken(params?.initiator?.type, 50, "other");
     state.requests.delete(requestId);
     state.requests.set(requestId, entry);
+    updateNetworkEntrySize(state, entry);
+    trimNetworkRequestState(state);
     return;
   }
 
   const entry = state.requests.get(requestId);
-  if (entry) {
+  if (!entry) return;
+  state.bufferChars -= entry.bufferChars ?? 0;
+  if (method === "Network.responseReceived") {
+    entry.resourceType = sanitizeNetworkToken(params?.type, 50, entry.resourceType);
+    entry.status = Number.isInteger(params?.response?.status) ? params.response.status : entry.status;
+    entry.mimeType = sanitizeNetworkToken(params?.response?.mimeType, 200, entry.mimeType);
+    entry.encodedLength = finiteNonNegativeNetworkNumber(params?.response?.encodedDataLength, entry.encodedLength);
+  } else {
     entry.inFlight = false;
-    entry.finishedAt = now;
-    entry.failed = method === "Network.loadingFailed";
+    entry.finishedAt = finiteNetworkNumber(params.timestamp, now);
+    if (method === "Network.loadingFinished") {
+      entry.encodedLength = finiteNonNegativeNetworkNumber(params.encodedDataLength, entry.encodedLength);
+    } else {
+      entry.failure = truncateString(params?.errorText || "Network request failed", MAX_NETWORK_FAILURE_CHARS);
+    }
+  }
+  updateNetworkEntrySize(state, entry);
+  trimNetworkRequestState(state);
+}
+
+function redactNetworkUrl(value) {
+  if (typeof value !== "string") return "";
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:", "ws:", "wss:"].includes(parsed.protocol)) {
+      return `${parsed.protocol}[REDACTED]`;
+    }
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (SENSITIVE_QUERY_KEY_RE.test(key)) parsed.searchParams.set(key, "[REDACTED]");
+    }
+    return truncateString(parsed.href, MAX_NETWORK_URL_CHARS);
+  } catch {
+    return "[invalid URL]";
+  }
+}
+
+function sanitizeNetworkToken(value, maxChars, fallback) {
+  return typeof value === "string" && value.length > 0 ? truncateString(value, maxChars) : fallback;
+}
+
+function finiteNetworkNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteNonNegativeNetworkNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function publicNetworkEntry(entry) {
+  return {
+    cursor: entry.cursor,
+    encodedLength: entry.encodedLength,
+    failure: entry.failure,
+    finishedAt: entry.finishedAt,
+    initiatorType: entry.initiatorType,
+    method: entry.method,
+    mimeType: entry.mimeType,
+    requestId: entry.requestId,
+    resourceType: entry.resourceType,
+    startedAt: entry.startedAt,
+    status: entry.status,
+    url: entry.url
+  };
+}
+
+function updateNetworkEntrySize(state, entry) {
+  entry.bufferChars = JSON.stringify(publicNetworkEntry(entry)).length;
+  state.bufferChars += entry.bufferChars;
+}
+
+function removeNetworkEntry(state, requestId) {
+  const entry = state.requests.get(requestId);
+  if (!entry) return false;
+  state.requests.delete(requestId);
+  state.bufferChars -= entry.bufferChars ?? 0;
+  state.dropped += 1;
+  return true;
+}
+
+function trimNetworkRequestState(state) {
+  while (state.requests.size > MAX_NETWORK_REQUEST_STATES || state.bufferChars > MAX_NETWORK_BUFFER_CHARS) {
+    const completedId = [...state.requests].find(([, candidate]) => candidate.inFlight === false)?.[0];
+    if (!completedId) {
+      state.overflowed = true;
+      const oldestId = state.requests.keys().next().value;
+      if (oldestId === undefined) return;
+      removeNetworkEntry(state, oldestId);
+      continue;
+    }
+    removeNetworkEntry(state, completedId);
   }
 }
 

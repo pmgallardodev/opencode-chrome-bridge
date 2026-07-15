@@ -1212,6 +1212,173 @@ test("network-idle waits reset on activity and preserve console debugger consume
   assert.equal(logs.logs[0].text, "still collecting");
 });
 
+test("network request summaries merge lifecycle events and redact sensitive URLs", async () => {
+  const harness = createBackgroundHarness();
+  const initial = await harness.execute("networkRequests", { tabId: 7 });
+  assert.equal(initial.attached, true);
+  assert.equal(initial.count, 0);
+  assert.equal(initial.cursor.next, 0);
+
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.requestWillBeSent",
+    {
+      requestId: "request-1",
+      timestamp: 10,
+      initiator: { type: "script" },
+      type: "Fetch",
+      request: {
+        method: "POST",
+        url: "https://alice:secret@example.com/api/items?token=abc&query=visible&password=hunter2&client_secret=hidden#private"
+      }
+    }
+  );
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.responseReceived",
+    {
+      requestId: "request-1",
+      timestamp: 11,
+      type: "Fetch",
+      response: { status: 201, mimeType: "application/json", encodedDataLength: 123 }
+    }
+  );
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.loadingFinished",
+    { requestId: "request-1", timestamp: 12, encodedDataLength: 456 }
+  );
+
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(result.count, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.requests[0])), {
+    cursor: 1,
+    encodedLength: 456,
+    failure: null,
+    finishedAt: 12,
+    initiatorType: "script",
+    method: "POST",
+    mimeType: "application/json",
+    requestId: "request-1",
+    resourceType: "Fetch",
+    startedAt: 10,
+    status: 201,
+    url: "https://example.com/api/items?token=%5BREDACTED%5D&query=visible&password=%5BREDACTED%5D&client_secret=%5BREDACTED%5D"
+  });
+  assert.equal(JSON.stringify(result).includes("alice"), false);
+  assert.equal(JSON.stringify(result).includes("alice:secret"), false);
+  assert.equal(JSON.stringify(result).includes("hunter2"), false);
+  assert.equal(JSON.stringify(result).includes("hidden"), false);
+  assert.equal(result.cursor.next, 1);
+  assert.equal(result.cursor.oldest, 1);
+
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    requestId: "request-2",
+    timestamp: 13,
+    type: "Other",
+    request: { method: "GET", url: "data:text/plain,private-body-content" },
+    initiator: { type: "other" }
+  });
+  const withDataUrl = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, since: 1 });
+  assert.equal(withDataUrl.requests[0].url, "data:[REDACTED]");
+  assert.equal(JSON.stringify(withDataUrl).includes("private-body-content"), false);
+});
+
+test("network request summaries filter stably, clear atomically, and coexist with debugger consumers", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+  await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Network.responseReceived"] });
+  await harness.execute("networkRequests", { tabId: 7 });
+  assert.equal(harness.calls.debuggerAttach.length, 1, "persistent consumers must share one debugger");
+  assert.equal(
+    harness.calls.debuggerCommands.filter((entry) => entry.method === "Network.enable").length,
+    1,
+    "Network must be enabled once per tab"
+  );
+
+  for (const [requestId, method, url, type, status] of [
+    ["b", "GET", "https://example.com/assets/b.js", "Script", 200],
+    ["a", "POST", "https://example.com/api/a", "Fetch", 503],
+    ["c", "GET", "https://example.com/api/c", "Fetch", 204]
+  ]) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+      requestId, timestamp: requestId === "b" ? 3 : requestId === "a" ? 1 : 2,
+      type, request: { method, url }, initiator: { type: "parser" }
+    });
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.responseReceived", {
+      requestId, timestamp: 4, type, response: { status, mimeType: "text/plain", encodedDataLength: 10 }
+    });
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFinished", {
+      requestId, timestamp: 5, encodedDataLength: 20
+    });
+  }
+
+  const filtered = await harness.execute("networkRequests", {
+    tabId: 7,
+    autoAttach: false,
+    methods: ["GET"],
+    resourceTypes: ["Fetch"],
+    statusMin: 200,
+    statusMax: 299,
+    urlContains: "/api/",
+    since: 0,
+    limit: 10
+  });
+  assert.equal(JSON.stringify(filtered.requests.map((entry) => entry.requestId)), JSON.stringify(["c"]));
+  assert.equal(filtered.cursor.next, 3);
+  assert.equal(filtered.cursor.hasMore, false);
+
+  const cleared = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, clear: true });
+  assert.equal(JSON.stringify(cleared.requests.map((entry) => entry.requestId)), JSON.stringify(["b", "a", "c"]));
+  assert.equal((await harness.execute("networkRequests", { tabId: 7, autoAttach: false })).count, 0);
+  await harness.execute("unsubscribeCdpEvents", { tabId: 7 });
+  assert.equal(harness.calls.debuggerDetach.length, 0, "network capture must keep the shared debugger attached");
+  await harness.execute("releaseDebuggers", { tabIds: [7] });
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.equal(await harness.networkTrackerState(7), null, "release must remove network state");
+});
+
+test("network request summaries enforce count, string, and filter bounds", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("networkRequests", { tabId: 7 });
+  for (let index = 0; index < 1_005; index += 1) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+      requestId: `request-${index}`,
+      timestamp: index,
+      type: "Fetch",
+      request: { method: "GET", url: `https://example.com/${index}/${"x".repeat(3_000)}` },
+      initiator: { type: "script" }
+    });
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.loadingFailed", {
+      requestId: `request-${index}`,
+      timestamp: index + 0.5,
+      errorText: "failure".repeat(2_000)
+    });
+  }
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false, limit: 500 });
+  assert.ok(result.cursor.dropped >= 5);
+  assert.ok(result.cursor.oldest > 1);
+  assert.ok(result.requests.length <= 500);
+  assert.ok(result.requests.every((entry) => entry.url.length <= 2_048));
+  assert.ok(result.requests.every((entry) => entry.failure.length <= 500));
+
+  for (const invalid of [
+    { methods: "GET" },
+    { methods: Array.from({ length: 21 }, () => "GET") },
+    { resourceTypes: [""] },
+    { urlContains: "x".repeat(501) },
+    { limit: 501 },
+    { since: -1 },
+    { clear: "yes" },
+    { autoAttach: 1 }
+  ]) {
+    await assert.rejects(
+      harness.execute("networkRequests", { tabId: 7, autoAttach: false, ...invalid }),
+      /methods|resourceTypes|urlContains|limit|since|clear|autoAttach/iu
+    );
+  }
+});
+
 test("network-idle tracks requests emitted while Network.enable is in flight", async () => {
   let harness;
   harness = createBackgroundHarness({
@@ -2212,7 +2379,7 @@ function createBackgroundHarness({
   windowsGet = async (windowId) => ({ id: windowId }),
   windowsUpdate = async (windowId) => ({ id: windowId })
 } = {}) {
-  const calls = { debuggerAttach: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
@@ -2254,7 +2421,10 @@ function createBackgroundHarness({
       getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
       onEvent: events.debuggerOnEvent,
-      sendCommand: debuggerSendCommand
+      sendCommand: async (target, method, params) => {
+        calls.debuggerCommands.push({ target, method, params });
+        return debuggerSendCommand(target, method, params);
+      }
     },
     downloads: {
       onChanged: createEvent(),

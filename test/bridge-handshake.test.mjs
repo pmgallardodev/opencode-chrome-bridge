@@ -66,6 +66,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_hover: caps("browser.cdp", "browser.tabs"),
   chrome_keypress: caps("browser.cdp", "browser.tabs"),
   chrome_move: caps("browser.cdp", "browser.tabs"),
+  chrome_network_requests: caps("browser.cdp", "browser.network", "browser.tabs"),
   chrome_open: caps("browser.navigation", "browser.tabs", "session.tab-leases"),
   chrome_open_window: caps("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: caps("browser.cdp", "browser.tabs"),

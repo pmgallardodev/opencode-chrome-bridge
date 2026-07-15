@@ -578,6 +578,46 @@ test("OpenCode plugin exposes one typed deterministic wait tool and capability",
   }
 });
 
+test("OpenCode plugin exposes strict bounded network summaries with an explicit capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const network = plugin.tool.chrome_network_requests;
+  assert.ok(network, "chrome_network_requests tool missing");
+  assert.match(network.description, /network|request/iu);
+  assert.match(network.description, /bod|cookie|authorization|redact/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_network_requests],
+    ["bridge.handshake", "browser.cdp", "browser.network", "browser.tabs"]
+  );
+
+  const valid = {
+    tabId: 7,
+    methods: ["GET", "POST"],
+    resourceTypes: ["Fetch", "Document"],
+    statusMin: 200,
+    statusMax: 399,
+    urlContains: "/api/",
+    failuresOnly: false,
+    since: 0,
+    limit: 100,
+    clear: false,
+    autoAttach: true
+  };
+  for (const [name, value] of Object.entries(valid)) {
+    assert.equal(network.args[name].safeParse(value).success, true, `valid ${name} rejected`);
+  }
+  for (const [name, value] of Object.entries({
+    methods: "GET",
+    resourceTypes: Array.from({ length: 21 }, () => "Fetch"),
+    urlContains: "x".repeat(501),
+    limit: 501,
+    since: -1,
+    clear: "false",
+    autoAttach: 1
+  })) {
+    assert.equal(network.args[name].safeParse(value).success, false, `invalid ${name} accepted`);
+  }
+});
+
 test("wait condition schemas are strict discriminated unions for every condition type", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const conditionSchema = plugin.tool.chrome_wait_for.args.condition;
