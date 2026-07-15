@@ -1182,33 +1182,43 @@ export async function uploadWorkspaceFiles({
   const workspace = await realpath(directory);
   const files = [];
   let totalBytes = 0;
-  for (const inputPath of paths) {
-    throwIfUploadAborted(signal);
-    if (typeof inputPath !== "string" || inputPath.length === 0 || inputPath.length > 4096) {
-      throw new Error("upload path is invalid");
-    }
-    const candidate = path.resolve(workspace, inputPath);
-    const resolved = await realpath(candidate).catch(() => { throw new Error(`upload file does not exist: ${inputPath}`); });
-    const relative = path.relative(workspace, resolved);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new Error(`upload path escapes outside the workspace: ${inputPath}`);
-    }
-    const info = await lstat(resolved);
-    if (!info.isFile()) throw new Error(`upload path is not a regular file: ${inputPath}`);
-    totalBytes += info.size;
-    if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
-      throw new Error(`upload total exceeds ${MAX_UPLOAD_TOTAL_BYTES} bytes`);
-    }
-    files.push({
-      chunkCount: Math.ceil(info.size / chunkBytes),
-      name: path.basename(resolved),
-      path: resolved,
-      size: info.size,
-      type: "application/octet-stream"
-    });
-  }
   let transferId;
   try {
+    for (const inputPath of paths) {
+      throwIfUploadAborted(signal);
+      if (typeof inputPath !== "string" || inputPath.length === 0 || inputPath.length > 4096) {
+        throw new Error("upload path is invalid");
+      }
+      const candidate = path.resolve(workspace, inputPath);
+      const resolved = await realpath(candidate).catch(() => { throw new Error(`upload file does not exist: ${inputPath}`); });
+      assertUploadPathWithin(workspace, resolved, inputPath);
+      let handle;
+      try {
+        handle = await open(resolved, "r");
+        const info = await handle.stat();
+        const boundPath = await realpath(candidate).catch(() => { throw new Error(`upload file changed during validation: ${inputPath}`); });
+        assertUploadPathWithin(workspace, boundPath, inputPath);
+        const boundInfo = await lstat(boundPath);
+        if (boundInfo.dev !== info.dev || boundInfo.ino !== info.ino) {
+          throw new Error(`upload file identity changed during validation: ${inputPath}`);
+        }
+        if (!info.isFile()) throw new Error(`upload path is not a regular file: ${inputPath}`);
+        totalBytes += info.size;
+        if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+          throw new Error(`upload total exceeds ${MAX_UPLOAD_TOTAL_BYTES} bytes`);
+        }
+        files.push({
+          chunkCount: Math.ceil(info.size / chunkBytes),
+          handle,
+          name: path.basename(candidate),
+          size: info.size,
+          type: "application/octet-stream"
+        });
+        handle = null;
+      } finally {
+        await handle?.close();
+      }
+    }
     throwIfUploadAborted(signal);
     const begun = await command("fileUploadBegin", {
       tabId,
@@ -1221,25 +1231,20 @@ export async function uploadWorkspaceFiles({
     }
     for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
       const file = files[fileIndex];
-      const handle = await open(file.path, "r");
-      try {
-        let position = 0;
-        for (let chunkIndex = 0; chunkIndex < file.chunkCount; chunkIndex += 1) {
-          throwIfUploadAborted(signal);
-          const expected = Math.min(chunkBytes, file.size - position);
-          const buffer = Buffer.allocUnsafe(expected);
-          const { bytesRead } = await handle.read(buffer, 0, expected, position);
-          if (bytesRead !== expected) throw new Error(`upload file changed while reading: ${file.name}`);
-          await command("fileUploadChunk", {
-            transferId,
-            fileIndex,
-            chunkIndex,
-            data: buffer.toString("base64")
-          }, { signal });
-          position += bytesRead;
-        }
-      } finally {
-        await handle.close();
+      let position = 0;
+      for (let chunkIndex = 0; chunkIndex < file.chunkCount; chunkIndex += 1) {
+        throwIfUploadAborted(signal);
+        const expected = Math.min(chunkBytes, file.size - position);
+        const buffer = Buffer.allocUnsafe(expected);
+        const { bytesRead } = await file.handle.read(buffer, 0, expected, position);
+        if (bytesRead !== expected) throw new Error(`upload file changed while reading: ${file.name}`);
+        await command("fileUploadChunk", {
+          transferId,
+          fileIndex,
+          chunkIndex,
+          data: buffer.toString("base64")
+        }, { signal });
+        position += bytesRead;
       }
     }
     throwIfUploadAborted(signal);
@@ -1249,6 +1254,15 @@ export async function uploadWorkspaceFiles({
       try { await command("fileUploadAbort", { transferId }); } catch {}
     }
     throw error;
+  } finally {
+    await Promise.all(files.map((file) => file.handle.close().catch(() => {})));
+  }
+}
+
+function assertUploadPathWithin(workspace, resolved, inputPath) {
+  const relative = path.relative(workspace, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`upload path escapes outside the workspace: ${inputPath}`);
   }
 }
 

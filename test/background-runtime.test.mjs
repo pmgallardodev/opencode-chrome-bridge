@@ -2769,6 +2769,45 @@ test("file upload staging bounds concurrent declared bytes and enforces global f
   );
 });
 
+test("file upload cancellation after isolated preparation never reaches the DOM commit", async () => {
+  const actions = [];
+  let releasePrepare;
+  const prepareGate = new Promise((resolve) => { releasePrepare = resolve; });
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      const action = injection.args?.[0];
+      actions.push(action);
+      if (action === "prepare") {
+        await prepareGate;
+        return [{ result: { prepared: true, count: 1, names: ["hello.txt"] } }];
+      }
+      if (action === "commit") return [{ result: { committed: true, count: 1, names: ["hello.txt"] } }];
+      return [{ result: { accepted: true } }];
+    }
+  });
+  const begun = await harness.execute("fileUploadBegin", {
+    tabId: 7,
+    files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }],
+    totalBytes: 5
+  });
+  await harness.execute("fileUploadChunk", {
+    transferId: begun.transferId, fileIndex: 0, chunkIndex: 0, data: "aGVsbG8="
+  });
+  const controller = new AbortController();
+  const pending = harness.execute(
+    "fileUploadCommit",
+    { transferId: begun.transferId, tabId: 7, ref: "e1" },
+    { signal: controller.signal }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort(new Error("upload cancelled"));
+  releasePrepare();
+
+  await assert.rejects(pending, /cancelled/u);
+  assert.equal(actions.filter((action) => action === "commit").length, 0);
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},

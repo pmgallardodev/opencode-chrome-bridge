@@ -130,8 +130,24 @@ async function handleHttp(req, res) {
     if (req.method === "POST" && requestUrl.pathname === "/command") {
       requireJsonRequest(req);
       const body = await readJsonBody(req);
-      const result = await sendCommand(body.method, body.params ?? {}, body.timeoutMs);
-      sendJson(res, 200, { ok: true, result });
+      const command = sendCommand(body.method, body.params ?? {}, body.timeoutMs);
+      const cancelOnDisconnect = () => {
+        if (!res.writableEnded) cancelPendingCommand(
+          command.commandId,
+          new Error(`HTTP client disconnected during Chrome command ${body.method}`)
+        );
+      };
+      req.once("aborted", cancelOnDisconnect);
+      res.once("close", cancelOnDisconnect);
+      req.socket.once("close", cancelOnDisconnect);
+      try {
+        const result = await command;
+        sendJson(res, 200, { ok: true, result });
+      } finally {
+        req.removeListener("aborted", cancelOnDisconnect);
+        res.removeListener("close", cancelOnDisconnect);
+        req.socket.removeListener("close", cancelOnDisconnect);
+      }
       return;
     }
     if (req.method === "GET" && requestUrl.pathname === "/events") {
@@ -144,6 +160,7 @@ async function handleHttp(req, res) {
     }
     sendJson(res, 404, { ok: false, error: "Not found" });
   } catch (error) {
+    if (res.destroyed) return;
     const statusCode = error instanceof HttpError ? error.statusCode : 500;
     sendJson(res, statusCode, { ok: false, error: error?.message || "Internal bridge error" });
   }
@@ -415,13 +432,9 @@ function sendCommand(method, params, timeoutMs = 15000) {
   }
   const id = `opencode:${nextId++}`;
   const message = { type: "command", id, method, params };
-  return new Promise((resolve, reject) => {
+  const command = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      pending.delete(id);
-      writeNativeMessage({ type: "cancel", id }).catch((error) => {
-        log(`could not cancel timed-out Chrome command ${id}: ${error?.message ?? error}`);
-      });
-      reject(new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
+      cancelPendingCommand(id, new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
     }, clampTimeout(timeoutMs));
     pending.set(id, { resolve, reject, timeout });
     writeNativeMessage(message).catch((error) => {
@@ -430,6 +443,20 @@ function sendCommand(method, params, timeoutMs = 15000) {
       reject(error);
     });
   });
+  command.commandId = id;
+  return command;
+}
+
+function cancelPendingCommand(id, reason) {
+  const entry = pending.get(id);
+  if (!entry) return false;
+  pending.delete(id);
+  clearTimeout(entry.timeout);
+  writeNativeMessage({ type: "cancel", id }).catch((error) => {
+    log(`could not cancel Chrome command ${id}: ${error?.message ?? error}`);
+  });
+  entry.reject(reason);
+  return true;
 }
 
 async function writeNativeMessage(message) {

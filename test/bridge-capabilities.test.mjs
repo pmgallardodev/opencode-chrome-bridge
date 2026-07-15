@@ -229,6 +229,9 @@ test("native host validates local bridge command requests before forwarding to C
   assert.match(nativeHost, /if \(!subscriber\.write/u, "slow SSE subscribers must be disconnected instead of buffering indefinitely");
   assert.match(nativeHost, /server\.headersTimeout/u, "local HTTP headers must have a finite timeout");
   assert.match(nativeHost, /type:\s*"cancel",\s*id/u, "timed-out commands must cancel extension work");
+  assert.match(nativeHost, /res\.once\("close", cancelOnDisconnect\)/u, "disconnected HTTP command clients must cancel extension work");
+  assert.match(nativeHost, /if \(!res\.writableEnded\) cancelPendingCommand/u, "normal completed responses must not be cancelled on close");
+  assert.match(nativeHost, /pending\.delete\(id\)/u, "native cancellation must settle each pending command only once");
   assert.match(nativeHost, /Math\.min\(parsed,\s*125000\)/u, "host timeout must leave five seconds for extension cleanup");
   assert.match(nativeHost, /"Cache-Control": "no-store"/u, "JSON responses containing browser data must not be cached");
   assert.match(nativeHost, /"X-Content-Type-Options": "nosniff"/u, "JSON responses must disable MIME sniffing");
@@ -238,6 +241,7 @@ test("bridge client aborts stalled local HTTP requests", async () => {
   const source = await readFile(path.join(repoRoot, "src", "bridge-client.js"), "utf8");
 
   assert.match(source, /AbortController/u, "bridge client must create an AbortController for fetch");
+  assert.match(source, /http\.request/u, "externally cancellable bridge commands must use an HTTP request that destroys its socket on abort");
   assert.match(source, /setTimeout/u, "bridge client must enforce a client-side timeout");
   assert.match(source, /clearTimeout/u, "bridge client must clear the timeout after fetch settles");
   assert.match(source, /MAX_REQUEST_TIMEOUT_MS\s*=\s*126000/u, "client timeout must outlive the maximum native-host command timeout");

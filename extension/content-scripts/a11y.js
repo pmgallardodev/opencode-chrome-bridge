@@ -868,7 +868,7 @@ if (!window.__opencodeA11yInstalled) {
     if (!/^[A-Za-z0-9_-]{8,128}$/u.test(transferId)) throw new Error("upload transfer id is invalid");
     const now = Date.now();
     for (const [id, candidate] of uploadTransfers) {
-      if (now > candidate.expiresAt) uploadTransfers.delete(id);
+      if (now > candidate.expiresAt) clearUploadTransfer(id);
     }
     if (action === "begin") {
       if (uploadTransfers.has(transferId)) throw new Error("upload transfer already exists");
@@ -896,16 +896,18 @@ if (!window.__opencodeA11yInstalled) {
       }
       let nextFileIndex = 0;
       while (nextFileIndex < files.length && files[nextFileIndex].chunkCount === 0) nextFileIndex += 1;
-      uploadTransfers.set(transferId, { expiresAt: payload.expiresAt, files, nextFileIndex });
+      const transfer = { expiresAt: payload.expiresAt, files, nextFileIndex, timer: null };
+      uploadTransfers.set(transferId, transfer);
+      armUploadExpiry(transferId, transfer, payload.expiresAt);
       return { accepted: true, transferId };
     }
     const transfer = uploadTransfers.get(transferId);
     if (!transfer || Date.now() > transfer.expiresAt) {
-      uploadTransfers.delete(transferId);
+      clearUploadTransfer(transferId);
       throw new Error("upload transfer is unknown or expired");
     }
     if (action === "abort") {
-      uploadTransfers.delete(transferId);
+      clearUploadTransfer(transferId);
       return { aborted: true, transferId };
     }
     if (action === "chunk") {
@@ -934,10 +936,10 @@ if (!window.__opencodeA11yInstalled) {
         while (transfer.nextFileIndex < transfer.files.length
           && transfer.files[transfer.nextFileIndex].chunkCount === 0) transfer.nextFileIndex += 1;
       }
-      if (Number.isFinite(payload.expiresAt)) transfer.expiresAt = payload.expiresAt;
+      if (Number.isFinite(payload.expiresAt)) armUploadExpiry(transferId, transfer, payload.expiresAt);
       return { accepted: true, chunkIndex: payload.chunkIndex, fileIndex: payload.fileIndex, transferId };
     }
-    if (action !== "commit") throw new Error("upload action is invalid");
+    if (action !== "prepare" && action !== "commit") throw new Error("upload action is invalid");
     const element = derefElement(payload.ref);
     if (!element) throw new Error(`Element ${String(payload.ref)} was not found; capture a fresh accessibilityTree`);
     if (element.tagName.toLowerCase() !== "input"
@@ -950,21 +952,45 @@ if (!window.__opencodeA11yInstalled) {
         throw new Error(`upload is missing chunk data for ${file.name}`);
       }
     }
+    const expectedNames = transfer.files.map((file) => file.name);
+    if (action === "prepare") {
+      return { prepared: true, count: expectedNames.length, names: expectedNames, transferId };
+    }
     const dataTransfer = new DataTransfer();
     for (const staged of transfer.files) {
       dataTransfer.items.add(new File(staged.chunks, staged.name, { type: staged.type }));
     }
-    const expectedNames = transfer.files.map((file) => file.name);
     element.files = dataTransfer.files;
-    element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     const actualNames = Array.from(element.files ?? [], (file) => file.name);
     const verified = actualNames.length === expectedNames.length
       && actualNames.every((name, index) => name === expectedNames[index]);
     if (!verified) throw new Error("file input did not retain the exact staged files");
-    uploadTransfers.delete(transferId);
+    clearUploadTransfer(transferId);
+    element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     return { committed: true, count: actualNames.length, names: actualNames, transferId };
   };
+
+  function clearUploadTransfer(transferId) {
+    const transfer = uploadTransfers.get(transferId);
+    if (transfer?.timer != null) clearTimeout(transfer.timer);
+    uploadTransfers.delete(transferId);
+  }
+
+  function armUploadExpiry(transferId, transfer, expiresAt) {
+    if (transfer.timer != null) clearTimeout(transfer.timer);
+    transfer.expiresAt = expiresAt;
+    const expire = () => {
+      if (uploadTransfers.get(transferId) !== transfer) return;
+      const remaining = transfer.expiresAt - Date.now();
+      if (remaining > 0) {
+        transfer.timer = setTimeout(expire, remaining);
+        return;
+      }
+      clearUploadTransfer(transferId);
+    };
+    transfer.timer = setTimeout(expire, Math.max(0, expiresAt - Date.now()));
+  }
 
   function clampInt(value, min, max, fallback) {
     if (!Number.isInteger(value)) return fallback;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -80,6 +80,39 @@ test("workspace upload aborts staging on a chunk failure or cancellation", async
     /transport failed/u
   );
   assert.deepEqual(calls, ["fileUploadBegin", "fileUploadChunk", "fileUploadAbort"]);
+});
+
+test("workspace upload keeps validated handles across a symlink swap during begin", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "bridge-upload-swap-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "bridge-upload-swap-outside-"));
+  t.after(() => Promise.all([
+    rm(workspace, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  const candidate = path.join(workspace, "payload.txt");
+  const original = path.join(workspace, "payload-original.txt");
+  const secret = path.join(outside, "secret.txt");
+  await writeFile(candidate, "inside");
+  await writeFile(secret, "outside-secret");
+  const chunks = [];
+  const command = async (method, params) => {
+    if (method === "fileUploadBegin") {
+      await rename(candidate, original);
+      await symlink(secret, candidate);
+      return { transferId: "opaque-transfer-id" };
+    }
+    if (method === "fileUploadChunk") chunks.push(Buffer.from(params.data, "base64").toString("utf8"));
+    if (method === "fileUploadCommit") return { committed: true, count: 1, names: ["payload.txt"] };
+    return { accepted: true };
+  };
+
+  const result = await pluginModule.uploadWorkspaceFiles({
+    command, directory: workspace, paths: ["payload.txt"], ref: "e1", tabId: 1, chunkBytes: 64
+  });
+
+  assert.equal(result.committed, true);
+  assert.deepEqual(chunks, ["inside"]);
+  assert.doesNotMatch(chunks.join(""), /outside-secret/u);
 });
 
 test("workspace upload rejects empty, excessive, and byte-oversized file lists", async (t) => {

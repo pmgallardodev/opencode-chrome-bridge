@@ -118,23 +118,43 @@ test("file upload staging rejects stale and non-file refs", () => {
   assert.equal(fileInput.files.length, 0);
 });
 
-test("file upload staging expires content-world chunks at the supplied TTL", () => {
+test("file upload staging proactively expires content-world chunks without another upload action", async () => {
   const fileInput = createElement("input", { attributes: { type: "file" } });
   const harness = createA11yHarness([fileInput]);
   harness.generate();
   harness.upload("begin", {
-    expiresAt: Date.now() - 1,
+    expiresAt: Date.now() + 20,
     transferId: "expired-transfer",
     files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }]
   });
 
-  assert.throws(
-    () => harness.upload("chunk", {
-      transferId: "expired-transfer", fileIndex: 0, chunkIndex: 0, data: "aGVsbG8="
-    }),
-    /unknown|expired/iu
-  );
+  assert.equal(harness.hasUpload("expired-transfer"), true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(harness.hasUpload("expired-transfer"), false);
   assert.equal(fileInput.files.length, 0);
+});
+
+test("file upload commit verifies before events and succeeds when page listeners clear files", () => {
+  const fileInput = createElement("input", {
+    attributes: { type: "file" },
+    onDispatch(element) { element.files = []; }
+  });
+  const harness = createA11yHarness([fileInput]);
+  harness.generate();
+  harness.upload("begin", {
+    expiresAt: Date.now() + 60_000,
+    transferId: "listener-transfer",
+    files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }]
+  });
+  harness.upload("chunk", {
+    transferId: "listener-transfer", fileIndex: 0, chunkIndex: 0, data: "aGVsbG8="
+  });
+
+  const result = harness.upload("commit", { transferId: "listener-transfer", ref: "e1" });
+
+  assert.equal(result.committed, true);
+  assert.deepEqual(fileInput.dispatchedEvents, ["input", "change"]);
+  assert.equal(fileInput.files.length, 0, "page listeners may consume or clear the committed selection");
 });
 
 test("tab context returns bounded page metadata and selected element references", () => {
@@ -666,6 +686,13 @@ function createA11yHarness(elements, {
   viewportHeight = 768,
   viewportWidth = 1024
 } = {}) {
+  const trackedMaps = [];
+  class TrackingMap extends Map {
+    constructor(...args) {
+      super(...args);
+      trackedMaps.push(this);
+    }
+  }
   const allElements = [];
   const collectStack = [...elements].reverse();
   while (collectStack.length > 0) {
@@ -751,6 +778,13 @@ function createA11yHarness(elements, {
       }
     },
     Uint8Array,
+    Map: TrackingMap,
+    clearTimeout,
+    setTimeout(callback, delay) {
+      const timer = setTimeout(callback, delay);
+      timer.unref();
+      return timer;
+    },
     URL,
     WeakRef,
     window
@@ -769,6 +803,9 @@ function createA11yHarness(elements, {
     },
     generate() {
       return window.__opencodeA11yGenerate({ maxChars: 50_000, maxNodes: 800 });
+    },
+    hasUpload(transferId) {
+      return trackedMaps.some((map) => map.has(transferId));
     },
     tabContext(options) {
       return window.__opencodeTabContext(options);
@@ -790,6 +827,7 @@ function createElement(tagName, {
   readOnly = false,
   selectionEnd = 0,
   selectionStart = 0,
+  onDispatch = null,
   text = "",
   value = "",
   visible = true
@@ -816,6 +854,7 @@ function createElement(tagName, {
     dispatchedEvents: [],
     dispatchEvent(event) {
       this.dispatchedEvents.push(event.type);
+      onDispatch?.(this, event);
       return true;
     },
     focus() {

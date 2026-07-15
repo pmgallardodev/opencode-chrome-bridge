@@ -2400,13 +2400,22 @@ async function commitFileUpload(params, signal) {
     }
   }
   try {
+    const expectedNames = transfer.files.map((file) => file.name);
+    const prepared = await runInA11yWorld(
+      tabId,
+      (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+      ["prepare", { transferId: params.transferId, ref }]
+    );
+    throwIfAborted(signal);
+    if (prepared.prepared !== true || prepared.count !== expectedNames.length
+      || !Array.isArray(prepared.names) || prepared.names.some((name, index) => name !== expectedNames[index])) {
+      throw new Error("isolated upload preparation did not verify the exact files");
+    }
     const result = await runInA11yWorld(
       tabId,
       (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
       ["commit", { transferId: params.transferId, ref }]
     );
-    throwIfAborted(signal);
-    const expectedNames = transfer.files.map((file) => file.name);
     if (result.committed !== true || result.count !== expectedNames.length
       || !Array.isArray(result.names) || result.names.some((name, index) => name !== expectedNames[index])) {
       throw new Error("isolated upload commit did not verify the exact files");

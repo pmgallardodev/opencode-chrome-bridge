@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { open, writeFile } from "node:fs/promises";
 import { decodeSupportedImageDataUrl } from "./workspace-artifacts.js";
 
@@ -214,6 +215,14 @@ async function request(method, pathname, body, extraHeaders = {}, externalSignal
   const state = await readBridgeState();
   const url = `http://${state.host}:${state.port}${pathname}`;
   const timeoutMs = requestTimeoutMs(body);
+  const headers = {
+    Authorization: `Bearer ${state.token}`,
+    ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    ...extraHeaders
+  };
+  if (externalSignal) {
+    return abortableHttpRequest({ body, headers, method, signal: externalSignal, timeoutMs, url });
+  }
   const controller = new AbortController();
   const onExternalAbort = () => controller.abort(externalSignal.reason);
   externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
@@ -223,11 +232,7 @@ async function request(method, pathname, body, extraHeaders = {}, externalSignal
     response = await fetch(url, {
       method,
       signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${state.token}`,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-        ...extraHeaders
-      },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body)
     });
   } catch (error) {
@@ -244,6 +249,47 @@ async function request(method, pathname, body, extraHeaders = {}, externalSignal
     throw new Error(payload?.error ?? `Bridge request failed with HTTP ${response.status}`);
   }
   return payload;
+}
+
+function abortableHttpRequest({ body, headers, method, signal, timeoutMs, url }) {
+  const serialized = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Bridge request was cancelled"));
+      return;
+    }
+    const req = http.request(url, {
+      headers: {
+        ...headers,
+        ...(serialized === undefined ? {} : { "Content-Length": Buffer.byteLength(serialized) })
+      },
+      method,
+      signal
+    }, (res) => {
+      const chunks = [];
+      let bytes = 0;
+      res.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024 * 1024) req.destroy(new Error("Bridge response is too large"));
+        else chunks.push(chunk);
+      });
+      res.on("end", () => {
+        let payload;
+        try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { payload = null; }
+        if ((res.statusCode ?? 500) >= 400 || payload?.ok === false) {
+          reject(new Error(payload?.error ?? `Bridge request failed with HTTP ${res.statusCode}`));
+          return;
+        }
+        resolve(payload);
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Bridge request timed out after ${timeoutMs}ms`)));
+    req.on("error", (error) => {
+      reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    });
+    if (serialized !== undefined) req.end(serialized);
+    else req.end();
+  });
 }
 
 function validatePeer(value, label) {
