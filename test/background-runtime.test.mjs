@@ -340,6 +340,7 @@ test("readPage returns one combined context and accessibility result with an opt
   const injections = [];
   const captures = [];
   const order = [];
+  let tabReads = 0;
   const combined = {
     accessibility: {
       nodeCount: 1,
@@ -374,8 +375,9 @@ test("readPage returns one combined context and accessibility result with an opt
       return "data:image/jpeg;base64,/9j/2Q==";
     },
     tabsGet: async (tabId) => {
+      tabReads += 1;
       order.push("get");
-      return { active: false, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+      return { active: tabReads > 1, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
     },
     tabsUpdate: async (tabId) => {
       order.push("activate");
@@ -408,7 +410,7 @@ test("readPage returns one combined context and accessibility result with an opt
   );
   assert.equal(injections.filter((injection) => injection.files).length, 1);
   assert.equal(injections.filter((injection) => typeof injection.func === "function").length, 1);
-  assert.deepEqual(order.slice(0, 5), ["get", "focus", "activate", "inject", "read"]);
+  assert.deepEqual(order, ["get", "focus", "activate", "inject", "read", "get", "capture"]);
   const funcCall = injections.find((injection) => typeof injection.func === "function");
   assert.deepEqual({ ...funcCall.args[0] }, {
     interactiveOnly: false,
@@ -416,6 +418,41 @@ test("readPage returns one combined context and accessibility result with an opt
     maxNodes: 200,
     maxSelectionChars: 300
   });
+});
+
+test("readPage fails before capture when the activated tab changes", async () => {
+  let captures = 0;
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    },
+    tabsGet: async (tabId) => {
+      tabReads += 1;
+      return {
+        active: false,
+        id: tabId,
+        index: 0,
+        title: "Example",
+        url: "https://example.com",
+        windowId: 1
+      };
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("readPage", { includeScreenshot: true, tabId: 7 }),
+    /target tab changed before screenshot capture/u
+  );
+  assert.equal(tabReads, 2);
+  assert.equal(captures, 0);
 });
 
 test("readPage omits screenshot capture unless explicitly requested", async () => {

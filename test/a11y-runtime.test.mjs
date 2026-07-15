@@ -312,7 +312,7 @@ test("tab context preserves fractional DPR and negative scroll offsets", () => {
 
 test("tab context redacts credential query variants and URL credentials", () => {
   const harness = createA11yHarness([createElement("main", { text: "Page" })], {
-    url: "https://user:pass@example.test/?client_secret=a&refresh-token=b&id_token=c&password_reset_token=d&X-Amz-Credential=e&X-Amz-Signature=f&X-Amz-Security-Token=g&GoogleAccessId=h&Signature=i&sig=j&safe=value#private"
+    url: "https://user:pass@example.test/?client_secret=a&refresh-token=b&id_token=c&password_reset_token=d&X-Amz-Credential=e&X-Amz-Signature=f&X-Amz-Security-Token=g&GoogleAccessId=h&Signature=i&sig=j&X-Goog-Credential=k&X-Goog-Signature=l&AWSAccessKeyId=m&safe=value#private"
   });
 
   const context = harness.tabContext({ maxChars: 500 });
@@ -331,7 +331,10 @@ test("tab context redacts credential query variants and URL credentials", () => 
     "X-Amz-Security-Token",
     "GoogleAccessId",
     "Signature",
-    "sig"
+    "sig",
+    "X-Goog-Credential",
+    "X-Goog-Signature",
+    "AWSAccessKeyId"
   ]) {
     assert.equal(sanitized.searchParams.get(key), "[redacted]");
   }

@@ -195,10 +195,13 @@ if (!window.__opencodeA11yInstalled) {
       for (const key of [...url.searchParams.keys()]) {
         const normalizedKey = key.toLowerCase().replace(/[_-]/gu, "");
         if ([
-          "apikey", "auth", "authorization", "code", "credential", "googleaccessid",
-          "key", "pass", "password", "session", "sig", "signature",
-          "xamzcredential", "xamzsecuritytoken", "xamzsignature"
+          "apikey", "auth", "authorization", "code", "key", "pass",
+          "password", "session", "sig"
         ].includes(normalizedKey)
+          || normalizedKey.endsWith("credential")
+          || normalizedKey.endsWith("signature")
+          || normalizedKey.endsWith("accesskeyid")
+          || normalizedKey.endsWith("accessid")
           || normalizedKey.endsWith("token")
           || normalizedKey.endsWith("secret")
           || normalizedKey.includes("password")) {

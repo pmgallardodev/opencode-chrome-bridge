@@ -1707,13 +1707,14 @@ async function tabContext(params) {
 
 async function readPage(params) {
   const tabId = requireTabId(params);
+  const includeScreenshot = params.includeScreenshot === true;
   const options = {
     interactiveOnly: params.interactiveOnly === true,
     maxChars: clampInteger(params.maxChars, 100, 200000, 50000, "maxChars"),
     maxNodes: clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes"),
     maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
   };
-  if (params.includeScreenshot === true) await activateTab(tabId);
+  const activatedTab = includeScreenshot ? await activateTab(tabId) : null;
   await injectA11yScript(tabId);
   const combined = await runInA11yWorld(
     tabId,
@@ -1727,13 +1728,20 @@ async function readPage(params) {
     [options]
   );
   validateReadPageResult(combined);
-  const screenshot = params.includeScreenshot === true
-    ? await captureScreenshot({
-        format: params.screenshotFormat,
-        quality: params.screenshotQuality,
-        tabId
-      })
-    : null;
+  let screenshot = null;
+  if (includeScreenshot) {
+    const currentTab = await chrome.tabs.get(tabId);
+    if (!Number.isInteger(activatedTab.windowId)
+      || currentTab.active !== true
+      || currentTab.windowId !== activatedTab.windowId) {
+      throw new Error("read page target tab changed before screenshot capture");
+    }
+    screenshot = await captureScreenshot({
+      format: params.screenshotFormat,
+      quality: params.screenshotQuality,
+      windowId: activatedTab.windowId
+    });
+  }
   return {
     tabId,
     context: combined.context,
