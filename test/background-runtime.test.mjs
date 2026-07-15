@@ -9,6 +9,34 @@ import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/opencode-plugin.js";
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const backgroundSource = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
 
+test("scoped page commands fail before a read when the tab navigated after approval", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async () => ({ active: true, id: 7, url: "https://other.example/private", windowId: 1 }),
+    scriptingExecuteScript: async () => { throw new Error("page read must not start"); }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedScopes: ["https://example.com:443/app"],
+    method: "tabContext",
+    params: { tabId: 7, maxChars: 100, maxSelectionChars: 10 }
+  }), /scope.*changed|origin.*changed|not authorized/iu);
+  assert.equal(harness.calls.executeScript, 0);
+});
+
+test("scoped CDP blocks cross-target Target methods and unauthorized Page.navigate", async () => {
+  const harness = createBackgroundHarness();
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedScopes: ["https://example.com:443/"],
+    method: "cdpCommand",
+    params: { tabId: 7, method: "Target.getTargets" }
+  }), /Target.*not allowed|browser-wide/iu);
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedScopes: ["https://example.com:443/"],
+    method: "cdpCommand",
+    params: { tabId: 7, method: "Page.navigate", commandParams: { url: "https://evil.example/" } }
+  }), /destination.*not authorized|scope/iu);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+});
+
 test("tab claims fail closed when session storage cannot be read", async () => {
   const harness = createBackgroundHarness({
     storageGet: async () => {

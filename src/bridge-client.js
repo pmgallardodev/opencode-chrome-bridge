@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { open, writeFile } from "node:fs/promises";
 import { decodeSupportedImageDataUrl } from "./workspace-artifacts.js";
 
@@ -17,6 +18,15 @@ export const BRIDGE_PROTOCOL_MAX = "1.0.0";
 const DEFAULT_REQUIRED_CAPABILITIES = Object.freeze(["bridge.handshake"]);
 const VERSION_RE = /^\d+\.\d+\.\d+$/u;
 const CAPABILITY_RE = /^[a-z][a-z0-9.-]{0,99}$/u;
+const pageScopeContext = new AsyncLocalStorage();
+const ORIGIN_SCOPED_BRIDGE_METHODS = new Set([
+  "accessibilityTree", "activateTab", "back", "browserBatch", "cdpCommand", "click", "clickElement",
+  "closeTab", "domContent", "doubleClick", "evaluate", "fileUploadCommit", "fillElement",
+  "findElements", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
+  "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
+  "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
+  "setViewport", "subscribeCdpEvents", "tabContext", "type", "unsubscribeCdpEvents", "waitFor"
+]);
 
 export async function readBridgeState() {
   const stateFile = await open(STATE_PATH, "r");
@@ -190,12 +200,24 @@ function isLegacyBridgeStatus(payload) {
 }
 
 export async function bridgeCommand(method, params = {}, options = {}) {
+  const scope = pageScopeContext.getStore();
+  if (scope && ORIGIN_SCOPED_BRIDGE_METHODS.has(method)) {
+    params = { expectedScopes: scope.expectedScopes, method, params };
+    method = "scopedCommand";
+  }
   const response = await request("POST", "/command", {
     method,
     params,
     timeoutMs: options.timeoutMs
   }, {}, options.signal);
   return response.result;
+}
+
+export function withBridgePageScopes(expectedScopes, operation) {
+  if (!Array.isArray(expectedScopes) || expectedScopes.length === 0) {
+    throw new Error("withBridgePageScopes requires at least one expected page scope");
+  }
+  return pageScopeContext.run({ expectedScopes: [...expectedScopes] }, operation);
 }
 
 export async function pollEvents(since = 0) {

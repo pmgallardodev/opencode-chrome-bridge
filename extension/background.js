@@ -104,6 +104,15 @@ const BATCH_ACTION_METHODS = Object.freeze({
   tabContext: "tabContext",
   waitFor: "waitFor"
 });
+const ORIGIN_SCOPED_COMMANDS = new Set([
+  "accessibilityTree", "activateTab", "back", "browserBatch", "cdpCommand", "click", "clickElement",
+  "closeTab", "domContent", "doubleClick", "evaluate", "fillElement", "findElements",
+  "fileUploadCommit", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
+  "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
+  "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
+  "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
+  "waitFor", "type"
+]);
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -362,12 +371,19 @@ function postNativeResponse(message) {
 
 async function executeCommand(method, params, options = {}) {
   switch (method) {
+    case "scopedCommand":
+      return executeScopedPageCommand(params, options);
     case "handshake":
       return createExtensionHandshake();
     case "status":
       return { connected: true, extensionId: chrome.runtime.id, hostName: HOST_NAME };
     case "listTabs":
       return (await chrome.tabs.query({})).map(tabInfo);
+    case "getActiveTab": {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (tabs.length !== 1 || !Number.isInteger(tabs[0]?.id)) throw new Error("Active Chrome tab cannot be resolved deterministically");
+      return tabInfo(tabs[0]);
+    }
     case "getTab": {
       throwIfAborted(options.signal);
       const tab = await chrome.tabs.get(requireTabId(params));
@@ -517,6 +533,105 @@ async function executeCommand(method, params, options = {}) {
     default:
       throw new Error(`Unsupported command: ${method}`);
   }
+}
+
+async function executeScopedPageCommand(envelope, options) {
+  if (!isRecord(envelope) || !ORIGIN_SCOPED_COMMANDS.has(envelope.method) || !isRecord(envelope.params)) {
+    throw new Error("scoped page command is invalid or not allowed");
+  }
+  const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes);
+  const method = envelope.method;
+  const params = envelope.params;
+  if (method === "browserBatch") {
+    if (!Array.isArray(params.actions) || params.actions.length !== 1) {
+      throw new Error("origin-scoped browser batches must contain exactly one action");
+    }
+    const action = params.actions[0];
+    if (action?.type === "navigate") {
+      assertAuthorizedDestination(action.params?.url, expectedScopes);
+      return executeCommand(method, params, options);
+    }
+    const tabId = action?.params?.tabId;
+    if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
+    assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
+    const batchResult = await executeCommand(method, params, options);
+    assertExpectedScopeAuthorized(canonicalPermissionScope((await chrome.tabs.get(tabId)).url), expectedScopes);
+    return batchResult;
+  }
+  if (method === "cdpCommand" && typeof params.method === "string" && params.method.startsWith("Target.")) {
+    throw new Error("Browser-wide Target CDP methods are not allowed; use the dedicated authorized target tools");
+  }
+  if (method === "cdpCommand" && params.method === "Page.navigate") {
+    assertAuthorizedDestination(params.commandParams?.url, expectedScopes);
+  } else if (method === "navigate") {
+    assertAuthorizedDestination(params.url, expectedScopes);
+  } else {
+    const beforeScope = await currentCommandPageScope(method, params);
+    assertExpectedScopeAuthorized(beforeScope, expectedScopes);
+  }
+  const result = await executeCommand(method, params, options);
+  if (method !== "closeTab") {
+    const afterScope = await currentCommandPageScope(method, params, result);
+    assertExpectedScopeAuthorized(afterScope, expectedScopes);
+  }
+  return result;
+}
+
+function validateExpectedPageScopes(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 25) {
+    throw new Error("scoped page command expectedScopes must be a bounded non-empty array");
+  }
+  return [...new Set(value.map(canonicalPermissionScope))].sort();
+}
+
+async function currentCommandPageScope(method, params, result) {
+  if (Number.isInteger(params.tabId)) {
+    const tab = await chrome.tabs.get(params.tabId);
+    return canonicalPermissionScope(tab.url);
+  }
+  if (method === "cdpCommand" && typeof params.targetId === "string") {
+    const target = (await chrome.debugger.getTargets()).find((entry) => entry.id === params.targetId);
+    if (!target || typeof target.url !== "string") throw new Error("CDP target page scope cannot be resolved");
+    return canonicalPermissionScope(target.url);
+  }
+  if (Number.isInteger(result?.tabId)) {
+    const tab = await chrome.tabs.get(result.tabId);
+    return canonicalPermissionScope(tab.url);
+  }
+  throw new Error(`${method} requires a deterministic tab for origin-scoped execution`);
+}
+
+function assertAuthorizedDestination(value, expectedScopes) {
+  const destination = canonicalPermissionScope(value);
+  assertExpectedScopeAuthorized(destination, expectedScopes);
+}
+
+function assertExpectedScopeAuthorized(actualScope, expectedScopes) {
+  if (!expectedScopes.includes(actualScope)) {
+    throw new Error(`Page scope changed or is not authorized: ${actualScope}`);
+  }
+}
+
+function canonicalPermissionScope(value) {
+  if (typeof value !== "string" || hasAmbiguousPermissionEncoding(value)) {
+    throw new Error("Page scope contains an ambiguous encoded separator or traversal");
+  }
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("Page scope must be an absolute http or https URL"); }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Page scope supports only http and https URLs");
+  }
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  const pathname = (parsed.pathname || "/").replace(/%([0-9a-fA-F]{2})/gu, (encoded, hex) => {
+    const character = String.fromCharCode(Number.parseInt(hex, 16));
+    return /[A-Za-z0-9._~-]/u.test(character) ? character : `%${hex.toUpperCase()}`;
+  });
+  return `${parsed.protocol}//${parsed.hostname}:${port}${pathname}`;
+}
+
+function hasAmbiguousPermissionEncoding(value) {
+  const pathPart = value.split(/[?#]/u, 1)[0];
+  return /\\|%(?:2f|5c|2e|25)/iu.test(pathPart);
 }
 
 function tabInfo(tab) {

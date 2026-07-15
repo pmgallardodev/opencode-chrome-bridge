@@ -6,6 +6,7 @@ import {
   bridgeStatus,
   pollEvents,
   requireBridgeCapabilities,
+  withBridgePageScopes,
   writeDataUrlToFile
 } from "./bridge-client.js";
 import {
@@ -32,13 +33,15 @@ const TAB_SCOPED_TOOLS = new Set([
   "chrome_page_text", "chrome_read_page", "chrome_reload", "chrome_reset_viewport",
   "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
   "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
-  "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step"
+  "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step", "chrome_cursor_state",
+  "chrome_favicon_badge"
 ]);
 const PAGE_SCOPED_TOOLS = new Set([
   ...DESTINATION_SCOPED_TOOLS,
   ...TAB_SCOPED_TOOLS,
   "chrome_batch",
   "chrome_cdp_targets",
+  "chrome_events",
   "chrome_tabs"
 ]);
 const RETURNED_URL_TOOLS = new Set([
@@ -132,6 +135,9 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
 export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
   [...new Set(Object.values(TOOL_CAPABILITY_REQUIREMENTS).flat())].sort()
 );
+export const TOOL_ORIGIN_SCOPE_CLASSIFICATION = Object.freeze(Object.fromEntries(
+  Object.keys(TOOL_CAPABILITY_REQUIREMENTS).map((name) => [name, PAGE_SCOPED_TOOLS.has(name) ? "page" : "browser"])
+));
 
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
@@ -246,7 +252,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "List open Chrome tabs visible to the OpenCode Chrome Bridge extension.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeCommand("listTabs"), null, 2);
+          return JSON.stringify(filterPublicPageMetadata(await bridgeCommand("listTabs")), null, 2);
         }
       }),
       chrome_open: tool({
@@ -669,35 +675,50 @@ export default async function OpenCodeChromeBridgePlugin() {
         async execute(args, context) {
           const timeoutMs = args.timeoutMs;
 
-          const clickResult = await bridgeCommand("click", {
-            tabId: args.tabId,
-            x: args.x,
-            y: args.y,
-            button: args.button,
-            modifiers: args.modifiers
-          }, { timeoutMs });
+          let clickResult;
+          let transitionScope;
+          try {
+            clickResult = await bridgeCommand("click", {
+              tabId: args.tabId,
+              x: args.x,
+              y: args.y,
+              button: args.button,
+              modifiers: args.modifiers
+            }, { timeoutMs });
+          } catch (error) {
+            transitionScope = pageScopeFromMismatchError(error);
+            if (!transitionScope || typeof context.authorizePageTransition !== "function") throw error;
+            await context.authorizePageTransition(transitionScope);
+            clickResult = { navigated: true, scope: transitionScope };
+          }
 
           const waitMs = args.waitMs ?? 400;
           if (waitMs > 0) await sleep(waitMs);
 
-          let evaluation;
-          if (typeof args.expression === "string" && args.expression.length > 0) {
-            evaluation = await bridgeCommand("evaluate", {
-              tabId: args.tabId,
-              expression: args.expression
-            }, { timeoutMs });
-          }
+          const finishStep = async () => {
+            let evaluation;
+            if (typeof args.expression === "string" && args.expression.length > 0) {
+              evaluation = await bridgeCommand("evaluate", {
+                tabId: args.tabId,
+                expression: args.expression
+              }, { timeoutMs });
+            }
 
-          let screenshot;
-          if (typeof args.screenshotPath === "string" && args.screenshotPath.length > 0) {
-            const outputPath = await resolveProjectOutputPath(context.directory, args.screenshotPath, "screenshotPath");
-            const result = await bridgeCommand(
-              "screenshot",
-              { tabId: args.tabId, format: args.screenshotFormat, quality: args.screenshotQuality },
-              { timeoutMs: Math.max(timeoutMs ?? 15000, 30000) }
-            );
-            screenshot = await writeDataUrlToFile(result.dataUrl, outputPath);
-          }
+            let screenshot;
+            if (typeof args.screenshotPath === "string" && args.screenshotPath.length > 0) {
+              const outputPath = await resolveProjectOutputPath(context.directory, args.screenshotPath, "screenshotPath");
+              const result = await bridgeCommand(
+                "screenshot",
+                { tabId: args.tabId, format: args.screenshotFormat, quality: args.screenshotQuality },
+                { timeoutMs: Math.max(timeoutMs ?? 15000, 30000) }
+              );
+              screenshot = await writeDataUrlToFile(result.dataUrl, outputPath);
+            }
+            return { evaluation, screenshot };
+          };
+          const { evaluation, screenshot } = transitionScope
+            ? await withBridgePageScopes([transitionScope], finishStep)
+            : await finishStep();
 
           return JSON.stringify({
             clicked: true,
@@ -712,7 +733,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "List Chrome DevTools Protocol targets visible to the OpenCode Chrome Bridge extension.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeCommand("cdpTargets"), null, 2);
+          return JSON.stringify(filterPublicPageMetadata(await bridgeCommand("cdpTargets")), null, 2);
         }
       }),
       chrome_cdp: tool({
@@ -919,7 +940,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           since: schema.number().int().min(0).default(0).describe("Return events with seq greater than this value. Use 0 for the current buffer, or the nextSeq from the previous call.")
         },
         async execute(args) {
-          return JSON.stringify(await pollEvents(args.since ?? 0), null, 2);
+          return JSON.stringify(filterOriginBearingEvents(await pollEvents(args.since ?? 0)), null, 2);
         }
       }),
       chrome_get_console_logs: tool({
@@ -1153,9 +1174,24 @@ function requireApprovals(tools, schema) {
           return run(executionArgs, context);
         }
         const callGrants = new Set();
+        validateRawCdpAccess(name, executionArgs);
+        await resolveImplicitPageTarget(name, executionArgs);
         const beforeScopes = await resolvePageScopes(name, executionArgs);
         await authorizePageScopes(beforeScopes, args?.originGrant, context, describe(args), callGrants);
-        const result = await run(executionArgs, context);
+        const executionContext = {
+          ...context,
+          authorizePageTransition: async (scope) => authorizePageScopes(
+            [scope], args?.originGrant, context, {
+              ...describe(args),
+              action: `Authorize page transition during ${name}`
+            }, callGrants
+          )
+        };
+        const result = name === "chrome_batch"
+          ? await runPermissionAwareBatch(executionArgs, args?.originGrant, context, describe(args), callGrants)
+          : beforeScopes.length === 0
+            ? await run(executionArgs, executionContext)
+            : await withBridgePageScopes(beforeScopes, () => run(executionArgs, executionContext));
         const afterScopes = [
           ...pageScopesFromReturnedResult(name, executionArgs, result),
           ...await resolvePostExecutionPageScopes(name, executionArgs, result)
@@ -1171,7 +1207,62 @@ function requireApprovals(tools, schema) {
   return guarded;
 }
 
+async function runPermissionAwareBatch(args, originGrant, context, metadata, callGrants) {
+  const startedAt = Date.now();
+  const totalTimeoutMs = args.totalTimeoutMs ?? 60_000;
+  const deadline = startedAt + totalTimeoutMs;
+  const results = [];
+  let stoppedAt = null;
+  for (let index = 0; index < args.actions.length; index += 1) {
+    const action = args.actions[index];
+    const remaining = deadline - Date.now();
+    let scopes;
+    try {
+      if (remaining < 50) throw new Error(`browser batch total timeout after ${totalTimeoutMs}ms`);
+      scopes = await resolveBatchPageScopes([action]);
+      await authorizePageScopes(scopes, originGrant, context, {
+        ...metadata,
+        action: `Authorize browser batch action ${index}`,
+        actionIndex: index,
+        actionType: action.type
+      }, callGrants);
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, ok: false, type: action?.type });
+      stoppedAt = index;
+      break;
+    }
+    try {
+      const executeOne = () => bridgeCommand("browserBatch", {
+        actions: [action],
+        stopOnError: true,
+        totalTimeoutMs: Math.min(remaining, totalTimeoutMs)
+      }, { timeoutMs: Math.min(125_000, remaining + 5_000) });
+      const one = scopes.length === 0 ? await executeOne() : await withBridgePageScopes(scopes, executeOne);
+      const entry = one?.results?.[0];
+      if (!entry?.ok) throw new Error(entry?.error ?? `browser batch action ${index} failed`);
+      results.push({ ...entry, index });
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, ok: false, type: action?.type });
+      if (args.stopOnError !== false) {
+        stoppedAt = index;
+        break;
+      }
+    }
+  }
+  return JSON.stringify({
+    completed: results.length,
+    elapsedMs: Date.now() - startedAt,
+    ok: results.length === args.actions.length && results.every((entry) => entry.ok),
+    results,
+    stoppedAt,
+    totalActions: args.actions.length
+  }, null, 2);
+}
+
 export function canonicalPageScope(value) {
+  if (typeof value !== "string" || hasAmbiguousPageScopeEncoding(value)) {
+    throw new Error("Page scope contains an ambiguous encoded separator or traversal");
+  }
   let parsed;
   try {
     parsed = new URL(value);
@@ -1183,6 +1274,11 @@ export function canonicalPageScope(value) {
   }
   const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
   return `${parsed.protocol}//${parsed.hostname}:${port}${normalizePermissionPath(parsed.pathname)}`;
+}
+
+function hasAmbiguousPageScopeEncoding(value) {
+  const pathPart = value.split(/[?#]/u, 1)[0];
+  return /\\|%(?:2f|5c|2e|25)/iu.test(pathPart);
 }
 
 export function pageScopeCovers(grant, requested) {
@@ -1226,10 +1322,13 @@ async function resolvePageScopes(name, args) {
   if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
   if (name === "chrome_batch") return resolveBatchPageScopes(args.actions);
   if (name === "chrome_tabs") {
-    return scopesFromTabs(await bridgeCommand("listTabs"));
+    return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
   }
   if (name === "chrome_cdp_targets") {
-    return scopesFromTabs(await bridgeCommand("cdpTargets"));
+    return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("cdpTargets")));
+  }
+  if (name === "chrome_events") {
+    return pageScopesFromObject(filterOriginBearingEvents(await pollEvents(args.since ?? 0)));
   }
   if (name === "chrome_cdp" && !Number.isInteger(args.tabId)) {
     if (typeof args.targetId !== "string" || args.targetId.length === 0) {
@@ -1241,7 +1340,13 @@ async function resolvePageScopes(name, args) {
     return [canonicalPageScope(target.url)];
   }
   if (TAB_SCOPED_TOOLS.has(name)) {
-    if (Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+    if (Number.isInteger(args.tabId)) {
+      const scopes = [await scopeForTab(args.tabId)];
+      if (name === "chrome_cdp" && args.method === "Page.navigate") {
+        scopes.push(canonicalPageScope(args.commandParams?.url));
+      }
+      return scopes;
+    }
     if (name === "chrome_screenshot" || name === "chrome_screenshot_region") {
       const activeTabs = (await bridgeCommand("listTabs")).filter((tab) => tab?.active === true);
       if (activeTabs.length === 0) throw new Error("Unable to resolve an active page origin for the screenshot");
@@ -1252,11 +1357,19 @@ async function resolvePageScopes(name, args) {
   return [];
 }
 
+function validateRawCdpAccess(name, args) {
+  if (name !== "chrome_cdp") return;
+  if (typeof args.method === "string" && args.method.startsWith("Target.")) {
+    throw new Error("Browser-wide Target CDP methods are not allowed; use chrome_cdp_targets");
+  }
+}
+
 async function resolvePostExecutionPageScopes(name, args, result) {
   if (name === "chrome_close_tab") return [];
   if (name === "chrome_batch") return scopesForTabIds(batchTabIds(args.actions));
-  if (name === "chrome_tabs") return scopesFromTabs(await bridgeCommand("listTabs"));
-  if (name === "chrome_cdp_targets") return scopesFromTabs(await bridgeCommand("cdpTargets"));
+  if (name === "chrome_tabs") return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
+  if (name === "chrome_cdp_targets") return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("cdpTargets")));
+  if (name === "chrome_events") return [];
   if (DESTINATION_SCOPED_TOOLS.has(name)) {
     if (Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
     const output = parseToolOutput(result);
@@ -1281,6 +1394,15 @@ async function resolvePostExecutionPageScopes(name, args, result) {
     return resolvePageScopes(name, args);
   }
   return [];
+}
+
+async function resolveImplicitPageTarget(name, args) {
+  if ((name !== "chrome_screenshot" && name !== "chrome_screenshot_region") || Number.isInteger(args.tabId)) return;
+  const tab = await bridgeCommand("getActiveTab");
+  if (!Number.isInteger(tab?.id) || !isPagePermissionUrl(tab.url)) {
+    throw new Error("The actual active screenshot tab is not an authorized web page");
+  }
+  args.tabId = tab.id;
 }
 
 async function resolveBatchPageScopes(actions) {
@@ -1322,6 +1444,42 @@ function scopesFromTabs(tabs) {
   }))].sort();
 }
 
+function filterPublicPageMetadata(entries) {
+  if (!Array.isArray(entries)) throw new Error("Chrome page metadata must be an array");
+  return entries.filter((entry) => isPagePermissionUrl(entry?.url));
+}
+
+function filterOriginBearingEvents(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.events)) return payload;
+  return {
+    ...payload,
+    events: payload.events.filter((event) => !containsUnsupportedPageUrl(event))
+  };
+}
+
+export function sanitizeOriginBearingEvents(payload) {
+  return filterOriginBearingEvents(payload);
+}
+
+function containsUnsupportedPageUrl(value) {
+  if (!value || typeof value !== "object") return false;
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === "url" || key === "pendingUrl") && typeof entry === "string" && !isPagePermissionUrl(entry)) return true;
+    if (entry && typeof entry === "object" && containsUnsupportedPageUrl(entry)) return true;
+  }
+  return false;
+}
+
+function pageScopesFromObject(value) {
+  const scopes = [];
+  if (!value || typeof value !== "object") return scopes;
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === "url" || key === "pendingUrl") && isPagePermissionUrl(entry)) scopes.push(canonicalPageScope(entry));
+    else if (entry && typeof entry === "object") scopes.push(...pageScopesFromObject(entry));
+  }
+  return [...new Set(scopes)].sort();
+}
+
 function withoutOriginGrant(args) {
   if (!args || typeof args !== "object") return args;
   const clean = { ...args };
@@ -1357,11 +1515,17 @@ function parseToolOutput(value) {
   }
 }
 
+function pageScopeFromMismatchError(error) {
+  const match = /Page scope changed or is not authorized: (https?:\/\/\S+)/u.exec(error?.message ?? "");
+  return match ? canonicalPageScope(match[1]) : null;
+}
+
 function pageScopesFromReturnedResult(name, args, value) {
   const output = parseToolOutput(value);
   if (name === "chrome_tabs" || name === "chrome_cdp_targets") {
     return Array.isArray(output) ? scopesFromTabs(output) : [];
   }
+  if (name === "chrome_events") return pageScopesFromObject(output);
   if (name === "chrome_read_page") {
     return isPagePermissionUrl(output?.context?.url) ? [canonicalPageScope(output.context.url)] : [];
   }
