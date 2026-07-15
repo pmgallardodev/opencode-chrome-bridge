@@ -229,6 +229,31 @@ test("raw CDP allowlist rejects global storage, cookie, and browser domains", as
   }
 });
 
+test("allowlisted targetId CDP resolves a top-level tab binding for evaluate and navigate", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const bridge = installBridge(({ method, params }) => {
+    if (method === "cdpTargets") return [{ id: "target-7", tabId: 7, type: "page", url: "https://example.com/app" }];
+    if (method === "getTab") return {
+      documentId: "document-7", id: 7, navigationGeneration: 4, url: "https://example.com/app"
+    };
+    if (method === "cdpCommand") return params.method === "Runtime.evaluate" ? { result: { value: 2 } } : { frameId: "frame-7" };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_cdp.execute({
+      commandParams: { expression: "1 + 1", returnByValue: true }, method: "Runtime.evaluate", targetId: "target-7"
+    }, context([]));
+    await plugin.tool.chrome_cdp.execute({
+      commandParams: { url: "https://next.example/path" }, method: "Page.navigate", targetId: "target-7"
+    }, context([]));
+  } finally {
+    bridge.restore();
+  }
+  const dispatched = bridge.calls.filter((entry) => entry.method === "cdpCommand");
+  assert.equal(dispatched.length, 2);
+  assert.ok(dispatched.every((entry) => entry.params.tabId === 7 && entry.expectedBindings[0].documentId === "document-7"));
+});
+
 test("batch preflights a deduplicated origin union once before its first side effect", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];
@@ -478,6 +503,38 @@ test("wizard can continue under the newly approved redirect scope without clicki
   }
   assert.equal(bridge.calls.filter((entry) => entry.method === "click").length, 1);
   assert.equal(bridge.calls.find((entry) => entry.method === "evaluate").expectedBindings[0].documentId, "document-next");
+});
+
+test("wizard re-resolves an asynchronous navigation committed during wait without re-clicking", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  let tabReads = 0;
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") {
+      tabReads += 1;
+      const redirected = tabReads > 1;
+      return {
+        documentId: redirected ? "document-b" : "document-a",
+        id: 7,
+        navigationGeneration: redirected ? 2 : 1,
+        url: redirected ? "https://b.example/finish" : "https://a.example/start"
+      };
+    }
+    if (method === "click") return { clicked: true };
+    if (method === "evaluate") return "finished-on-b";
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    const output = JSON.parse(await plugin.tool.chrome_wizard_step.execute({
+      expression: "document.title", tabId: 7, waitMs: 0, x: 1, y: 2
+    }, context(asks)));
+    assert.equal(output.evaluation, "finished-on-b");
+  } finally {
+    bridge.restore();
+  }
+  assert.equal(bridge.calls.filter((entry) => entry.method === "click").length, 1);
+  assert.ok(asks.some((request) => request.permission === "browser.origin" && request.patterns.includes("https://b.example:443/finish")));
+  assert.equal(bridge.calls.find((entry) => entry.method === "evaluate").expectedBindings[0].documentId, "document-b");
 });
 
 test("scope race rejects combined page data before any workspace artifact is written", async () => {

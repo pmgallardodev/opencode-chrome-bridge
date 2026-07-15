@@ -55,7 +55,7 @@ const BATCH_RETURNED_URL_ACTIONS = new Set([
 const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
   "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
   "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
-  "Runtime.getProperties", "Page.navigate"
+  "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
 ]);
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({
@@ -704,6 +704,18 @@ export default async function OpenCodeChromeBridgePlugin() {
 
           const waitMs = args.waitMs ?? 400;
           if (waitMs > 0) await sleep(waitMs);
+
+          // A navigation may commit asynchronously after the native click has
+          // already returned. Always bind the finishing work to the live page
+          // after the wait, without repeating the click.
+          const liveTab = await bridgeCommand("getTab", { tabId: args.tabId });
+          if (typeof liveTab?.url !== "string") throw new Error("Wizard target no longer exposes a page URL");
+          const liveScope = canonicalPageScope(liveTab.url);
+          if (typeof context.authorizePageTransition !== "function") {
+            throw new Error("Wizard finishing work requires live page transition authorization");
+          }
+          transitionScope = liveScope;
+          transitionBinding = await context.authorizePageTransition(liveScope);
 
           const finishStep = async () => {
             let evaluation;
@@ -1366,7 +1378,11 @@ async function resolvePageScopes(name, args, pageMetadata) {
     const targets = await bridgeCommand("cdpTargets");
     const target = Array.isArray(targets) ? targets.find((entry) => entry?.id === args.targetId || entry?.targetId === args.targetId) : null;
     if (typeof target?.url !== "string") throw new Error("Unable to resolve the CDP target page origin");
-    return [canonicalPageScope(target.url)];
+    if (!Number.isInteger(target.tabId)) throw new Error("CDP target is not bound to a top-level Chrome tab");
+    args.tabId = target.tabId;
+    const scopes = [canonicalPageScope(target.url)];
+    if (args.method === "Page.navigate") scopes.push(canonicalPageScope(args.commandParams?.url));
+    return scopes;
   }
   if (TAB_SCOPED_TOOLS.has(name)) {
     if (Number.isInteger(args.tabId)) {

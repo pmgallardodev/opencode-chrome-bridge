@@ -95,7 +95,98 @@ test("every native mutation family emits zero CDP effects after document identit
       expectedBindings: [pageBinding(7, "https://example.com:443/", "approved-document")],
       expectedScopes: ["https://example.com:443/"], method, params: { tabId: 7, ...params }
     }), /document changed|not authorized/iu, method);
-    assert.equal(harness.calls.debuggerCommands.length, 0, `${method} emitted a native effect after document replacement`);
+    assert.equal(
+      harness.calls.debuggerCommands.filter(({ method: cdpMethod }) => /^(?:Input|Runtime|Emulation)\./u.test(cdpMethod)).length,
+      0,
+      `${method} emitted a native effect after document replacement`
+    );
+  }
+});
+
+test("scoped Fetch barrier keeps an IPC-entry navigation from moving native input onto B", async () => {
+  let harness;
+  let documentId = "document-a";
+  const effectDocuments = [];
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent") {
+        effectDocuments.push({ documentId, type: params.type });
+        if (params.type === "mouseMoved") {
+          await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+          await harness.events.debuggerOnEvent.emit(
+            { tabId: 7 }, "Fetch.requestPaused",
+            { requestId: "nav-b", resourceType: "Document", request: { url: "https://b.example/" } }
+          );
+        }
+      }
+      if (method === "Fetch.continueRequest") documentId = "document-b";
+      return {};
+    },
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 })
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/", "document-a")],
+    expectedScopes: ["https://example.com:443/"], method: "click",
+    params: { button: "left", tabId: 7, x: 10, y: 10 }
+  }), /document changed|not authorized/iu);
+  assert.ok(effectDocuments.every((entry) => entry.documentId === "document-a"));
+  assert.equal(effectDocuments.some((entry) => entry.type === "mousePressed"), false);
+  assert.ok(harness.calls.debuggerCommands.some(({ method }) => method === "Fetch.continueRequest"));
+});
+
+test("cleanup never releases mouse input into a changed document", async () => {
+  let harness;
+  let documentId = "document-a";
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 }, "Fetch.requestPaused",
+          { requestId: "nav-after-press", resourceType: "Document", request: { url: "https://b.example/" } }
+        );
+      }
+      if (method === "Fetch.continueRequest") documentId = "document-b";
+      return {};
+    },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: documentId === "document-a" ? "https://example.com/" : "https://b.example/", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 })
+  });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/", "document-a")],
+    expectedScopes: ["https://example.com:443/"], method: "click",
+    params: { button: "left", tabId: 7, x: 10, y: 10 }
+  });
+  assert.equal(result.transition.documentId, "document-b");
+  assert.equal(harness.calls.debuggerCommands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mouseReleased"), false);
+});
+
+test("cleanup never sends keyUp or drag release after navigation invalidation", async () => {
+  for (const [method, params, downType, releaseType] of [
+    ["keypress", { key: "Enter" }, "keyDown", "keyUp"],
+    ["moveSequence", { button: "left", drag: true, points: [{ x: 1, y: 1 }, { x: 2, y: 2 }], stepDelayMs: 0, steps: 1 }, "mousePressed", "mouseReleased"]
+  ]) {
+    let harness;
+    let invalidated = false;
+    harness = createBackgroundHarness({
+      debuggerSendCommand: async (_target, cdpMethod, cdpParams) => {
+        if (!invalidated && ((cdpMethod === "Input.dispatchKeyEvent" && ["keyDown", "rawKeyDown"].includes(cdpParams.type))
+          || (cdpMethod === "Input.dispatchMouseEvent" && cdpParams.type === downType))) {
+          invalidated = true;
+          await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+        }
+        return {};
+      }
+    });
+    await assert.rejects(() => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+      method, params: { tabId: 7, ...params }
+    }), /document changed|not authorized/iu);
+    assert.equal(
+      harness.calls.debuggerCommands.some(({ params: cdpParams }) => cdpParams?.type === releaseType),
+      false,
+      `${method} sent ${releaseType} after invalidation`
+    );
   }
 });
 
@@ -158,6 +249,25 @@ test("scoped readPage discards A to B to A activation races before returning scr
     expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
     method: "readPage", params: { includeScreenshot: true, tabId: 7 }
   }), /discarded.*active tab|changed during capture/iu);
+});
+
+test("scoped screenshotRegion discards A to B to A activation races during CDP capture", async () => {
+  let harness;
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Page.captureScreenshot") {
+        await harness.events.tabsOnActivated.emit({ tabId: 8, windowId: 1 });
+        await harness.events.tabsOnActivated.emit({ tabId: 7, windowId: 1 });
+        return { data: "iVBORw0KGgo=" };
+      }
+      return {};
+    }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "screenshotRegion",
+    params: { height: 20, tabId: 7, width: 20, x: 0, y: 0 }
+  }), /region discarded|active tab or document changed/iu);
 });
 
 test("scoped coordinate click has zero effect when navigation wins the precheck race", async () => {
@@ -3067,6 +3177,7 @@ function createBackgroundHarness({
     tabsOnReplaced: createEvent(),
     tabsOnUpdated: createEvent(),
     webNavigationOnCommitted: createEvent(),
+    webNavigationOnBeforeNavigate: createEvent(),
     webNavigationOnCreatedNavigationTarget: createEvent()
   };
   const nativePort = {
@@ -3162,6 +3273,7 @@ function createBackgroundHarness({
     },
     webNavigation: {
       getFrame: webNavigationGetFrame,
+      onBeforeNavigate: events.webNavigationOnBeforeNavigate,
       onCommitted: events.webNavigationOnCommitted,
       onCreatedNavigationTarget: events.webNavigationOnCreatedNavigationTarget
     }

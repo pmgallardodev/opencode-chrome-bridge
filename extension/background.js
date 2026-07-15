@@ -116,7 +116,11 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
 const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
   "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
   "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
-  "Runtime.getProperties", "Page.navigate"
+  "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
+]);
+const NAVIGATION_BARRIER_COMMANDS = new Set([
+  "cdpCommand", "click", "clickElement", "doubleClick", "evaluate", "fillElement", "hover",
+  "keypress", "moveSequence", "screenshotRegion", "scroll", "setViewport", "resetViewport", "type"
 ]);
 
 let nativePort = null;
@@ -149,6 +153,8 @@ const networkCaptureAttached = new Set();
 const networkWaitConsumers = new Map();
 const navigationSequences = new Map();
 const windowActivationGenerations = new Map();
+const navigationBarriers = new Map();
+const scopedDebuggerTargets = new Map();
 const tabPageProvenance = new Map();
 const executionContextScopes = new Map();
 const activeNativeCommands = new Map();
@@ -431,11 +437,11 @@ async function executeCommand(method, params, options = {}) {
     case "screenshot":
       return captureScreenshot(params, options.pageGuard);
     case "screenshotRegion":
-      return captureScreenshotRegion(params);
+      return captureScreenshotRegion(params, options.pageGuard);
     case "getConsoleLogs":
-      return getConsoleLogs(params);
+      return getConsoleLogs(params, options.pageGuard);
     case "networkRequests":
-      return getNetworkRequests(params, options.signal);
+      return getNetworkRequests(params, options.signal, options.pageGuard);
     case "fileUploadBegin":
       return beginFileUpload(params, options.signal);
     case "fileUploadChunk":
@@ -513,9 +519,9 @@ async function executeCommand(method, params, options = {}) {
     case "ungroupTabs":
       return ungroupTabs(params);
     case "subscribeCdpEvents":
-      return subscribeCdpEvents(params);
+      return subscribeCdpEvents(params, options.pageGuard);
     case "unsubscribeCdpEvents":
-      return unsubscribeCdpEvents(params);
+      return unsubscribeCdpEvents(params, options.pageGuard);
     case "setCursorState":
       return setCursorState(params);
     case "setFaviconBadge":
@@ -589,7 +595,13 @@ async function executeScopedPageCommand(envelope, options) {
   }
   let result;
   try {
-    result = await executeCommand(method, params, { ...options, pageGuard });
+    const run = () => executeCommand(method, params, { ...options, pageGuard });
+    const barrierTabId = Number.isInteger(params.tabId) ? params.tabId : null;
+    result = barrierTabId !== null
+      && NAVIGATION_BARRIER_COMMANDS.has(method)
+      && !(method === "cdpCommand" && params.method === "Page.navigate")
+      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, options.signal)
+      : await run();
   } catch (error) {
     if (method !== "click" || error?.authorizedPageEffect !== true) throw error;
     const transition = await currentPageBindingForCommand(method, params);
@@ -810,7 +822,7 @@ async function captureScreenshot(params, pageGuard) {
   return { dataUrl, format };
 }
 
-async function captureScreenshotRegion(params) {
+async function captureScreenshotRegion(params, pageGuard) {
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const width = requireFiniteNumber(params.width, "width");
@@ -838,6 +850,10 @@ async function captureScreenshotRegion(params) {
     if (tabs.length === 0) throw new Error("screenshotRegion requires an active tab in the target window");
     tabId = tabs[0].id;
   }
+  await pageGuard?.();
+  const beforeTab = await chrome.tabs.get(tabId);
+  const beforeBinding = await currentPageBinding(tabId, beforeTab.url);
+  const activationGeneration = windowActivationGenerations.get(windowId) ?? 0;
 
   const captureParams = {
     format,
@@ -847,9 +863,20 @@ async function captureScreenshotRegion(params) {
   if (quality !== undefined) captureParams.quality = quality;
 
   const data = await withDebugger(tabId, async (target) => {
+    await pageGuard?.();
     const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", captureParams);
     return result.data;
   });
+  const activeAfter = await chrome.tabs.query({ active: true, windowId });
+  const afterBinding = await currentPageBinding(tabId);
+  if (activeAfter.length !== 1
+    || activeAfter[0].id !== tabId
+    || (windowActivationGenerations.get(windowId) ?? 0) !== activationGeneration
+    || afterBinding.documentId !== beforeBinding.documentId
+    || afterBinding.navigationGeneration !== beforeBinding.navigationGeneration) {
+    throw new Error("Screenshot region discarded because the active tab or document changed during capture");
+  }
+  await pageGuard?.();
   assertScreenshotPayloadSize(data);
 
   const dataUrl = `data:image/${format};base64,${data}`;
@@ -878,7 +905,7 @@ async function dispatchClick(params, signal, pageGuard) {
       throwIfAborted(signal);
       await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y }, pageGuard);
     });
-  }, signal);
+  }, signal, pageGuard);
   throwIfAborted(signal);
   return { clicked: true };
 }
@@ -898,7 +925,7 @@ async function dispatchDoubleClick(params, pageGuard) {
         await dispatchMousePressAndRelease(target, { button, clickCount, modifiers, x, y }, pageGuard);
       }
     });
-  });
+  }, undefined, pageGuard);
   return { doubleClicked: true };
 }
 
@@ -974,7 +1001,7 @@ async function dispatchMousePressAndRelease(target, event, pageGuard) {
     if (pressed && error && typeof error === "object") error.authorizedPageEffect = true;
     throw error;
   } finally {
-    if (pressed) {
+    if (pressed && await pageGuardStillAuthorized(pageGuard)) {
       try {
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...event, type: "mouseReleased" });
       } catch (releaseError) {
@@ -1052,9 +1079,10 @@ async function dispatchKeyDownAndUp(target, { key, modifiers }, pageGuard) {
     keyDown = false;
   } catch (error) {
     operationError = error;
+    if (keyDown && error && typeof error === "object") error.authorizedPageEffect = true;
     throw error;
   } finally {
-    if (keyDown) {
+    if (keyDown && await pageGuardStillAuthorized(pageGuard)) {
       try {
         await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { ...event, type: "keyUp" });
       } catch (releaseError) {
@@ -1062,6 +1090,11 @@ async function dispatchKeyDownAndUp(target, { key, modifiers }, pageGuard) {
       }
     }
   }
+}
+
+async function pageGuardStillAuthorized(pageGuard) {
+  if (!pageGuard) return true;
+  try { await pageGuard(); return true; } catch { return false; }
 }
 
 async function evaluateInTab(params, pageGuard) {
@@ -1768,7 +1801,7 @@ async function moveSequence(params, pageGuard) {
       operationError = error;
       throw error;
     } finally {
-      if (mousePressed) {
+      if (mousePressed && await pageGuardStillAuthorized(pageGuard)) {
         try {
           await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
             type: "mouseReleased", button, clickCount: 1, modifiers, x: last.x, y: last.y
@@ -1993,9 +2026,16 @@ async function cdpCommand(params, pageGuard) {
     };
   }
   const target = debuggerTarget(params);
-  const commandParams = params.commandParams ?? {};
+  let commandParams = params.commandParams ?? {};
   if (typeof commandParams !== "object" || commandParams === null || Array.isArray(commandParams)) {
     throw new Error("commandParams must be an object when provided");
+  }
+  if (params.method === "Runtime.evaluate" && Array.isArray(params.__expectedScopes)) {
+    if (typeof commandParams.expression !== "string") throw new Error("Runtime.evaluate requires an expression string");
+    commandParams = {
+      ...commandParams,
+      expression: `(() => { const p = location.port || (location.protocol === "https:" ? "443" : "80"); const s = location.protocol + "//" + location.hostname + ":" + p + (location.pathname || "/"); if (!${JSON.stringify(params.__expectedScopes)}.includes(s)) throw new Error("Page scope changed before evaluation"); return (0, eval)(${JSON.stringify(commandParams.expression)}); })()`
+    };
   }
   return withDebuggerTarget(target, async (attachedTarget, { reused }) => {
     await pageGuard?.();
@@ -2054,7 +2094,39 @@ async function searchBookmarks(params) {
 }
 
 async function withDebugger(tabId, callback) {
+  const scopedTarget = scopedDebuggerTargets.get(tabId);
+  if (scopedTarget) return callback(scopedTarget, { reused: true, scoped: true });
   return withDebuggerTarget({ tabId }, callback);
+}
+
+async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal) {
+  return withDebuggerTarget({ tabId }, async (target) => {
+    throwIfAborted(signal);
+    if (navigationBarriers.has(tabId) || cdpEnabledDomains.get(tabId)?.has("Fetch")) {
+      throw new Error("A scoped navigation barrier cannot prove exclusive Fetch ownership");
+    }
+    const barrier = { pausedRequestIds: [], target };
+    navigationBarriers.set(tabId, barrier);
+    try {
+      await chrome.debugger.sendCommand(target, "Fetch.enable", {
+        patterns: [{ requestStage: "Request", resourceType: "Document", urlPattern: "*" }]
+      });
+      throwIfAborted(signal);
+      await pageGuard();
+      scopedDebuggerTargets.set(tabId, target);
+      try {
+        return await operation();
+      } finally {
+        scopedDebuggerTargets.delete(tabId);
+      }
+    } finally {
+      navigationBarriers.delete(tabId);
+      for (const requestId of barrier.pausedRequestIds) {
+        await chrome.debugger.sendCommand(target, "Fetch.continueRequest", { requestId }).catch(() => {});
+      }
+      await chrome.debugger.sendCommand(target, "Fetch.disable", {}).catch(() => {});
+    }
+  });
 }
 
 async function withDebuggerTarget(debugTarget, callback) {
@@ -2130,7 +2202,7 @@ async function notifyOverlay(tabId, type, data, documentId) {
   return sendOverlayMessage(tabId, type, data, documentId);
 }
 
-async function withOverlayInputPassThrough(tabId, point, operation, signal) {
+async function withOverlayInputPassThrough(tabId, point, operation, signal, pageGuard) {
   let inputStarted = false;
   try {
     throwIfAborted(signal);
@@ -2145,7 +2217,9 @@ async function withOverlayInputPassThrough(tabId, point, operation, signal) {
     }
     return await operation();
   } finally {
-    if (inputStarted) await sendOverlayMessage(tabId, "agent-input-end", {});
+    if (inputStarted && await pageGuardStillAuthorized(pageGuard)) {
+      await sendOverlayMessage(tabId, "agent-input-end", {});
+    }
   }
 }
 
@@ -2215,6 +2289,10 @@ function sendEvent(event) {
 }
 
 function registerBrowserEventListeners() {
+  chrome.webNavigation.onBeforeNavigate?.addListener((details) => {
+    if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
+    navigationSequences.set(details.tabId, (navigationSequences.get(details.tabId) ?? 0) + 1);
+  });
   chrome.webNavigation.onCommitted?.addListener((details) => {
     if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
     const generation = (navigationSequences.get(details.tabId) ?? 0) + 1;
@@ -2278,6 +2356,11 @@ function registerBrowserEventListeners() {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source?.tabId;
     if (!Number.isInteger(tabId)) return;
+    if (method === "Fetch.requestPaused" && params?.resourceType === "Document") {
+      const barrier = navigationBarriers.get(tabId);
+      if (barrier && typeof params.requestId === "string") barrier.pausedRequestIds.push(params.requestId);
+      return;
+    }
     recordExecutionContextScope(tabId, method, params);
     if (networkTrackerAttached.has(tabId)) trackNetworkEvent(tabId, method, params);
     const subscribed = cdpSubscriptions.get(tabId);
@@ -2367,7 +2450,7 @@ function cdpEventPageProvenance(tabId, method, params) {
 const CDP_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/u;
 const VALID_MOUSE_BUTTONS = new Set(["left", "middle", "right"]);
 
-async function subscribeCdpEvents(params) {
+async function subscribeCdpEvents(params, pageGuard) {
   const tabId = requireTabId(params);
   await refreshTabPageProvenance(tabId);
   const methods = Array.isArray(params.methods) ? params.methods : [];
@@ -2383,6 +2466,7 @@ async function subscribeCdpEvents(params) {
   }
   cdpSubscriptions.set(tabId, subscribed);
   try {
+    await pageGuard?.();
     await ensureCdpEventDebugger(tabId, methods);
   } catch (error) {
     if (previous.size === 0) cdpSubscriptions.delete(tabId);
@@ -2392,7 +2476,7 @@ async function subscribeCdpEvents(params) {
   return { tabId, subscribed: [...subscribed] };
 }
 
-async function unsubscribeCdpEvents(params) {
+async function unsubscribeCdpEvents(params, pageGuard) {
   const tabId = requireTabId(params);
   const methods = Array.isArray(params.methods) ? params.methods : [];
   if (methods.length > MAX_CDP_METHODS) {
@@ -2402,6 +2486,7 @@ async function unsubscribeCdpEvents(params) {
     throw new Error("methods must be CDP method strings in 'Domain.method' format");
   }
   if (methods.length === 0) {
+    await pageGuard?.();
     cdpSubscriptions.delete(tabId);
     await detachCdpEventDebuggerIfIdle(tabId);
     return { tabId, subscribed: [] };
@@ -2411,15 +2496,19 @@ async function unsubscribeCdpEvents(params) {
     for (const method of methods) subscribed.delete(method);
     if (subscribed.size === 0) cdpSubscriptions.delete(tabId);
   }
+  await pageGuard?.();
   await detachCdpEventDebuggerIfIdle(tabId);
   return { tabId, subscribed: subscribed ? [...subscribed] : [] };
 }
 
-async function getConsoleLogs(params) {
+async function getConsoleLogs(params, pageGuard) {
   const tabId = requireTabId(params);
   const clear = params.clear === true;
   const autoAttach = params.autoAttach !== false;
-  if (autoAttach) await ensureConsoleLogDebugger(tabId);
+  if (autoAttach) {
+    await pageGuard?.();
+    await ensureConsoleLogDebugger(tabId);
+  }
   const buffer = consoleLogBuffers.get(tabId);
   const logs = buffer ? buffer.slice() : [];
   if (clear && buffer) {
@@ -2434,7 +2523,7 @@ async function getConsoleLogs(params) {
   };
 }
 
-async function getNetworkRequests(params, signal) {
+async function getNetworkRequests(params, signal, pageGuard) {
   throwIfAborted(signal);
   assertNetworkRequestFields(params);
   const tabId = requireTabId(params);
@@ -2453,7 +2542,10 @@ async function getNetworkRequests(params, signal) {
   }
   const since = strictNetworkInteger(params.since, 0, Number.MAX_SAFE_INTEGER, 0, "since");
   const limit = strictNetworkInteger(params.limit, 1, MAX_NETWORK_RESULT_LIMIT, 100, "limit");
-  if (autoAttach) await ensureNetworkCaptureDebugger(tabId, signal);
+  if (autoAttach) {
+    await pageGuard?.();
+    await ensureNetworkCaptureDebugger(tabId, signal);
+  }
   throwIfAborted(signal);
 
   const state = networkRequestStates.get(tabId);
