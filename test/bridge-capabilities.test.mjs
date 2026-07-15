@@ -3,7 +3,8 @@ import os from "node:os";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin, { TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
+import * as pluginModule from "../src/opencode-plugin.js";
 import { writeDataUrlToFile } from "../src/bridge-client.js";
 import { createLauncher, isSupportedNodeVersion, nativeHostLayout } from "../scripts/lib/platform-support.mjs";
 
@@ -505,6 +506,51 @@ test("OpenCode plugin exposes bounded tab context and combined page reading tool
   assert.match(source, /chrome_read_page[\s\S]{0,4000}includeScreenshot[\s\S]{0,1500}outputDirectory/u);
   assert.match(source, /bridgeCommand\("tabContext"/u);
   assert.match(source, /bridgeCommand\("readPage"/u);
+});
+
+test("OpenCode plugin exposes ranked page finding with an explicit capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  assert.ok(plugin.tool.chrome_find, "chrome_find tool missing");
+  assert.match(plugin.tool.chrome_find.description, /rank|find|element/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_find],
+    ["bridge.handshake", "browser.find", "browser.tabs"]
+  );
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /bridgeCommand\("findElements"/u);
+  assert.match(source, /chrome_find[\s\S]{0,2500}interactiveOnly[\s\S]{0,1000}visibleOnly/u);
+});
+
+test("OpenCode plugin exposes one typed deterministic wait tool and capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  assert.ok(plugin.tool.chrome_wait_for, "chrome_wait_for tool missing");
+  assert.match(plugin.tool.chrome_wait_for.description, /wait|condition/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_wait_for],
+    ["bridge.handshake", "browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"]
+  );
+  assert.equal(typeof pluginModule.requiredCapabilitiesForTool, "function");
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "download" } }),
+    ["bridge.handshake", "browser.downloads", "browser.wait"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "networkIdle" } }),
+    ["bridge.handshake", "browser.cdp", "browser.tabs", "browser.wait"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "text" } }),
+    ["bridge.handshake", "browser.tabs", "browser.wait"]
+  );
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /bridgeCommand\("waitFor"/u);
+  for (const type of ["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]) {
+    assert.match(source, new RegExp(`"${type}"`, "u"), `missing wait condition ${type}`);
+  }
 });
 
 test("dangerous and private-data tools require user approval before running", async () => {

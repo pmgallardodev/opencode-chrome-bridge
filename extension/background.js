@@ -8,12 +8,14 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.console",
   "browser.downloads",
   "browser.events",
+  "browser.find",
   "browser.history",
   "browser.navigation",
   "browser.page-context",
   "browser.screenshots",
   "browser.tab-groups",
   "browser.tabs",
+  "browser.wait",
   "browser.windows",
   "session.tab-leases"
 ]);
@@ -41,6 +43,15 @@ const MAX_MOVE_DURATION_MS = 30_000;
 const MAX_TAB_IDS = 200;
 const MAX_CDP_METHODS = 100;
 const MAX_QUERY_CHARS = 1000;
+const MAX_FIND_QUERY_CHARS = 500;
+const MAX_FIND_ROLE_CHARS = 50;
+const MAX_FIND_RESULTS = 100;
+const MAX_WAIT_TIMEOUT_MS = 120_000;
+const MIN_WAIT_TIMEOUT_MS = 50;
+const MAX_WAIT_POLL_MS = 1_000;
+const MIN_WAIT_POLL_MS = 10;
+const MAX_WAIT_VALUE_CHARS = 2_000;
+const MAX_NETWORK_REQUEST_STATES = 1_000;
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -64,6 +75,11 @@ const consoleLogAttached = new Set();
 // Tabs with a long-lived debugger attached for CDP event subscriptions
 const cdpEventAttached = new Set();
 const cdpEnabledDomains = new Map();
+// Bounded request state shared by deterministic network-idle waits and the
+// high-level network summaries added in the next roadmap phase.
+const networkRequestStates = new Map();
+const networkTrackerAttached = new Set();
+const networkWaitConsumers = new Map();
 const tabLeases = new Map();
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
@@ -390,6 +406,10 @@ async function executeCommand(method, params) {
       return tabContext(params);
     case "readPage":
       return readPage(params);
+    case "findElements":
+      return findElements(params);
+    case "waitFor":
+      return waitFor(params);
     case "clickElement":
       return clickElement(params);
     case "fillElement":
@@ -1401,7 +1421,7 @@ function debuggerKey(debugTarget) {
 }
 
 function isPersistentDebuggerAttached(tabId) {
-  return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId);
+  return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId) || networkTrackerAttached.has(tabId);
 }
 
 async function withDebuggerLock(key, callback) {
@@ -1422,13 +1442,16 @@ async function withDebuggerLock(key, callback) {
 async function releaseDebuggers(params = {}) {
   const tabIds = Array.isArray(params.tabIds)
     ? (params.tabIds.length === 0 ? [] : requireTabIdArray(params.tabIds))
-    : [...new Set([...consoleLogAttached, ...cdpEventAttached])];
+    : [...new Set([...consoleLogAttached, ...cdpEventAttached, ...networkTrackerAttached])];
   for (const tabId of tabIds) {
     const target = { tabId };
     await withDebuggerLock(debuggerKey(target), async () => {
       const attached = isPersistentDebuggerAttached(tabId);
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkWaitConsumers.delete(tabId);
+      networkRequestStates.delete(tabId);
       cdpSubscriptions.delete(tabId);
       cdpEnabledDomains.delete(tabId);
       consoleLogBuffers.delete(tabId);
@@ -1551,6 +1574,7 @@ function registerBrowserEventListeners() {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source?.tabId;
     if (!Number.isInteger(tabId)) return;
+    if (networkTrackerAttached.has(tabId)) trackNetworkEvent(tabId, method, params);
     const subscribed = cdpSubscriptions.get(tabId);
     const collectsConsole = consoleLogAttached.has(tabId) && CONSOLE_LOG_METHODS.includes(method);
     if (!collectsConsole && (!subscribed || !subscribed.has(method))) return;
@@ -1567,6 +1591,9 @@ function registerBrowserEventListeners() {
       consoleLogBufferChars.delete(tabId);
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkWaitConsumers.delete(tabId);
+      networkRequestStates.delete(tabId);
       cdpEnabledDomains.delete(tabId);
       sendEvent({ category: "cdp", type: "cdpDetached", tabId, reason });
     }
@@ -1748,6 +1775,243 @@ async function readPage(params) {
     accessibility: combined.accessibility,
     screenshot
   };
+}
+
+async function findElements(params) {
+  const tabId = requireTabId(params);
+  if (typeof params.query !== "string" || params.query.trim().length === 0) {
+    throw new Error("query must be a non-empty string");
+  }
+  const query = limitString(params.query, "query", MAX_FIND_QUERY_CHARS);
+  let role;
+  if (params.role != null) {
+    if (typeof params.role !== "string" || params.role.trim().length === 0) {
+      throw new Error("role must be a non-empty string when provided");
+    }
+    role = limitString(params.role, "role", MAX_FIND_ROLE_CHARS);
+  }
+  const options = {
+    interactiveOnly: params.interactiveOnly === true,
+    limit: clampInteger(params.limit, 1, MAX_FIND_RESULTS, 20, "limit"),
+    query,
+    role,
+    visibleOnly: params.visibleOnly !== false
+  };
+  await injectA11yScript(tabId);
+  const result = await runInA11yWorld(
+    tabId,
+    (findOptions) => window.__opencodeA11yFind ? window.__opencodeA11yFind(findOptions) : null,
+    [options]
+  );
+  validateFindElementsResult(result);
+  return { tabId, ...result };
+}
+
+function validateFindElementsResult(result) {
+  if (!isRecord(result)
+    || typeof result.query !== "string"
+    || result.query.length > MAX_FIND_QUERY_CHARS
+    || !Array.isArray(result.matches)
+    || result.matches.length > MAX_FIND_RESULTS
+    || !Number.isInteger(result.totalMatches)
+    || result.totalMatches < result.matches.length
+    || typeof result.truncated !== "boolean") {
+    throw new Error("find elements result is invalid");
+  }
+  for (const match of result.matches) {
+    if (!isRecord(match)
+      || Object.prototype.hasOwnProperty.call(match, "value")
+      || typeof match.ref !== "string"
+      || match.ref.length === 0
+      || match.ref.length > MAX_A11Y_REF_CHARS
+      || typeof match.role !== "string"
+      || match.role.length > MAX_FIND_ROLE_CHARS
+      || typeof match.name !== "string"
+      || match.name.length > 500
+      || typeof match.text !== "string"
+      || match.text.length > 500
+      || typeof match.score !== "number"
+      || !Number.isFinite(match.score)
+      || match.score <= 0
+      || typeof match.visible !== "boolean"
+      || typeof match.interactive !== "boolean") {
+      throw new Error("find elements result is invalid");
+    }
+  }
+}
+
+async function waitFor(params) {
+  const condition = validateWaitCondition(params.condition);
+  const timeoutMs = clampInteger(params.timeoutMs, MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS, 10_000, "timeoutMs");
+  const pollIntervalMs = clampInteger(params.pollIntervalMs, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, 100, "pollIntervalMs");
+  const tabId = condition.type === "download" ? null : requireTabId(params);
+  const startedAt = Date.now();
+  let networkConsumer = false;
+
+  if (["text", "ref", "selector"].includes(condition.type)) await injectA11yScript(tabId);
+  if (condition.type === "networkIdle") {
+    await acquireNetworkWaitTracker(tabId);
+    networkConsumer = true;
+  }
+
+  try {
+    while (true) {
+      const result = await checkWaitCondition(tabId, condition);
+      if (result.matched === true) {
+        return {
+          ...result,
+          elapsedMs: Date.now() - startedAt,
+          matched: true,
+          type: condition.type
+        };
+      }
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) {
+        throw new Error(`timed out waiting for ${condition.type} after ${timeoutMs}ms`);
+      }
+      await sleep(Math.min(pollIntervalMs, remainingMs));
+    }
+  } finally {
+    if (networkConsumer) await releaseNetworkWaitTracker(tabId);
+  }
+}
+
+function validateWaitCondition(condition) {
+  if (!isRecord(condition) || typeof condition.type !== "string") {
+    throw new Error("condition must be a typed object");
+  }
+  const type = condition.type;
+  if (!["url", "navigation", "text", "ref", "selector", "networkIdle", "download"].includes(type)) {
+    throw new Error("condition type must be one of: url, navigation, text, ref, selector, networkIdle, download");
+  }
+  const allowedFields = {
+    url: ["type", "value", "match"],
+    navigation: ["type"],
+    text: ["type", "value", "caseSensitive"],
+    ref: ["type", "ref", "visibleOnly"],
+    selector: ["type", "selector", "visibleOnly"],
+    networkIdle: ["type", "idleMs"],
+    download: ["type", "downloadId"]
+  }[type];
+  const unsupported = Object.keys(condition).filter((key) => !allowedFields.includes(key));
+  if (unsupported.length > 0) throw new Error(`${type} condition contains unsupported fields: ${unsupported.join(", ")}`);
+
+  if (type === "url") {
+    const value = requireWaitString(condition.value, "url condition value");
+    const match = condition.match ?? "contains";
+    if (match !== "contains" && match !== "exact") throw new Error("url condition match must be contains or exact");
+    return { type, value, match };
+  }
+  if (type === "navigation") return { type };
+  if (type === "text") {
+    return {
+      type,
+      value: requireWaitString(condition.value, "text condition value"),
+      caseSensitive: condition.caseSensitive === true
+    };
+  }
+  if (type === "ref") {
+    return { type, ref: requireElementRef({ ref: condition.ref }), visibleOnly: condition.visibleOnly !== false };
+  }
+  if (type === "selector") {
+    return {
+      type,
+      selector: requireWaitString(condition.selector, "selector condition selector"),
+      visibleOnly: condition.visibleOnly !== false
+    };
+  }
+  if (type === "networkIdle") {
+    return { type, idleMs: clampInteger(condition.idleMs, 10, 30_000, 500, "idleMs") };
+  }
+  if (!Number.isInteger(condition.downloadId) || condition.downloadId < 0) {
+    throw new Error("download condition downloadId must be a non-negative integer");
+  }
+  return { type, downloadId: condition.downloadId };
+}
+
+function requireWaitString(value, name) {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string`);
+  return limitString(value, name, MAX_WAIT_VALUE_CHARS);
+}
+
+async function checkWaitCondition(tabId, condition) {
+  if (condition.type === "url") {
+    const tab = await chrome.tabs.get(tabId);
+    const url = typeof tab.url === "string" ? tab.url : "";
+    const matched = condition.match === "exact" ? url === condition.value : url.includes(condition.value);
+    return { matched, url: sanitizeBrowserUrl(url) };
+  }
+  if (condition.type === "navigation") {
+    const tab = await chrome.tabs.get(tabId);
+    return {
+      matched: tab.status === "complete",
+      status: typeof tab.status === "string" ? tab.status : "unknown",
+      url: sanitizeBrowserUrl(tab.url)
+    };
+  }
+  if (["text", "ref", "selector"].includes(condition.type)) {
+    const result = await runInA11yWorld(
+      tabId,
+      (pageCondition) => window.__opencodeA11yCheck ? window.__opencodeA11yCheck(pageCondition) : null,
+      [condition]
+    );
+    if (!isRecord(result)
+      || result.type !== condition.type
+      || typeof result.matched !== "boolean") {
+      throw new Error(`${condition.type} wait result is invalid`);
+    }
+    if (result.invalid === true) throw new Error(`${condition.type} is invalid`);
+    return { matched: result.matched };
+  }
+  if (condition.type === "networkIdle") {
+    const snapshot = networkIdleSnapshot(tabId);
+    return {
+      ...snapshot,
+      matched: snapshot.overflowed !== true
+        && snapshot.inFlight === 0
+        && snapshot.idleForMs >= condition.idleMs
+    };
+  }
+  const items = await chrome.downloads.search({ id: condition.downloadId });
+  const item = items.find((candidate) => candidate.id === condition.downloadId);
+  if (!item) return { matched: false };
+  if (item.state === "interrupted") {
+    const reason = truncateString(item.error || "unknown error", 200);
+    throw new Error(`Download ${condition.downloadId} was interrupted: ${reason}`);
+  }
+  return {
+    download: normalizeWaitDownload(item),
+    matched: item.state === "complete"
+  };
+}
+
+function normalizeWaitDownload(item) {
+  return {
+    bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : 0,
+    filename: truncateString(item.filename, 2_000),
+    id: item.id,
+    state: item.state,
+    totalBytes: Number.isFinite(item.totalBytes) ? item.totalBytes : -1,
+    url: sanitizeBrowserUrl(item.url)
+  };
+}
+
+function sanitizeBrowserUrl(value) {
+  try {
+    const url = new URL(String(value ?? ""));
+    url.username = "";
+    url.password = "";
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      const normalized = key.toLowerCase().replace(/[_-]/gu, "");
+      if (/(auth|code|credential|key|pass|password|session|sig|signature|token|secret)/u.test(normalized)) {
+        url.searchParams.set(key, "[redacted]");
+      }
+    }
+    return url.href;
+  } catch {
+    return "";
+  }
 }
 
 function validateReadPageResult(result) {
@@ -1970,6 +2234,116 @@ async function assertNavigationAllowed(url) {
   }
 }
 
+async function acquireNetworkWaitTracker(tabId) {
+  const target = { tabId };
+  await withDebuggerLock(debuggerKey(target), async () => {
+    const consumers = networkWaitConsumers.get(tabId) ?? 0;
+    if (consumers > 0) {
+      networkWaitConsumers.set(tabId, consumers + 1);
+      return;
+    }
+    const reused = isPersistentDebuggerAttached(tabId);
+    let attachedHere = false;
+    try {
+      if (!reused) {
+        await chrome.debugger.attach(target, DEBUGGER_VERSION);
+        attachedHere = true;
+      }
+      await enableRequiredCdpDomain(target, "Network");
+      networkRequestStates.set(tabId, {
+        lastActivityAt: Date.now(),
+        overflowed: false,
+        requests: new Map()
+      });
+      networkTrackerAttached.add(tabId);
+      networkWaitConsumers.set(tabId, 1);
+    } catch (error) {
+      if (attachedHere) {
+        cdpEnabledDomains.delete(tabId);
+        await chrome.debugger.detach(target).catch(() => {});
+      }
+      throw error;
+    }
+  });
+}
+
+async function releaseNetworkWaitTracker(tabId) {
+  const target = { tabId };
+  await withDebuggerLock(debuggerKey(target), async () => {
+    const consumers = networkWaitConsumers.get(tabId) ?? 0;
+    if (consumers > 1) {
+      networkWaitConsumers.set(tabId, consumers - 1);
+      return;
+    }
+    networkWaitConsumers.delete(tabId);
+    networkTrackerAttached.delete(tabId);
+    networkRequestStates.delete(tabId);
+    if (!isPersistentDebuggerAttached(tabId)) {
+      cdpEnabledDomains.delete(tabId);
+      await chrome.debugger.detach(target).catch(() => {});
+    }
+  });
+}
+
+async function enableRequiredCdpDomain(target, domain) {
+  const tabId = target.tabId;
+  const enabled = cdpEnabledDomains.get(tabId) ?? new Set();
+  if (!enabled.has(domain)) {
+    await chrome.debugger.sendCommand(target, `${domain}.enable`, {});
+    enabled.add(domain);
+    cdpEnabledDomains.set(tabId, enabled);
+  }
+}
+
+function trackNetworkEvent(tabId, method, params) {
+  if (!["Network.requestWillBeSent", "Network.loadingFinished", "Network.loadingFailed"].includes(method)) return;
+  const state = networkRequestStates.get(tabId);
+  const requestId = typeof params?.requestId === "string" ? params.requestId : "";
+  if (!state || requestId.length === 0 || requestId.length > 500) return;
+  const now = Date.now();
+  state.lastActivityAt = now;
+
+  if (method === "Network.requestWillBeSent") {
+    let entry = state.requests.get(requestId);
+    if (!entry && state.requests.size >= MAX_NETWORK_REQUEST_STATES) {
+      const completedId = [...state.requests].find(([, candidate]) => candidate.inFlight === false)?.[0];
+      if (completedId) state.requests.delete(completedId);
+      else {
+        state.overflowed = true;
+        return;
+      }
+    }
+    entry = entry ?? { requestId };
+    entry.inFlight = true;
+    entry.startedAt = now;
+    entry.finishedAt = null;
+    state.requests.delete(requestId);
+    state.requests.set(requestId, entry);
+    return;
+  }
+
+  const entry = state.requests.get(requestId);
+  if (entry) {
+    entry.inFlight = false;
+    entry.finishedAt = now;
+    entry.failed = method === "Network.loadingFailed";
+  }
+}
+
+function networkIdleSnapshot(tabId) {
+  const state = networkRequestStates.get(tabId);
+  if (!state) return { idleForMs: 0, inFlight: 0, overflowed: true };
+  let inFlight = 0;
+  for (const request of state.requests.values()) {
+    if (request.inFlight === true) inFlight += 1;
+  }
+  return {
+    idleForMs: Math.max(0, Date.now() - state.lastActivityAt),
+    inFlight,
+    overflowed: state.overflowed
+  };
+}
+
 async function ensureConsoleLogDebugger(tabId) {
   const target = { tabId };
   return withDebuggerLock(debuggerKey(target), async () => {
@@ -2097,8 +2471,10 @@ async function detachCdpEventDebuggerIfIdle(tabId) {
   await withDebuggerLock(debuggerKey(target), async () => {
     if (cdpSubscriptions.has(tabId) || !cdpEventAttached.has(tabId)) return;
     cdpEventAttached.delete(tabId);
-    cdpEnabledDomains.delete(tabId);
-    if (!consoleLogAttached.has(tabId)) await chrome.debugger.detach(target).catch(() => {});
+    if (!isPersistentDebuggerAttached(tabId)) {
+      cdpEnabledDomains.delete(tabId);
+      await chrome.debugger.detach(target).catch(() => {});
+    }
   });
 }
 

@@ -364,6 +364,88 @@ test("tab context reports visible text and selection truncation", () => {
   assert.equal(context.truncated.selection, true);
 });
 
+test("findElements ranks normalized token matches and preserves document order for ties", () => {
+  const harness = createA11yHarness([
+    createElement("a", { attributes: { "aria-label": "Account settings" }, text: "Open" }),
+    createElement("button", { text: "Save account" }),
+    createElement("button", { text: "Save account" }),
+    createElement("button", { attributes: { placeholder: "Account search" }, text: "Search" })
+  ]);
+
+  const ranked = harness.find({ query: "ACCOUNT settings", limit: 10 });
+  assert.equal(ranked.matches[0].ref, "e1");
+  assert.equal(ranked.matches[0].name, "Account settings");
+
+  const ties = harness.find({ query: "save account", role: "button", limit: 10 });
+  assert.deepEqual([...ties.matches.map((match) => match.ref)], ["e2", "e3"]);
+  assert.equal(ties.matches[0].score, ties.matches[1].score);
+});
+
+test("findElements applies visibility and interactivity filters without indexing sensitive values", () => {
+  const hidden = createElement("button", { text: "Private report", visible: false });
+  const generic = createElement("div", { text: "Private report" });
+  const interactive = createElement("button", { text: "Private report" });
+  const sensitive = createElement("input", {
+    attributes: { autocomplete: "current-password", type: "text" },
+    value: "private report secret"
+  });
+  const nestedSecret = createElement("span", { text: "deep nested secret" });
+  const sensitiveContainer = createElement("div", {
+    attributes: { autocomplete: "cc-number" },
+    children: [nestedSecret]
+  });
+  const harness = createA11yHarness([hidden, generic, interactive, sensitive, sensitiveContainer]);
+
+  const visibleInteractive = harness.find({
+    query: "private report",
+    interactiveOnly: true,
+    visibleOnly: true,
+    limit: 10
+  });
+  assert.deepEqual([...visibleInteractive.matches.map((match) => match.ref)], ["e1"]);
+
+  const withHidden = harness.find({
+    query: "private report",
+    interactiveOnly: true,
+    visibleOnly: false,
+    limit: 10
+  });
+  assert.equal(withHidden.matches.length, 2);
+  assert.equal(withHidden.matches.some((match) => match.visible === false), true);
+
+  const secret = harness.find({ query: "secret", visibleOnly: false, limit: 10 });
+  assert.equal(secret.matches.length, 0);
+  const deepSecret = harness.find({ query: "deep nested secret", visibleOnly: false, limit: 10 });
+  assert.equal(deepSecret.matches.length, 0);
+  assert.doesNotMatch(JSON.stringify(withHidden), /secret/u);
+});
+
+test("findElements bounds hostile nesting without overflowing the isolated world", () => {
+  let nested = createElement("button", { text: "Target beyond scan bound" });
+  for (let index = 0; index < 10001; index += 1) {
+    nested = createElement("div", { children: [nested] });
+  }
+  const harness = createA11yHarness([nested]);
+
+  const result = harness.find({ query: "target beyond scan bound", visibleOnly: false, limit: 10 });
+
+  assert.equal(result.matches.length, 0);
+  assert.equal(result.truncated, true);
+});
+
+test("wait checks page text, selectors, and live refs without evaluating page JavaScript", () => {
+  const button = createElement("button", { text: "Report ready" });
+  const harness = createA11yHarness([button], { selectors: { "[data-ready]": button } });
+  harness.generate();
+
+  assert.equal(harness.check({ type: "text", value: "report READY", caseSensitive: false }).matched, true);
+  assert.equal(harness.check({ type: "selector", selector: "[data-ready]", visibleOnly: true }).matched, true);
+  assert.equal(harness.check({ type: "ref", ref: "e1", visibleOnly: true }).matched, true);
+
+  button.isConnected = false;
+  assert.equal(harness.check({ type: "ref", ref: "e1", visibleOnly: true }).matched, false);
+});
+
 function createA11yHarness(elements, {
   activeElement = null,
   contentType = "text/html",
@@ -373,6 +455,7 @@ function createA11yHarness(elements, {
   scrollX = 0,
   scrollY = 0,
   selection = null,
+  selectors = {},
   url = "https://example.test/",
   viewportHeight = 768,
   viewportWidth = 1024
@@ -397,7 +480,7 @@ function createA11yHarness(elements, {
       scrollHeight: documentHeight,
       scrollWidth: documentWidth
     },
-    querySelector: () => null,
+    querySelector: (selector) => selectors[selector] ?? null,
     title: "A11y test"
   };
   for (const element of elements) attachElement(element, document, null);
@@ -438,6 +521,12 @@ function createA11yHarness(elements, {
     focus(ref, selectAll) {
       return window.__opencodeA11yFocus(ref, selectAll);
     },
+    find(options) {
+      return window.__opencodeA11yFind(options);
+    },
+    check(condition) {
+      return window.__opencodeA11yCheck(condition);
+    },
     generate() {
       return window.__opencodeA11yGenerate({ maxChars: 50_000, maxNodes: 800 });
     },
@@ -458,7 +547,8 @@ function createElement(tagName, {
   selectionEnd = 0,
   selectionStart = 0,
   text = "",
-  value = ""
+  value = "",
+  visible = true
 } = {}) {
   const attrs = new Map(Object.entries(attributes));
   const textNode = text ? { nodeType: 3, parentElement: null, textContent: text } : null;
@@ -473,7 +563,7 @@ function createElement(tagName, {
     readOnly,
     selectionEnd,
     selectionStart,
-    tabIndex: 0,
+    tabIndex: ["a", "button", "input", "select", "textarea"].includes(tagName.toLowerCase()) ? 0 : -1,
     tagName: tagName.toUpperCase(),
     textContent: text,
     value,
@@ -487,7 +577,7 @@ function createElement(tagName, {
       return { height: 20, left: 0, top: 0, width: 100 };
     },
     getClientRects() {
-      return [{ height: 20, width: 100 }];
+      return visible ? [{ height: 20, width: 100 }] : [];
     },
     getRootNode() {
       return this.ownerDocument;
@@ -506,7 +596,14 @@ function createElement(tagName, {
 }
 
 function attachElement(element, document, parentElement) {
-  element.ownerDocument = document;
-  element.parentElement = parentElement;
-  for (const child of element.children ?? []) attachElement(child, document, element);
+  const stack = [{ element, parentElement }];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    current.element.ownerDocument = document;
+    current.element.parentElement = current.parentElement;
+    const children = current.element.children ?? [];
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push({ element: children[index], parentElement: current.element });
+    }
+  }
 }

@@ -54,6 +54,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_events: caps("browser.events"),
   chrome_favicon_badge: caps("browser.tabs"),
   chrome_fill_element: caps("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_find: caps("browser.find", "browser.tabs"),
   chrome_finalize_tabs: caps("browser.cdp", "browser.tabs", "session.tab-leases"),
   chrome_forward: caps("browser.navigation", "browser.tabs"),
   chrome_get_console_logs: caps("browser.cdp", "browser.console", "browser.tabs"),
@@ -85,6 +86,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_type: caps("browser.cdp", "browser.tabs"),
   chrome_ungroup_tabs: caps("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: caps("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_wait_for: caps("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
   chrome_wizard_step: caps("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 };
 
@@ -388,13 +390,12 @@ test("every browser tool fails before execution when its negotiated capability i
     });
   };
   try {
-    for (const [name, required] of Object.entries(EXPECTED_TOOL_CAPABILITIES)) {
-      const negotiated = name === "chrome_read_page"
-        ? required.filter((capability) => !["browser.screenshots", "browser.windows"].includes(capability))
-        : required;
+    for (const name of Object.keys(EXPECTED_TOOL_CAPABILITIES)) {
+      const args = {};
+      const negotiated = pluginModule.requiredCapabilitiesForTool(name, args);
       let asked = 0;
       await assert.rejects(
-        () => plugin.tool[name].execute({}, {
+        () => plugin.tool[name].execute(args, {
           ask: async () => { asked += 1; },
           directory: repoRoot
         }),

@@ -41,6 +41,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_events: capabilities("browser.events"),
   chrome_favicon_badge: capabilities("browser.tabs"),
   chrome_fill_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_find: capabilities("browser.find", "browser.tabs"),
   chrome_finalize_tabs: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
   chrome_forward: capabilities("browser.navigation", "browser.tabs"),
   chrome_get_console_logs: capabilities("browser.cdp", "browser.console", "browser.tabs"),
@@ -72,6 +73,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_type: capabilities("browser.cdp", "browser.tabs"),
   chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_wait_for: capabilities("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
   chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 });
 
@@ -280,6 +282,45 @@ export default async function OpenCodeChromeBridgePlugin() {
             previewChars: args.previewChars,
             projectDirectory: context.directory,
             result
+          }), null, 2);
+        }
+      }),
+      chrome_find: tool({
+        description: "Find and rank page elements deterministically by reference, role, accessible name, label, placeholder, and visible text.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          query: schema.string().min(1).max(500).describe("Natural-language or reference query used to rank elements."),
+          role: schema.string().min(1).max(50).optional().describe("Optional exact accessibility role filter, such as button or textbox."),
+          interactiveOnly: schema.boolean().default(false).describe("Only return interactive elements."),
+          visibleOnly: schema.boolean().default(true).describe("Only return currently visible elements."),
+          limit: schema.number().int().min(1).max(100).default(20).describe("Maximum ranked matches to return.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("findElements", args), null, 2);
+        }
+      }),
+      chrome_wait_for: tool({
+        description: "Wait deterministically for exactly one typed condition: URL, navigation, text, ref, selector, network idle, or download completion.",
+        args: {
+          tabId: schema.number().int().optional().describe("Chrome tab id. Required for every condition except download."),
+          condition: schema.object({
+            type: schema.enum(["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]),
+            value: schema.string().min(1).max(2000).optional(),
+            match: schema.enum(["contains", "exact"]).optional(),
+            caseSensitive: schema.boolean().optional(),
+            ref: schema.string().min(1).max(50).optional(),
+            selector: schema.string().min(1).max(2000).optional(),
+            visibleOnly: schema.boolean().optional(),
+            idleMs: schema.number().int().min(10).max(30000).optional(),
+            downloadId: schema.number().int().min(0).optional()
+          }).describe("One typed wait condition. Fields not belonging to the selected type are rejected."),
+          timeoutMs: schema.number().int().min(50).max(120000).default(10000).describe("Overall wait timeout."),
+          pollIntervalMs: schema.number().int().min(10).max(1000).default(100).describe("Polling interval for deterministic checks.")
+        },
+        async execute(args) {
+          const timeoutMs = args.timeoutMs ?? 10_000;
+          return JSON.stringify(await bridgeCommand("waitFor", args, {
+            timeoutMs: Math.min(125_000, timeoutMs + 5_000)
           }), null, 2);
         }
       }),
@@ -841,6 +882,7 @@ const APPROVAL_METADATA = {
   chrome_cdp: (args) => ({ action: "Run a full Chrome DevTools Protocol command", method: args.method, tabId: args.tabId, targetId: args.targetId }),
   chrome_evaluate: (args) => ({ action: "Evaluate JavaScript in the page", tabId: args.tabId, expression: previewText(args.expression) }),
   chrome_wizard_step: (args) => ({ action: "Click, then optionally evaluate JavaScript and screenshot", tabId: args.tabId, expression: previewText(args.expression) }),
+  chrome_wait_for: (args) => ({ action: "Wait for one browser condition", tabId: args.tabId, condition: args.condition?.type, timeoutMs: args.timeoutMs }),
   chrome_open: (args) => ({ action: "Open or navigate a tab", url: args.url, tabId: args.tabId }),
   chrome_open_window: (args) => ({ action: "Open a new browser window", url: args.url }),
   chrome_click: (args) => ({ action: "Click in the page", tabId: args.tabId, x: args.x, y: args.y, button: args.button }),
@@ -859,6 +901,7 @@ const APPROVAL_METADATA = {
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
+  chrome_find: (args) => ({ action: "Find ranked page elements", tabId: args.tabId, query: previewText(args.query), role: args.role }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
@@ -894,11 +937,20 @@ function requireApprovals(tools) {
   return guarded;
 }
 
-function requiredCapabilitiesForTool(name, args) {
+export function requiredCapabilitiesForTool(name, args) {
   const required = TOOL_CAPABILITY_REQUIREMENTS[name];
   if (!required) throw new Error(`Browser tool ${name} is missing an explicit capability declaration`);
   if (name === "chrome_read_page" && args?.includeScreenshot !== true) {
     return required.filter((capability) => capability !== "browser.screenshots" && capability !== "browser.windows");
+  }
+  if (name === "chrome_wait_for") {
+    if (args?.condition?.type === "download") {
+      return required.filter((capability) => capability !== "browser.cdp" && capability !== "browser.tabs");
+    }
+    if (args?.condition?.type !== "networkIdle") {
+      return required.filter((capability) => capability !== "browser.cdp" && capability !== "browser.downloads");
+    }
+    return required.filter((capability) => capability !== "browser.downloads");
   }
   return required;
 }

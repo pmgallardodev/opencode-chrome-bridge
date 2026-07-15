@@ -496,6 +496,303 @@ test("tabContext and readPage fail closed on malformed isolated-world results", 
   );
 });
 
+test("findElements injects the isolated finder and returns bounded ranked matches", async () => {
+  const injections = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      return injection.files ? [] : [{
+        result: {
+          matches: [{
+            interactive: true,
+            name: "Save account",
+            ref: "e2",
+            role: "button",
+            score: 2200,
+            text: "Save account",
+            visible: true
+          }],
+          query: "save account",
+          totalMatches: 1,
+          truncated: false
+        }
+      }];
+    }
+  });
+
+  const result = await harness.execute("findElements", {
+    interactiveOnly: true,
+    limit: 7,
+    query: "save account",
+    role: "button",
+    tabId: 7,
+    visibleOnly: true
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.matches[0].ref, "e2");
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, {
+    interactiveOnly: true,
+    limit: 7,
+    query: "save account",
+    role: "button",
+    visibleOnly: true
+  });
+});
+
+test("findElements validates query limits and isolated-world output", async () => {
+  let injectionCalls = 0;
+  const invalidInput = createBackgroundHarness({
+    scriptingExecuteScript: async () => { injectionCalls += 1; return []; }
+  });
+  await assert.rejects(
+    invalidInput.execute("findElements", { tabId: 7, query: "" }),
+    /query must be a non-empty string/u
+  );
+  await assert.rejects(
+    invalidInput.execute("findElements", { tabId: 7, query: "x".repeat(501) }),
+    /query is too large/u
+  );
+  assert.equal(injectionCalls, 0);
+
+  const malformedOutput = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { matches: [{ ref: "e1", score: "high" }] } }]
+  });
+  await assert.rejects(
+    malformedOutput.execute("findElements", { tabId: 7, query: "save" }),
+    /find elements result is invalid/u
+  );
+});
+
+test("waitFor validates one typed condition and bounds its timing controls", async () => {
+  const harness = createBackgroundHarness();
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "url", value: "https://example.com", selector: "#also" },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 50
+    }),
+    /url condition contains unsupported fields/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", { condition: { type: "text" }, tabId: 7, timeoutMs: 50 }),
+    /text condition value must be a non-empty string/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", { condition: { type: "unknown" }, tabId: 7, timeoutMs: 50 }),
+    /condition type must be one of/u
+  );
+});
+
+test("waitFor observes URL and completed navigation deterministically", async () => {
+  let urlReads = 0;
+  const urlHarness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: true,
+      id: tabId,
+      status: "complete",
+      url: ++urlReads < 2 ? "https://example.com/start" : "https://example.com/ready",
+      windowId: 1
+    })
+  });
+  const urlResult = await urlHarness.execute("waitFor", {
+    condition: { type: "url", value: "/ready", match: "contains" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  assert.equal(urlResult.matched, true);
+  assert.equal(urlResult.type, "url");
+  assert.match(urlResult.url, /\/ready$/u);
+
+  let navigationReads = 0;
+  const navigationHarness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: true,
+      id: tabId,
+      status: ++navigationReads < 2 ? "loading" : "complete",
+      url: "https://example.com/ready",
+      windowId: 1
+    })
+  });
+  const navigationResult = await navigationHarness.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  assert.equal(navigationResult.type, "navigation");
+  assert.equal(navigationResult.status, "complete");
+});
+
+test("waitFor checks text, live refs, and selectors only through the isolated helper", async () => {
+  const callsByType = new Map();
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      const condition = injection.args[0];
+      callsByType.set(condition.type, (callsByType.get(condition.type) ?? 0) + 1);
+      if (condition.type === "selector" && condition.selector === "[") {
+        return [{ result: { invalid: true, matched: false, type: "selector" } }];
+      }
+      return [{ result: {
+        matched: condition.type === "ref" ? false : (callsByType.get(condition.type) >= 2),
+        type: condition.type
+      } }];
+    }
+  });
+
+  for (const condition of [
+    { type: "text", value: "Ready", caseSensitive: false },
+    { type: "selector", selector: "[data-ready]", visibleOnly: true }
+  ]) {
+    const result = await harness.execute("waitFor", {
+      condition,
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 200
+    });
+    assert.equal(result.type, condition.type);
+    assert.equal(result.matched, true);
+  }
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "ref", ref: "e99", visibleOnly: true },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 50
+    }),
+    /timed out waiting for ref after 50ms/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "selector", selector: "[", visibleOnly: true },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 100
+    }),
+    /selector is invalid/u
+  );
+});
+
+test("network-idle waits reset on activity and preserve console debugger consumers", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 500
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.requestWillBeSent",
+    { requestId: "request-1", timestamp: 1 }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.loadingFinished",
+    { requestId: "request-1", timestamp: 2 }
+  );
+
+  const result = await waiting;
+  assert.equal(result.type, "networkIdle");
+  assert.equal(result.inFlight, 0);
+  assert.ok(result.idleForMs >= 40);
+  assert.equal(harness.calls.debuggerDetach.length, 0, "network wait cleanup must preserve the console debugger");
+
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Console.messageAdded",
+    { message: { level: "info", text: "still collecting" } }
+  );
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs[0].text, "still collecting");
+});
+
+test("CDP unsubscription does not detach an active network-idle consumer", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Network.responseReceived"] });
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  await harness.execute("unsubscribeCdpEvents", { tabId: 7 });
+  assert.equal(harness.calls.debuggerDetach.length, 0, "CDP cleanup must leave the network consumer attached");
+
+  await waiting;
+  assert.equal(harness.calls.debuggerDetach.length, 1, "the final network consumer owns the eventual detach");
+});
+
+test("network-idle timeout cleans its debugger consumer in finally", async () => {
+  const harness = createBackgroundHarness();
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 80
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.requestWillBeSent",
+    { requestId: "never-finishes", timestamp: 1 }
+  );
+
+  await assert.rejects(waiting, /timed out waiting for networkIdle after 80ms/u);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+});
+
+test("waitFor returns completed downloads and rejects interrupted downloads", async () => {
+  const completeHarness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{
+      id,
+      bytesReceived: 100,
+      filename: "/tmp/report.pdf",
+      state: "complete",
+      totalBytes: 100,
+      url: "https://example.com/report.pdf"
+    }]
+  });
+  const complete = await completeHarness.execute("waitFor", {
+    condition: { type: "download", downloadId: 42 },
+    pollIntervalMs: 10,
+    timeoutMs: 100
+  });
+  assert.equal(complete.type, "download");
+  assert.equal(complete.download.id, 42);
+  assert.equal(complete.download.state, "complete");
+
+  const interruptedHarness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{
+      id,
+      error: "NETWORK_FAILED",
+      filename: "/tmp/report.pdf",
+      state: "interrupted",
+      url: "https://example.com/report.pdf"
+    }]
+  });
+  await assert.rejects(
+    interruptedHarness.execute("waitFor", {
+      condition: { type: "download", downloadId: 42 },
+      pollIntervalMs: 10,
+      timeoutMs: 100
+    }),
+    /Download 42 was interrupted: NETWORK_FAILED/u
+  );
+});
+
 test("clickElement locates the reference and clicks its center through CDP", async () => {
   const mouseEvents = [];
   const harness = createBackgroundHarness({
@@ -1061,6 +1358,7 @@ function createBackgroundHarness({
   storageSet = async () => {},
   debuggerSendCommand = async () => ({}),
   consoleError = () => {},
+  downloadsSearch = async () => [],
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
   scriptingExecuteScript = null,
@@ -1075,7 +1373,7 @@ function createBackgroundHarness({
   windowsGet = async (windowId) => ({ id: windowId }),
   windowsUpdate = async (windowId) => ({ id: windowId })
 } = {}) {
-  const calls = { executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { debuggerAttach: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
@@ -1109,8 +1407,8 @@ function createBackgroundHarness({
     },
     bookmarks: { search: async () => [] },
     debugger: {
-      attach: async () => {},
-      detach: async () => {},
+      attach: async (target) => { calls.debuggerAttach.push(target); },
+      detach: async (target) => { calls.debuggerDetach.push(target); },
       getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
       onEvent: events.debuggerOnEvent,
@@ -1119,7 +1417,7 @@ function createBackgroundHarness({
     downloads: {
       onChanged: createEvent(),
       onCreated: createEvent(),
-      search: async () => [],
+      search: downloadsSearch,
       showDefaultFolder: downloadsShowDefaultFolder
     },
     history: { search: async () => [] },

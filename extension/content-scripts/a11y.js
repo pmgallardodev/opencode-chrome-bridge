@@ -152,6 +152,37 @@ if (!window.__opencodeA11yInstalled) {
     return truncate(text);
   }
 
+  function isInteractiveElement(element, role) {
+    return INTERACTIVE_ROLES.has(role) || element.hasAttribute("onclick") || element.tabIndex >= 0;
+  }
+
+  function normalizeSearchText(value) {
+    return String(value ?? "")
+      .normalize("NFKD")
+      .replace(/\p{M}+/gu, "")
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim();
+  }
+
+  function searchScore(query, queryTokens, weightedFields) {
+    let score = 0;
+    for (const [rawValue, weight] of weightedFields) {
+      const value = normalizeSearchText(rawValue);
+      if (!value) continue;
+      if (value === query) score += weight * 20;
+      else if (value.includes(query)) score += weight * 10;
+      const fieldTokens = value.split(" ");
+      for (const token of queryTokens) {
+        if (value === token) score += weight * 4;
+        else if (fieldTokens.includes(token)) score += weight * 2;
+        else if (value.includes(token)) score += weight;
+      }
+    }
+    return score;
+  }
+
   function fieldValue(element) {
     const tag = element.tagName.toLowerCase();
     if (tag !== "input" && tag !== "textarea") return null;
@@ -513,7 +544,7 @@ if (!window.__opencodeA11yInstalled) {
 
     function shouldEmit(element, role) {
       if (role === "hidden") return false;
-      const interactive = INTERACTIVE_ROLES.has(role) || element.hasAttribute("onclick") || element.tabIndex >= 0;
+      const interactive = isInteractiveElement(element, role);
       if (interactiveOnly) return interactive;
       if (interactive) return true;
       if (role === "generic") return false;
@@ -547,6 +578,116 @@ if (!window.__opencodeA11yInstalled) {
       truncated,
       tree: lines.join("\n")
     };
+  };
+
+  window.__opencodeA11yFind = function (options) {
+    const query = normalizeSearchText(options?.query);
+    const queryTokens = [...new Set(query.split(" ").filter(Boolean))];
+    const roleFilter = normalizeSearchText(options?.role);
+    const interactiveOnly = options?.interactiveOnly === true;
+    const visibleOnly = options?.visibleOnly !== false;
+    const limit = clampInt(options?.limit, 1, 100, 20);
+    const matches = [];
+    let documentOrder = 0;
+    let scanTruncated = false;
+
+    function pushElements(stack, elements, sensitiveAncestor) {
+      for (let index = (elements?.length ?? 0) - 1; index >= 0; index -= 1) {
+        stack.push({ element: elements[index], sensitiveAncestor });
+      }
+    }
+
+    if (queryTokens.length > 0) {
+      const stack = [];
+      pushElements(stack, (document.body ?? document.documentElement)?.children, false);
+      while (stack.length > 0) {
+        if (documentOrder >= MAX_VISIBLE_TEXT_SCAN_NODES) {
+          scanTruncated = true;
+          break;
+        }
+        const { element, sensitiveAncestor } = stack.pop();
+        documentOrder += 1;
+        if (SKIP_TAGS.has(element.tagName)) continue;
+        const sensitive = sensitiveAncestor || isSensitiveField(element);
+        const visible = isVisible(element);
+        const role = roleFor(element);
+        const interactive = isInteractiveElement(element, role);
+        if ((!visibleOnly || visible)
+          && (!interactiveOnly || interactive)
+          && (!roleFilter || normalizeSearchText(role) === roleFilter)
+          && !sensitive) {
+          const ref = refFor(element);
+          const name = accessibleName(element, role);
+          const label = labelText(element);
+          const placeholder = element.getAttribute("placeholder") || "";
+          const text = truncate(ownText(element) || element.textContent || "", 200);
+          const weightedFields = [
+            [ref, 120],
+            [role, 20],
+            [name, 100],
+            [label, 90],
+            [placeholder, 80],
+            [text, 60]
+          ];
+          const searchable = normalizeSearchText(weightedFields.map(([value]) => value).join(" "));
+          const score = searchScore(query, queryTokens, weightedFields);
+          if (score > 0 && queryTokens.every((token) => searchable.includes(token))) {
+            matches.push({
+              interactive,
+              name,
+              order: documentOrder,
+              ref,
+              role,
+              score,
+              text,
+              visible
+            });
+          }
+        }
+        // Push light DOM first so the shadow subtree, which is pushed last,
+        // remains the next deterministic traversal target.
+        pushElements(stack, element.children, sensitive);
+        pushElements(stack, shadowRootOf(element)?.children, sensitive);
+      }
+    }
+    matches.sort((left, right) => right.score - left.score || left.order - right.order);
+    const totalMatches = matches.length;
+    return {
+      matches: matches.slice(0, limit).map(({ order: _order, ...match }) => match),
+      query: String(options?.query ?? "").slice(0, 500),
+      totalMatches,
+      truncated: scanTruncated || totalMatches > limit
+    };
+  };
+
+  window.__opencodeA11yCheck = function (condition) {
+    if (condition?.type === "text") {
+      const pageText = visiblePageText(document.body ?? document.documentElement, 200000).text;
+      const expected = String(condition.value ?? "");
+      const matched = condition.caseSensitive === true
+        ? pageText.includes(expected)
+        : pageText.toLocaleLowerCase().includes(expected.toLocaleLowerCase());
+      return { matched, type: "text" };
+    }
+    if (condition?.type === "ref") {
+      const element = derefElement(condition.ref);
+      return {
+        matched: element !== null && (condition.visibleOnly !== true || isVisible(element)),
+        type: "ref"
+      };
+    }
+    if (condition?.type === "selector") {
+      try {
+        const element = document.querySelector(String(condition.selector ?? ""));
+        return {
+          matched: element !== null && (condition.visibleOnly !== true || isVisible(element)),
+          type: "selector"
+        };
+      } catch {
+        return { invalid: true, matched: false, type: "selector" };
+      }
+    }
+    return { matched: false, type: "unsupported" };
   };
 
   window.__opencodeA11yLocate = function (ref) {
