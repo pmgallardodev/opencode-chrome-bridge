@@ -62,6 +62,81 @@ test("fill verification compares the resulting value with the intended edit", ()
   assert.equal(harness.verify("e1", "replacement", true).verified, true);
 });
 
+test("file upload staging commits exact files to a live file input without partial success", () => {
+  const fileInput = createElement("input", { attributes: { type: "file", multiple: "" } });
+  const harness = createA11yHarness([fileInput]);
+  harness.generate();
+
+  assert.deepEqual({ ...harness.upload("begin", {
+    expiresAt: Date.now() + 60_000,
+    transferId: "transfer-test",
+    files: [
+      { chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" },
+      { chunkCount: 1, name: "world.bin", size: 3, type: "application/octet-stream" }
+    ]
+  }) }, { accepted: true, transferId: "transfer-test" });
+  harness.upload("chunk", { transferId: "transfer-test", fileIndex: 0, chunkIndex: 0, data: "aGVsbG8=" });
+  assert.throws(
+    () => harness.upload("commit", { transferId: "transfer-test", ref: "e1" }),
+    /missing chunk/iu
+  );
+  assert.equal(fileInput.files.length, 0, "an incomplete transfer must not mutate the input");
+
+  harness.upload("chunk", { transferId: "transfer-test", fileIndex: 1, chunkIndex: 0, data: "AAEC" });
+  const result = harness.upload("commit", { transferId: "transfer-test", ref: "e1" });
+
+  assert.equal(JSON.stringify(result), JSON.stringify({
+    committed: true,
+    count: 2,
+    names: ["hello.txt", "world.bin"],
+    transferId: "transfer-test"
+  }));
+  assert.deepEqual(Array.from(fileInput.files, (file) => file.name), ["hello.txt", "world.bin"]);
+  assert.deepEqual(fileInput.dispatchedEvents, ["input", "change"]);
+  assert.throws(
+    () => harness.upload("commit", { transferId: "transfer-test", ref: "e1" }),
+    /unknown|expired/iu
+  );
+});
+
+test("file upload staging rejects stale and non-file refs", () => {
+  const textInput = createElement("input", { attributes: { type: "text" } });
+  const fileInput = createElement("input", { attributes: { type: "file" } });
+  const harness = createA11yHarness([textInput, fileInput]);
+  harness.generate();
+
+  harness.upload("begin", {
+    expiresAt: Date.now() + 60_000,
+    transferId: "wrong-ref",
+    files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }]
+  });
+  harness.upload("chunk", { transferId: "wrong-ref", fileIndex: 0, chunkIndex: 0, data: "aGVsbG8=" });
+  assert.throws(() => harness.upload("commit", { transferId: "wrong-ref", ref: "e1" }), /file input/iu);
+  fileInput.isConnected = false;
+  assert.throws(() => harness.upload("commit", { transferId: "wrong-ref", ref: "e2" }), /fresh accessibilityTree/iu);
+  assert.equal(textInput.files.length, 0);
+  assert.equal(fileInput.files.length, 0);
+});
+
+test("file upload staging expires content-world chunks at the supplied TTL", () => {
+  const fileInput = createElement("input", { attributes: { type: "file" } });
+  const harness = createA11yHarness([fileInput]);
+  harness.generate();
+  harness.upload("begin", {
+    expiresAt: Date.now() - 1,
+    transferId: "expired-transfer",
+    files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }]
+  });
+
+  assert.throws(
+    () => harness.upload("chunk", {
+      transferId: "expired-transfer", fileIndex: 0, chunkIndex: 0, data: "aGVsbG8="
+    }),
+    /unknown|expired/iu
+  );
+  assert.equal(fileInput.files.length, 0);
+});
+
 test("tab context returns bounded page metadata and selected element references", () => {
   const selectedButton = createElement("button", { text: "Continue checkout" });
   const harness = createA11yHarness([
@@ -654,11 +729,28 @@ function createA11yHarness(elements, {
     scrollY
   };
   const context = vm.createContext({
+    atob: (value) => Buffer.from(value, "base64").toString("binary"),
     chrome: {},
     CSS: { escape: (value) => String(value) },
     document,
     location: { href: url },
     Node: { TEXT_NODE: 3 },
+    DataTransfer: class DataTransfer {
+      constructor() {
+        const files = [];
+        this.files = files;
+        this.items = { add(file) { files.push(file); } };
+      }
+    },
+    Event: class Event { constructor(type) { this.type = type; } },
+    File: class File {
+      constructor(parts, name, options = {}) {
+        this.name = name;
+        this.type = options.type ?? "";
+        this.size = parts.reduce((total, part) => total + part.byteLength, 0);
+      }
+    },
+    Uint8Array,
     URL,
     WeakRef,
     window
@@ -680,6 +772,9 @@ function createA11yHarness(elements, {
     },
     tabContext(options) {
       return window.__opencodeTabContext(options);
+    },
+    upload(action, payload) {
+      return window.__opencodeA11yUpload(action, payload);
     },
     verify(ref, text, clear) {
       return window.__opencodeA11yVerifyFill(ref, text, clear);
@@ -717,6 +812,12 @@ function createElement(tagName, {
     tagName: tagName.toUpperCase(),
     textContent: text,
     value,
+    files: [],
+    dispatchedEvents: [],
+    dispatchEvent(event) {
+      this.dispatchedEvents.push(event.type);
+      return true;
+    },
     focus() {
       if (!this.disabled) this.ownerDocument.activeElement = this;
     },

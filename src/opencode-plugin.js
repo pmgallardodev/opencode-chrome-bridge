@@ -1,5 +1,5 @@
 import path from "node:path";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   bridgeCommand,
@@ -14,6 +14,9 @@ import {
 } from "./workspace-artifacts.js";
 
 const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
+const MAX_UPLOAD_FILES = 20;
+const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({
   activateTab: ["browser.tabs", "browser.windows"],
@@ -55,6 +58,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_events: capabilities("browser.events"),
   chrome_favicon_badge: capabilities("browser.tabs"),
   chrome_fill_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_upload_files: capabilities("browser.accessibility", "browser.file-upload", "browser.tabs"),
   chrome_find: capabilities("browser.find", "browser.tabs"),
   chrome_finalize_tabs: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
   chrome_forward: capabilities("browser.navigation", "browser.tabs"),
@@ -992,6 +996,23 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("fillElement", args), null, 2);
         }
       }),
+      chrome_upload_files: tool({
+        description: "Upload workspace files to a live file input by accessibility-tree reference. Every real path must remain inside the current OpenCode workspace; directories, symlink escapes, oversized inputs, stale refs, and partial uploads are rejected.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          ref: schema.string().min(1).max(50).describe("Live file-input reference from chrome_accessibility_tree."),
+          paths: schema.array(schema.string().min(1).max(4096)).min(1).max(MAX_UPLOAD_FILES).describe("Workspace-relative or contained absolute file paths.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await uploadWorkspaceFiles({
+            directory: context.directory,
+            paths: args.paths,
+            ref: args.ref,
+            signal: context.abort,
+            tabId: args.tabId
+          }), null, 2);
+        }
+      }),
       chrome_blocked_urls: tool({
         description: "List the effective blocked URL patterns the bridge enforces on navigation. Patterns come from enterprise managed storage and the extension's local storage key blockedUrlPatterns.",
         args: {},
@@ -1060,6 +1081,7 @@ const APPROVAL_METADATA = {
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
+  chrome_upload_files: (args) => ({ action: "Upload workspace files to a page file input", tabId: args.tabId, ref: args.ref, files: args.paths?.length }),
   chrome_find: (args) => ({ action: "Find ranked page elements", tabId: args.tabId, query: previewText(args.query), role: args.role }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
@@ -1140,6 +1162,99 @@ function requiredCapabilitiesForBatchAction(action) {
 function previewText(value) {
   if (typeof value !== "string") return undefined;
   return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+}
+
+export async function uploadWorkspaceFiles({
+  command = bridgeCommand,
+  directory,
+  paths,
+  ref,
+  signal,
+  tabId,
+  chunkBytes = UPLOAD_CHUNK_BYTES
+}) {
+  if (typeof directory !== "string" || directory.length === 0) throw new Error("workspace directory is required");
+  if (!Array.isArray(paths) || paths.length === 0) throw new Error("upload requires at least one file");
+  if (paths.length > MAX_UPLOAD_FILES) throw new Error(`upload supports at most ${MAX_UPLOAD_FILES} files`);
+  if (!Number.isInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > UPLOAD_CHUNK_BYTES) {
+    throw new Error(`upload chunkBytes must be between 1 and ${UPLOAD_CHUNK_BYTES}`);
+  }
+  const workspace = await realpath(directory);
+  const files = [];
+  let totalBytes = 0;
+  for (const inputPath of paths) {
+    throwIfUploadAborted(signal);
+    if (typeof inputPath !== "string" || inputPath.length === 0 || inputPath.length > 4096) {
+      throw new Error("upload path is invalid");
+    }
+    const candidate = path.resolve(workspace, inputPath);
+    const resolved = await realpath(candidate).catch(() => { throw new Error(`upload file does not exist: ${inputPath}`); });
+    const relative = path.relative(workspace, resolved);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`upload path escapes outside the workspace: ${inputPath}`);
+    }
+    const info = await lstat(resolved);
+    if (!info.isFile()) throw new Error(`upload path is not a regular file: ${inputPath}`);
+    totalBytes += info.size;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      throw new Error(`upload total exceeds ${MAX_UPLOAD_TOTAL_BYTES} bytes`);
+    }
+    files.push({
+      chunkCount: Math.ceil(info.size / chunkBytes),
+      name: path.basename(resolved),
+      path: resolved,
+      size: info.size,
+      type: "application/octet-stream"
+    });
+  }
+  let transferId;
+  try {
+    throwIfUploadAborted(signal);
+    const begun = await command("fileUploadBegin", {
+      tabId,
+      totalBytes,
+      files: files.map(({ chunkCount, name, size, type }) => ({ chunkCount, name, size, type }))
+    }, { signal });
+    transferId = begun?.transferId;
+    if (typeof transferId !== "string" || transferId.length < 8 || transferId.length > 128) {
+      throw new Error("bridge returned an invalid upload transfer id");
+    }
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+      const file = files[fileIndex];
+      const handle = await open(file.path, "r");
+      try {
+        let position = 0;
+        for (let chunkIndex = 0; chunkIndex < file.chunkCount; chunkIndex += 1) {
+          throwIfUploadAborted(signal);
+          const expected = Math.min(chunkBytes, file.size - position);
+          const buffer = Buffer.allocUnsafe(expected);
+          const { bytesRead } = await handle.read(buffer, 0, expected, position);
+          if (bytesRead !== expected) throw new Error(`upload file changed while reading: ${file.name}`);
+          await command("fileUploadChunk", {
+            transferId,
+            fileIndex,
+            chunkIndex,
+            data: buffer.toString("base64")
+          }, { signal });
+          position += bytesRead;
+        }
+      } finally {
+        await handle.close();
+      }
+    }
+    throwIfUploadAborted(signal);
+    return await command("fileUploadCommit", { transferId, tabId, ref }, { signal });
+  } catch (error) {
+    if (transferId) {
+      try { await command("fileUploadAbort", { transferId }); } catch {}
+    }
+    throw error;
+  }
+}
+
+function throwIfUploadAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("file upload was cancelled");
 }
 
 function requireArtifactDirectoryWhenRequested(args) {

@@ -485,7 +485,7 @@ test("OpenCode plugin chrome_screenshot accepts optional tabId", async () => {
 test("OpenCode plugin resolves screenshot output paths against real project paths", async () => {
   const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
 
-  assert.match(source, /import \{ lstat, realpath \} from "node:fs\/promises"/u, "plugin must inspect real filesystem paths");
+  assert.match(source, /import \{ lstat, open, realpath \} from "node:fs\/promises"/u, "plugin must inspect and stream real filesystem paths");
   assert.match(source, /await resolveProjectOutputPath\(context\.directory/u, "screenshot tools must await path validation");
   assert.match(source, /nearestExistingAncestor/u, "plugin must validate existing symlink ancestors");
   assert.match(source, /assertPathWithin/u, "plugin must reject paths outside the project");

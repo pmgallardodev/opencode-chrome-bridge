@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -2667,6 +2668,107 @@ test("browser batches bound action count and serialized payload size", async () 
   );
 });
 
+test("file upload staging uses opaque ids and rejects duplicate or out-of-order chunks", async () => {
+  const isolatedCalls = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      isolatedCalls.push(injection.args);
+      return [{ result: { accepted: true } }];
+    }
+  });
+
+  const begun = await harness.execute("fileUploadBegin", {
+    tabId: 7,
+    files: [{ chunkCount: 2, name: "hello.txt", size: 5, type: "text/plain" }],
+    totalBytes: 5
+  });
+  assert.match(begun.transferId, /^[A-Za-z0-9_-]{32,}$/u);
+  assert.doesNotMatch(begun.transferId, /^(?:\d+|transfer-)/u);
+  await harness.execute("fileUploadChunk", {
+    transferId: begun.transferId, fileIndex: 0, chunkIndex: 0, data: "aGVs"
+  });
+  await assert.rejects(
+    harness.execute("fileUploadChunk", {
+      transferId: begun.transferId, fileIndex: 0, chunkIndex: 0, data: "aGVs"
+    }),
+    /duplicate|out of order/iu
+  );
+  await assert.rejects(
+    harness.execute("fileUploadChunk", {
+      transferId: begun.transferId, fileIndex: 0, chunkIndex: 2, data: "bG8="
+    }),
+    /out of order/iu
+  );
+  assert.ok(isolatedCalls.length >= 2);
+});
+
+test("file upload commit requires every chunk and abort removes staging", async () => {
+  const actions = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      actions.push(injection.args?.[0]);
+      return [{ result: injection.args?.[0] === "commit"
+        ? { committed: true, count: 1, names: ["hello.txt"] }
+        : { accepted: true } }];
+    }
+  });
+  const begun = await harness.execute("fileUploadBegin", {
+    tabId: 7,
+    files: [{ chunkCount: 1, name: "hello.txt", size: 5, type: "text/plain" }],
+    totalBytes: 5
+  });
+  await assert.rejects(
+    harness.execute("fileUploadCommit", { transferId: begun.transferId, tabId: 7, ref: "e1" }),
+    /missing chunk/iu
+  );
+  await harness.execute("fileUploadAbort", { transferId: begun.transferId });
+  await assert.rejects(
+    harness.execute("fileUploadChunk", {
+      transferId: begun.transferId, fileIndex: 0, chunkIndex: 0, data: "aGVsbG8="
+    }),
+    /unknown|expired/iu
+  );
+  assert.ok(actions.includes("abort"));
+});
+
+test("file upload staging bounds concurrent declared bytes and enforces global file order", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { accepted: true } }]
+  });
+  const begun = await harness.execute("fileUploadBegin", {
+    tabId: 7,
+    files: [
+      { chunkCount: 1, name: "first.bin", size: 1, type: "application/octet-stream" },
+      { chunkCount: 1, name: "second.bin", size: 1, type: "application/octet-stream" }
+    ],
+    totalBytes: 2
+  });
+  await assert.rejects(
+    harness.execute("fileUploadChunk", {
+      transferId: begun.transferId, fileIndex: 1, chunkIndex: 0, data: "AA=="
+    }),
+    /out of order/iu
+  );
+
+  for (let index = 0; index < 3; index += 1) {
+    await harness.execute("fileUploadBegin", {
+      tabId: 7,
+      files: [{ chunkCount: 1, name: `pending-${index}.bin`, size: 1, type: "application/octet-stream" }],
+      totalBytes: 1
+    });
+  }
+  await assert.rejects(
+    harness.execute("fileUploadBegin", {
+      tabId: 7,
+      files: [{ chunkCount: 1, name: "too-many.bin", size: 1, type: "application/octet-stream" }],
+      totalBytes: 1
+    }),
+    /concurrent|staging limit/iu
+  );
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
@@ -2803,8 +2905,10 @@ function createBackgroundHarness({
   harnessConsole.error = consoleError;
   const context = vm.createContext({
     AbortController,
+    atob,
     chrome,
     console: harnessConsole,
+    crypto: webcrypto,
     navigator: { platform: "MacIntel" },
     setTimeout,
     clearTimeout,

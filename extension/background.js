@@ -9,6 +9,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.console",
   "browser.downloads",
   "browser.events",
+  "browser.file-upload",
   "browser.find",
   "browser.history",
   "browser.navigation",
@@ -63,6 +64,14 @@ const MAX_NETWORK_FILTER_VALUES = 20;
 const MAX_NETWORK_URL_CHARS = 2_048;
 const MAX_NETWORK_FAILURE_CHARS = 500;
 const MAX_NETWORK_FILTER_CHARS = 500;
+const MAX_UPLOAD_FILES = 20;
+const MAX_CONCURRENT_UPLOADS = 4;
+const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_CHUNK_BYTES = 256 * 1024;
+const MAX_UPLOAD_CHUNKS = 256;
+const MAX_UPLOAD_NAME_CHARS = 255;
+const MAX_UPLOAD_MIME_CHARS = 255;
+const UPLOAD_TRANSFER_TTL_MS = 2 * 60 * 1000;
 const SENSITIVE_QUERY_KEYS = new Set([
   "access", "accesstoken", "apikey", "assertion", "auth", "authorization", "authorizationcode",
   "authtoken", "bearer", "clientsecret", "code", "cookie", "credential", "credentials", "idtoken",
@@ -127,6 +136,7 @@ const networkWaitConsumers = new Map();
 const navigationSequences = new Map();
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
+const uploadTransfers = new Map();
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
 chrome.runtime.onStartup.addListener(connectNativeHost);
@@ -402,6 +412,14 @@ async function executeCommand(method, params, options = {}) {
       return getConsoleLogs(params);
     case "networkRequests":
       return getNetworkRequests(params, options.signal);
+    case "fileUploadBegin":
+      return beginFileUpload(params, options.signal);
+    case "fileUploadChunk":
+      return appendFileUploadChunk(params, options.signal);
+    case "fileUploadCommit":
+      return commitFileUpload(params, options.signal);
+    case "fileUploadAbort":
+      return abortFileUpload(params);
     case "click":
       return dispatchClick(params, options.signal);
     case "doubleClick":
@@ -2236,6 +2254,184 @@ async function runInA11yWorld(tabId, func, args) {
   const result = results?.[0]?.result;
   if (result == null) throw new Error("Accessibility script did not return a result");
   return result;
+}
+
+function randomUploadTransferId() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `u_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function cleanupExpiredFileUploads() {
+  const now = Date.now();
+  for (const [transferId, transfer] of uploadTransfers) {
+    if (now <= transfer.expiresAt) continue;
+    uploadTransfers.delete(transferId);
+    try {
+      await injectA11yScript(transfer.tabId);
+      await runInA11yWorld(
+        transfer.tabId,
+        (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+        ["abort", { transferId }]
+      );
+    } catch {}
+  }
+}
+
+function validateUploadFiles(params) {
+  if (!Array.isArray(params.files) || params.files.length < 1) throw new Error("upload requires at least one file");
+  if (params.files.length > MAX_UPLOAD_FILES) throw new Error(`upload supports at most ${MAX_UPLOAD_FILES} files`);
+  const files = params.files.map((file) => {
+    if (!isRecord(file)
+      || typeof file.name !== "string" || file.name.length < 1 || file.name.length > MAX_UPLOAD_NAME_CHARS
+      || file.name.includes("/") || file.name.includes("\\")
+      || !Number.isSafeInteger(file.size) || file.size < 0
+      || typeof file.type !== "string" || file.type.length > MAX_UPLOAD_MIME_CHARS
+      || !Number.isInteger(file.chunkCount) || file.chunkCount < 0 || file.chunkCount > MAX_UPLOAD_CHUNKS
+      || (file.size === 0) !== (file.chunkCount === 0)) {
+      throw new Error("upload file metadata is invalid");
+    }
+    return { chunkCount: file.chunkCount, name: file.name, nextChunk: 0, receivedBytes: 0, size: file.size, type: file.type };
+  });
+  const totalBytes = files.reduce((total, file) => total + file.size, 0);
+  if (!Number.isSafeInteger(params.totalBytes) || params.totalBytes !== totalBytes || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+    throw new Error(`upload total bytes must match file metadata and not exceed ${MAX_UPLOAD_TOTAL_BYTES}`);
+  }
+  if (files.reduce((total, file) => total + file.chunkCount, 0) > MAX_UPLOAD_CHUNKS) {
+    throw new Error(`upload supports at most ${MAX_UPLOAD_CHUNKS} chunks`);
+  }
+  return { files, totalBytes };
+}
+
+async function beginFileUpload(params, signal) {
+  throwIfAborted(signal);
+  await cleanupExpiredFileUploads();
+  const tabId = requireTabId(params);
+  const { files, totalBytes } = validateUploadFiles(params);
+  if (uploadTransfers.size >= MAX_CONCURRENT_UPLOADS) throw new Error("upload concurrent staging limit reached");
+  const stagedBytes = [...uploadTransfers.values()].reduce((total, transfer) => total + transfer.totalBytes, 0);
+  if (stagedBytes + totalBytes > MAX_UPLOAD_TOTAL_BYTES) throw new Error("upload staging byte limit reached");
+  const transferId = randomUploadTransferId();
+  let nextFileIndex = 0;
+  while (nextFileIndex < files.length && files[nextFileIndex].chunkCount === 0) nextFileIndex += 1;
+  const transfer = { expiresAt: Date.now() + UPLOAD_TRANSFER_TTL_MS, files, nextFileIndex, tabId, totalBytes };
+  uploadTransfers.set(transferId, transfer);
+  try {
+    await injectA11yScript(tabId);
+    throwIfAborted(signal);
+    const result = await runInA11yWorld(
+      tabId,
+      (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+      ["begin", { transferId, expiresAt: transfer.expiresAt, files: files.map(({ chunkCount, name, size, type }) => ({ chunkCount, name, size, type })) }]
+    );
+    if (result.accepted !== true) throw new Error("isolated upload staging rejected the transfer");
+    return { expiresAt: transfer.expiresAt, transferId };
+  } catch (error) {
+    uploadTransfers.delete(transferId);
+    throw error;
+  }
+}
+
+function requireUploadTransfer(params) {
+  if (typeof params.transferId !== "string") throw new Error("upload transferId is invalid");
+  const transfer = uploadTransfers.get(params.transferId);
+  if (!transfer || Date.now() > transfer.expiresAt) {
+    uploadTransfers.delete(params.transferId);
+    throw new Error("upload transfer is unknown or expired");
+  }
+  return transfer;
+}
+
+function decodedBase64Bytes(value) {
+  if (typeof value !== "string" || value.length === 0
+    || value.length > Math.ceil(MAX_UPLOAD_CHUNK_BYTES / 3) * 4 + 4
+    || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)) throw new Error("upload chunk data is invalid");
+  try {
+    return atob(value).length;
+  } catch {
+    throw new Error("upload chunk data is invalid base64");
+  }
+}
+
+async function appendFileUploadChunk(params, signal) {
+  throwIfAborted(signal);
+  await cleanupExpiredFileUploads();
+  const transfer = requireUploadTransfer(params);
+  const file = transfer.files[params.fileIndex];
+  if (!file || !Number.isInteger(params.fileIndex)) throw new Error("upload file index is invalid");
+  if (params.fileIndex !== transfer.nextFileIndex) throw new Error("upload chunk is out of order");
+  if (!Number.isInteger(params.chunkIndex) || params.chunkIndex !== file.nextChunk) {
+    throw new Error("upload chunk is duplicate or out of order");
+  }
+  if (params.chunkIndex >= file.chunkCount) throw new Error("upload chunk is out of order");
+  const byteLength = decodedBase64Bytes(params.data);
+  if (byteLength > MAX_UPLOAD_CHUNK_BYTES || file.receivedBytes + byteLength > file.size) {
+    throw new Error("upload chunk exceeds declared bounds");
+  }
+  const expiresAt = Date.now() + UPLOAD_TRANSFER_TTL_MS;
+  const result = await runInA11yWorld(
+    transfer.tabId,
+    (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+    ["chunk", { transferId: params.transferId, fileIndex: params.fileIndex, chunkIndex: params.chunkIndex, data: params.data, expiresAt }]
+  );
+  throwIfAborted(signal);
+  if (result.accepted !== true) throw new Error("isolated upload staging rejected the chunk");
+  file.nextChunk += 1;
+  file.receivedBytes += byteLength;
+  if (file.nextChunk === file.chunkCount) {
+    transfer.nextFileIndex += 1;
+    while (transfer.nextFileIndex < transfer.files.length
+      && transfer.files[transfer.nextFileIndex].chunkCount === 0) transfer.nextFileIndex += 1;
+  }
+  transfer.expiresAt = expiresAt;
+  return { accepted: true, chunkIndex: params.chunkIndex, fileIndex: params.fileIndex, transferId: params.transferId };
+}
+
+async function commitFileUpload(params, signal) {
+  throwIfAborted(signal);
+  await cleanupExpiredFileUploads();
+  const transfer = requireUploadTransfer(params);
+  const tabId = requireTabId(params);
+  const ref = requireElementRef(params);
+  if (tabId !== transfer.tabId) throw new Error("upload transfer belongs to a different tab");
+  for (const file of transfer.files) {
+    if (file.nextChunk !== file.chunkCount || file.receivedBytes !== file.size) {
+      throw new Error(`upload is missing chunk data for ${file.name}`);
+    }
+  }
+  try {
+    const result = await runInA11yWorld(
+      tabId,
+      (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+      ["commit", { transferId: params.transferId, ref }]
+    );
+    throwIfAborted(signal);
+    const expectedNames = transfer.files.map((file) => file.name);
+    if (result.committed !== true || result.count !== expectedNames.length
+      || !Array.isArray(result.names) || result.names.some((name, index) => name !== expectedNames[index])) {
+      throw new Error("isolated upload commit did not verify the exact files");
+    }
+    uploadTransfers.delete(params.transferId);
+    return { ...result, ref, tabId };
+  } catch (error) {
+    await abortFileUpload({ transferId: params.transferId });
+    throw error;
+  }
+}
+
+async function abortFileUpload(params) {
+  if (typeof params.transferId !== "string") throw new Error("upload transferId is invalid");
+  const transfer = uploadTransfers.get(params.transferId);
+  uploadTransfers.delete(params.transferId);
+  if (!transfer) return { aborted: true, existed: false, transferId: params.transferId };
+  try {
+    await runInA11yWorld(
+      transfer.tabId,
+      (action, payload) => window.__opencodeA11yUpload?.(action, payload) ?? null,
+      ["abort", { transferId: params.transferId }]
+    );
+  } catch {}
+  return { aborted: true, existed: true, transferId: params.transferId };
 }
 
 async function accessibilityTree(params) {

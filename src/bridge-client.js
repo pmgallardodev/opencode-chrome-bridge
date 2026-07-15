@@ -193,7 +193,7 @@ export async function bridgeCommand(method, params = {}, options = {}) {
     method,
     params,
     timeoutMs: options.timeoutMs
-  });
+  }, {}, options.signal);
   return response.result;
 }
 
@@ -210,11 +210,13 @@ export async function writeDataUrlToFile(dataUrl, outputPath) {
   return { bytes: data.length, mimeType, path: outputPath };
 }
 
-async function request(method, pathname, body, extraHeaders = {}) {
+async function request(method, pathname, body, extraHeaders = {}, externalSignal) {
   const state = await readBridgeState();
   const url = `http://${state.host}:${state.port}${pathname}`;
   const timeoutMs = requestTimeoutMs(body);
   const controller = new AbortController();
+  const onExternalAbort = () => controller.abort(externalSignal.reason);
+  externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
@@ -235,6 +237,7 @@ async function request(method, pathname, body, extraHeaders = {}) {
     throw error;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
   }
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.ok === false) {

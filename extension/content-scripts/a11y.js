@@ -11,6 +11,7 @@ if (!window.__opencodeA11yInstalled) {
   const elementByRef = new Map();
   const refByElement = new WeakMap();
   const pendingFills = new Map();
+  const uploadTransfers = new Map();
   let refCounter = 0;
 
   const ROLE_BY_TAG = {
@@ -860,6 +861,109 @@ if (!window.__opencodeA11yInstalled) {
     if (selectedAll) return { found: true, verified: current === text };
     if (text.length === 0) return { found: true, verified: current === pending.before };
     return { found: true, verified: current !== pending.before && current.includes(text) };
+  };
+
+  window.__opencodeA11yUpload = function (action, payload) {
+    const transferId = String(payload?.transferId ?? "");
+    if (!/^[A-Za-z0-9_-]{8,128}$/u.test(transferId)) throw new Error("upload transfer id is invalid");
+    const now = Date.now();
+    for (const [id, candidate] of uploadTransfers) {
+      if (now > candidate.expiresAt) uploadTransfers.delete(id);
+    }
+    if (action === "begin") {
+      if (uploadTransfers.has(transferId)) throw new Error("upload transfer already exists");
+      if (uploadTransfers.size >= 4) throw new Error("upload concurrent staging limit reached");
+      if (!Array.isArray(payload.files) || payload.files.length < 1 || payload.files.length > 20) {
+        throw new Error("upload requires between 1 and 20 files");
+      }
+      const files = payload.files.map((file) => {
+        if (!file || typeof file !== "object"
+          || typeof file.name !== "string" || file.name.length < 1 || file.name.length > 255
+          || !Number.isSafeInteger(file.size) || file.size < 0
+          || !Number.isInteger(file.chunkCount) || file.chunkCount < 0 || file.chunkCount > 256
+          || typeof file.type !== "string" || file.type.length > 255) {
+          throw new Error("upload file metadata is invalid");
+        }
+        return { ...file, chunks: [], receivedBytes: 0 };
+      });
+      if (!Number.isFinite(payload.expiresAt)) throw new Error("upload expiration is invalid");
+      const declaredBytes = files.reduce((total, file) => total + file.size, 0);
+      const alreadyDeclared = [...uploadTransfers.values()]
+        .flatMap((candidate) => candidate.files)
+        .reduce((total, file) => total + file.size, 0);
+      if (declaredBytes > 50 * 1024 * 1024 || alreadyDeclared + declaredBytes > 50 * 1024 * 1024) {
+        throw new Error("upload staging byte limit reached");
+      }
+      let nextFileIndex = 0;
+      while (nextFileIndex < files.length && files[nextFileIndex].chunkCount === 0) nextFileIndex += 1;
+      uploadTransfers.set(transferId, { expiresAt: payload.expiresAt, files, nextFileIndex });
+      return { accepted: true, transferId };
+    }
+    const transfer = uploadTransfers.get(transferId);
+    if (!transfer || Date.now() > transfer.expiresAt) {
+      uploadTransfers.delete(transferId);
+      throw new Error("upload transfer is unknown or expired");
+    }
+    if (action === "abort") {
+      uploadTransfers.delete(transferId);
+      return { aborted: true, transferId };
+    }
+    if (action === "chunk") {
+      const file = transfer.files[payload.fileIndex];
+      if (!file || !Number.isInteger(payload.fileIndex)) throw new Error("upload file index is invalid");
+      if (payload.fileIndex !== transfer.nextFileIndex) throw new Error("upload chunk is out of order");
+      if (!Number.isInteger(payload.chunkIndex) || payload.chunkIndex !== file.chunks.length) {
+        throw new Error("upload chunk is duplicate or out of order");
+      }
+      if (payload.chunkIndex >= file.chunkCount || typeof payload.data !== "string") {
+        throw new Error("upload chunk is invalid");
+      }
+      let binary;
+      try {
+        binary = atob(payload.data);
+      } catch {
+        throw new Error("upload chunk is not valid base64");
+      }
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      if (file.receivedBytes + bytes.byteLength > file.size) throw new Error("upload chunk exceeds declared file size");
+      file.chunks.push(bytes);
+      file.receivedBytes += bytes.byteLength;
+      if (file.chunks.length === file.chunkCount) {
+        transfer.nextFileIndex += 1;
+        while (transfer.nextFileIndex < transfer.files.length
+          && transfer.files[transfer.nextFileIndex].chunkCount === 0) transfer.nextFileIndex += 1;
+      }
+      if (Number.isFinite(payload.expiresAt)) transfer.expiresAt = payload.expiresAt;
+      return { accepted: true, chunkIndex: payload.chunkIndex, fileIndex: payload.fileIndex, transferId };
+    }
+    if (action !== "commit") throw new Error("upload action is invalid");
+    const element = derefElement(payload.ref);
+    if (!element) throw new Error(`Element ${String(payload.ref)} was not found; capture a fresh accessibilityTree`);
+    if (element.tagName.toLowerCase() !== "input"
+      || (element.getAttribute("type") || "text").toLowerCase() !== "file"
+      || isDisabled(element)) {
+      throw new Error(`Element ${String(payload.ref)} is not an enabled file input`);
+    }
+    for (const file of transfer.files) {
+      if (file.chunks.length !== file.chunkCount || file.receivedBytes !== file.size) {
+        throw new Error(`upload is missing chunk data for ${file.name}`);
+      }
+    }
+    const dataTransfer = new DataTransfer();
+    for (const staged of transfer.files) {
+      dataTransfer.items.add(new File(staged.chunks, staged.name, { type: staged.type }));
+    }
+    const expectedNames = transfer.files.map((file) => file.name);
+    element.files = dataTransfer.files;
+    element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    const actualNames = Array.from(element.files ?? [], (file) => file.name);
+    const verified = actualNames.length === expectedNames.length
+      && actualNames.every((name, index) => name === expectedNames[index]);
+    if (!verified) throw new Error("file input did not retain the exact staged files");
+    uploadTransfers.delete(transferId);
+    return { committed: true, count: actualNames.length, names: actualNames, transferId };
   };
 
   function clampInt(value, min, max, fallback) {

@@ -55,6 +55,7 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_events: caps("browser.events"),
   chrome_favicon_badge: caps("browser.tabs"),
   chrome_fill_element: caps("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_upload_files: caps("browser.accessibility", "browser.file-upload", "browser.tabs"),
   chrome_find: caps("browser.find", "browser.tabs"),
   chrome_finalize_tabs: caps("browser.cdp", "browser.tabs", "session.tab-leases"),
   chrome_forward: caps("browser.navigation", "browser.tabs"),
