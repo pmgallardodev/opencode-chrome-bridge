@@ -7,7 +7,8 @@ import {
   readdir,
   rename,
   rm,
-  symlink
+  symlink,
+  writeFile
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -232,6 +233,77 @@ test("oversized context text is replaced with a preview and a workspace artifact
   assert.equal(result.artifact.originalTruncated, false);
   assert.equal(await readFile(result.artifact.path, "utf8"), visibleText);
   assert.match(result.artifact.relativePath, /^browser-output[\\/]tab-context-[a-z0-9-]+\.txt$/u);
+});
+
+test("combined page artifacts validate screenshots before publishing text", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-prevalidate-"));
+  t.after(() => rm(projectDirectory, { force: true, recursive: true }));
+  const { materializeReadPageArtifacts } = await loadArtifacts();
+
+  await assert.rejects(
+    materializeReadPageArtifacts({
+      forceText: true,
+      outputDirectory: "browser-output",
+      previewChars: 100,
+      projectDirectory,
+      result: {
+        context: { visibleText: "private page text" },
+        screenshot: { dataUrl: "data:image/gif;base64,R0lGODlh", format: "gif" }
+      }
+    }),
+    /unsupported MIME type/u
+  );
+
+  assert.deepEqual(await readdir(projectDirectory), []);
+});
+
+test("combined page artifacts roll back prior writes by identity", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-rollback-"));
+  t.after(() => rm(projectDirectory, { force: true, recursive: true }));
+  const outputDirectory = path.join(projectDirectory, "browser-output");
+  await mkdir(outputDirectory);
+  const unrelatedPath = path.join(outputDirectory, "keep.txt");
+  await writeFile(unrelatedPath, "unrelated");
+  const { materializeReadPageArtifacts } = await loadArtifacts();
+
+  const probePath = path.join(projectDirectory, "file-handle-probe");
+  const probe = await open(probePath, "w");
+  const fileHandlePrototype = Object.getPrototypeOf(probe);
+  const originalWriteFile = fileHandlePrototype.writeFile;
+  await probe.close();
+  await rm(probePath, { force: true });
+  let writeCalls = 0;
+  fileHandlePrototype.writeFile = async function (...args) {
+    writeCalls += 1;
+    if (writeCalls === 2) throw new Error("simulated second artifact write failure");
+    return originalWriteFile.apply(this, args);
+  };
+  t.after(() => {
+    fileHandlePrototype.writeFile = originalWriteFile;
+  });
+
+  try {
+    await assert.rejects(
+      materializeReadPageArtifacts({
+        forceText: true,
+        outputDirectory: "browser-output",
+        previewChars: 100,
+        projectDirectory,
+        result: {
+          context: { visibleText: "private page text" },
+          screenshot: { dataUrl: "data:image/png;base64,iVBORw0KGgo=", format: "png" }
+        }
+      }),
+      /simulated second artifact write failure/u
+    );
+  } finally {
+    fileHandlePrototype.writeFile = originalWriteFile;
+  }
+
+  assert.equal(writeCalls, 2);
+  assert.deepEqual(await readdir(outputDirectory), ["keep.txt"]);
+  assert.equal(await readFile(unrelatedPath, "utf8"), "unrelated");
+  assert.equal((await readdir(projectDirectory)).some((entry) => entry.endsWith(".tmp")), false);
 });
 
 test("combined page artifacts replace raw data URLs with safe text and image paths", async (t) => {

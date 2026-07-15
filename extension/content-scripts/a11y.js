@@ -60,6 +60,8 @@ if (!window.__opencodeA11yInstalled) {
   ]);
 
   const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "NOSCRIPT", "TEMPLATE"]);
+  const MAX_VISIBLE_TEXT_SCAN_DEPTH = 200;
+  const MAX_VISIBLE_TEXT_SCAN_NODES = 10000;
   const MAX_SELECTED_ELEMENT_REFS = 100;
   const MAX_SELECTION_SCAN_ELEMENTS = 10000;
 
@@ -192,7 +194,11 @@ if (!window.__opencodeA11yInstalled) {
       url.hash = "";
       for (const key of [...url.searchParams.keys()]) {
         const normalizedKey = key.toLowerCase().replace(/[_-]/gu, "");
-        if (["apikey", "auth", "authorization", "code", "credential", "key", "pass", "password", "session"].includes(normalizedKey)
+        if ([
+          "apikey", "auth", "authorization", "code", "credential", "googleaccessid",
+          "key", "pass", "password", "session", "sig", "signature",
+          "xamzcredential", "xamzsecuritytoken", "xamzsignature"
+        ].includes(normalizedKey)
           || normalizedKey.endsWith("token")
           || normalizedKey.endsWith("secret")
           || normalizedKey.includes("password")) {
@@ -215,57 +221,78 @@ if (!window.__opencodeA11yInstalled) {
 
   function visiblePageText(root, maxChars) {
     let text = "";
-    let truncated = false;
+    let scanTruncated = false;
+    let textTruncated = false;
+    let visited = 0;
+    const stack = [];
 
     function append(value) {
-      if (truncated) return;
+      if (textTruncated) return;
       const normalized = String(value ?? "").replace(/\s+/gu, " ").trim();
       if (!normalized) return;
       const separator = text ? " " : "";
       const available = maxChars - text.length;
       if (available <= separator.length) {
-        truncated = true;
+        textTruncated = true;
         return;
       }
       const candidate = `${separator}${normalized}`;
       if (candidate.length > available) {
         text += candidate.slice(0, available);
-        truncated = true;
+        textTruncated = true;
         return;
       }
       text += candidate;
     }
 
-    function walkElement(element) {
-      if (truncated || !element || SKIP_TAGS.has(element.tagName)) return;
-      if (typeof element.getClientRects === "function" && !isVisible(element)) return;
-
-      if (isSensitiveField(element)) {
-        if (element.value || element.textContent || (element.childNodes?.length ?? 0) > 0) append("[redacted]");
-        return;
-      }
-
-      const tag = String(element.tagName ?? "").toLowerCase();
-      if (tag === "input" || tag === "textarea" || tag === "select") {
-        const rawValue = tag === "select"
-          ? element.options?.[element.selectedIndex]?.textContent
-          : element.value;
-        if (rawValue) append(rawValue);
-      }
-
-      for (const node of element.childNodes ?? []) {
-        if (truncated) return;
-        if (node.nodeType === Node.TEXT_NODE) append(node.textContent);
-        else if (node?.tagName) walkElement(node);
-      }
-      const shadow = shadowRootOf(element);
-      if (shadow) {
-        for (const child of shadow.children ?? []) walkElement(child);
-      }
+    function pushFrame(nodes, depth) {
+      if ((nodes?.length ?? 0) > 0) stack.push({ depth, index: 0, nodes });
     }
 
-    for (const element of root?.children ?? []) walkElement(element);
-    return { text, truncated };
+    pushFrame(root?.children ?? [], 1);
+    while (stack.length > 0 && !textTruncated) {
+      const frame = stack.at(-1);
+      if (frame.index >= frame.nodes.length) {
+        stack.pop();
+        continue;
+      }
+      if (visited >= MAX_VISIBLE_TEXT_SCAN_NODES) {
+        scanTruncated = true;
+        break;
+      }
+      const node = frame.nodes[frame.index];
+      frame.index += 1;
+      visited += 1;
+      if (!node) continue;
+      if (frame.depth > MAX_VISIBLE_TEXT_SCAN_DEPTH) {
+        scanTruncated = true;
+        continue;
+      }
+      if (node.nodeType === Node.TEXT_NODE) {
+        append(node.textContent);
+        continue;
+      }
+      const element = node.tagName ? node : null;
+      if (!element || SKIP_TAGS.has(element.tagName)) continue;
+      if (typeof element.getClientRects === "function" && !isVisible(element)) continue;
+      if (isSensitiveField(element)) {
+        if (element.value || element.textContent || (element.childNodes?.length ?? 0) > 0) append("[redacted]");
+        continue;
+      }
+
+      const childNodes = element.childNodes ?? [];
+      const shadowChildren = shadowRootOf(element)?.children ?? [];
+      if (frame.depth >= MAX_VISIBLE_TEXT_SCAN_DEPTH
+        && (childNodes.length > 0 || shadowChildren.length > 0)) {
+        scanTruncated = true;
+        continue;
+      }
+      // Shadow children are pushed first so light DOM remains first in the
+      // LIFO traversal, matching document order from the previous reader.
+      pushFrame(shadowChildren, frame.depth + 1);
+      pushFrame(childNodes, frame.depth + 1);
+    }
+    return { text, truncated: textTruncated || scanTruncated };
   }
 
   function elementFromSelectionNode(node) {

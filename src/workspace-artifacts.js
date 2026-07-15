@@ -15,6 +15,7 @@ const MAX_TEXT_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const MAX_ATOMIC_NAME_ATTEMPTS = 10;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png"]);
+const ARTIFACT_IDENTITY = Symbol("workspaceArtifactIdentity");
 
 export async function writeWorkspaceTextArtifact({
   outputDirectory,
@@ -86,6 +87,13 @@ export async function materializeContextText({
     projectDirectory,
     text: fullText
   });
+  Object.assign(artifact, {
+    originalChars: fullText.length,
+    originalReturnedChars,
+    originalTotalChars,
+    originalTruncated,
+    preview
+  });
   return {
     context: {
       ...context,
@@ -96,14 +104,7 @@ export async function materializeContextText({
         visibleText: originalTruncated || fullText.length > preview.length
       }
     },
-    artifact: {
-      ...artifact,
-      originalChars: fullText.length,
-      originalReturnedChars,
-      originalTotalChars,
-      originalTruncated,
-      preview
-    }
+    artifact
   };
 }
 
@@ -118,38 +119,67 @@ export async function materializeReadPageArtifacts({
     || !result.context || typeof result.context !== "object" || Array.isArray(result.context)) {
     throw new Error("read page result must contain a tab context object");
   }
-  const materialized = typeof outputDirectory === "string" && outputDirectory.length > 0
-    ? await materializeContextText({
-        context: result.context,
-        force: forceText,
+  const screenshotDataUrl = prevalidateReadPageScreenshot(result.screenshot, outputDirectory);
+  const createdArtifacts = [];
+  try {
+    const materialized = typeof outputDirectory === "string" && outputDirectory.length > 0
+      ? await materializeContextText({
+          context: result.context,
+          force: forceText,
+          outputDirectory,
+          previewChars,
+          projectDirectory
+        })
+      : { artifact: null, context: result.context };
+    if (materialized.artifact) createdArtifacts.push(materialized.artifact);
+    let screenshot = null;
+    if (screenshotDataUrl != null) {
+      screenshot = await writeWorkspaceImageArtifact({
+        dataUrl: screenshotDataUrl,
         outputDirectory,
-        previewChars,
+        prefix: "page-screenshot",
         projectDirectory
-      })
-    : { artifact: null, context: result.context };
-  let screenshot = null;
-  if (result.screenshot != null) {
-    if (typeof outputDirectory !== "string" || outputDirectory.length === 0) {
-      throw new Error("outputDirectory is required to materialize a screenshot");
+      });
+      createdArtifacts.push(screenshot);
     }
-    if (typeof result.screenshot !== "object" || Array.isArray(result.screenshot)) {
-      throw new Error("read page screenshot result is invalid");
+    return {
+      ...result,
+      context: {
+        ...materialized.context,
+        visibleTextArtifact: materialized.artifact
+      },
+      screenshot
+    };
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const artifact of createdArtifacts.reverse()) {
+      try {
+        await rollbackWorkspaceArtifact(artifact);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
     }
-    screenshot = await writeWorkspaceImageArtifact({
-      dataUrl: result.screenshot.dataUrl,
-      outputDirectory,
-      prefix: "page-screenshot",
-      projectDirectory
-    });
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        "read page artifact transaction failed and rollback was incomplete"
+      );
+    }
+    throw error;
   }
-  return {
-    ...result,
-    context: {
-      ...materialized.context,
-      visibleTextArtifact: materialized.artifact
-    },
-    screenshot
-  };
+}
+
+function prevalidateReadPageScreenshot(screenshot, outputDirectory) {
+  if (screenshot == null) return null;
+  if (typeof outputDirectory !== "string" || outputDirectory.length === 0) {
+    throw new Error("outputDirectory is required to materialize a screenshot");
+  }
+  if (typeof screenshot !== "object" || Array.isArray(screenshot)) {
+    throw new Error("read page screenshot result is invalid");
+  }
+  const dataUrl = screenshot.dataUrl;
+  decodeSupportedImageDataUrl(dataUrl);
+  return dataUrl;
 }
 
 export function decodeSupportedImageDataUrl(dataUrl) {
@@ -225,14 +255,15 @@ async function writeWorkspaceArtifact({
       finalPublished = true;
       await validatePublishedFile(finalPath, temporaryIdentity, directory);
       await assertWorkspaceDirectoryIdentity(directory);
-      await unlink(temporaryPath);
-      temporaryIdentity = null;
-      return {
+      const artifact = withArtifactIdentity({
         bytes: data.length,
         mimeType,
         path: finalPath,
         relativePath: path.relative(projectRoot, finalPath)
-      };
+      }, temporaryIdentity);
+      await unlink(temporaryPath);
+      temporaryIdentity = null;
+      return artifact;
     } catch (error) {
       await handle?.close().catch(() => {});
       let failure = error;
@@ -343,6 +374,17 @@ async function unlinkIfIdentityMatches(candidatePath, expectedIdentity) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+}
+
+function withArtifactIdentity(artifact, identity) {
+  Object.defineProperty(artifact, ARTIFACT_IDENTITY, { value: identity });
+  return artifact;
+}
+
+async function rollbackWorkspaceArtifact(artifact) {
+  const identity = artifact?.[ARTIFACT_IDENTITY];
+  if (typeof artifact?.path !== "string" || typeof identity !== "string") return;
+  await unlinkIfIdentityMatches(artifact.path, identity);
 }
 
 function exclusiveNoFollowWriteFlags() {

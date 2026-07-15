@@ -339,6 +339,7 @@ test("tabContext injects the isolated page reader with bounded options", async (
 test("readPage returns one combined context and accessibility result with an optional screenshot", async () => {
   const injections = [];
   const captures = [];
+  const order = [];
   const combined = {
     accessibility: {
       nodeCount: 1,
@@ -363,12 +364,26 @@ test("readPage returns one combined context and accessibility result with an opt
   };
   const harness = createBackgroundHarness({
     scriptingExecuteScript: async (injection) => {
+      order.push(injection.files ? "inject" : "read");
       injections.push(injection);
       return injection.files ? [] : [{ result: combined }];
     },
     tabsCaptureVisibleTab: async (windowId, options) => {
+      order.push("capture");
       captures.push({ options, windowId });
       return "data:image/jpeg;base64,/9j/2Q==";
+    },
+    tabsGet: async (tabId) => {
+      order.push("get");
+      return { active: false, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    },
+    tabsUpdate: async (tabId) => {
+      order.push("activate");
+      return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    },
+    windowsUpdate: async (windowId) => {
+      order.push("focus");
+      return { id: windowId };
     }
   });
 
@@ -393,6 +408,7 @@ test("readPage returns one combined context and accessibility result with an opt
   );
   assert.equal(injections.filter((injection) => injection.files).length, 1);
   assert.equal(injections.filter((injection) => typeof injection.func === "function").length, 1);
+  assert.deepEqual(order.slice(0, 5), ["get", "focus", "activate", "inject", "read"]);
   const funcCall = injections.find((injection) => typeof injection.func === "function");
   assert.deepEqual({ ...funcCall.args[0] }, {
     interactiveOnly: false,
@@ -1017,8 +1033,10 @@ function createBackgroundHarness({
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
+  tabsUpdate = async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
-  windowsGet = async (windowId) => ({ id: windowId })
+  windowsGet = async (windowId) => ({ id: windowId }),
+  windowsUpdate = async (windowId) => ({ id: windowId })
 } = {}) {
   const calls = { executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
@@ -1099,14 +1117,14 @@ function createBackgroundHarness({
         calls.sendMessage += 1;
         calls.overlayMessages.push(message);
       },
-      update: async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 })
+      update: tabsUpdate
     },
     windows: {
       create: windowsCreate,
       get: windowsGet,
       getCurrent: async () => ({ id: 1 }),
       onFocusChanged: createEvent(),
-      update: async (windowId) => ({ id: windowId })
+      update: windowsUpdate
     }
   };
   const harnessConsole = Object.create(console);

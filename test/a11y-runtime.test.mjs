@@ -136,6 +136,63 @@ test("tab context redacts sensitive controls and ignores non-visible document te
   }
 });
 
+test("tab context visible text never exports live form control values", () => {
+  const liveSelect = createElement("select");
+  liveSelect.options = [{ textContent: "selected-live-secret" }];
+  liveSelect.selectedIndex = 0;
+  const harness = createA11yHarness([
+    createElement("input", {
+      attributes: { name: "password", type: "text" },
+      value: "name-password-secret"
+    }),
+    createElement("input", {
+      attributes: { name: "api_token", type: "text" },
+      value: "token-field-secret"
+    }),
+    createElement("input", { attributes: { type: "text" }, value: "ordinary-live-value" }),
+    createElement("textarea", { value: "textarea-live-value" }),
+    liveSelect,
+    createElement("input", { attributes: { type: "password" }, value: "direct-password-secret" })
+  ]);
+
+  const context = harness.tabContext({ maxChars: 500 });
+
+  assert.equal(context.visibleText, "[redacted]");
+  for (const secret of [
+    "name-password-secret",
+    "token-field-secret",
+    "ordinary-live-value",
+    "textarea-live-value",
+    "selected-live-secret",
+    "direct-password-secret"
+  ]) {
+    assert.doesNotMatch(context.visibleText, new RegExp(secret, "u"));
+  }
+});
+
+test("tab context bounds visible text scans by node count", () => {
+  const trailing = createElement("p", { text: "after-node-limit" });
+  const elements = [
+    ...Array.from({ length: 10000 }, () => createElement("div")),
+    trailing
+  ];
+  const context = createA11yHarness(elements).tabContext({ maxChars: 500 });
+
+  assert.equal(context.truncated.visibleText, true);
+  assert.doesNotMatch(context.visibleText, /after-node-limit/u);
+});
+
+test("tab context bounds visible text scans by nesting depth", () => {
+  let nested = createElement("span", { text: "after-depth-limit" });
+  for (let depth = 0; depth < 300; depth += 1) {
+    nested = createElement("div", { children: [nested] });
+  }
+  const context = createA11yHarness([nested]).tabContext({ maxChars: 500 });
+
+  assert.equal(context.truncated.visibleText, true);
+  assert.doesNotMatch(context.visibleText, /after-depth-limit/u);
+});
+
 test("tab context redacts custom sensitive fields and selections inside their descendants", () => {
   const nestedText = createElement("span", { text: "5555444433331111" });
   const sensitiveContainer = createElement("div", {
@@ -255,7 +312,7 @@ test("tab context preserves fractional DPR and negative scroll offsets", () => {
 
 test("tab context redacts credential query variants and URL credentials", () => {
   const harness = createA11yHarness([createElement("main", { text: "Page" })], {
-    url: "https://user:pass@example.test/?client_secret=a&refresh-token=b&id_token=c&password_reset_token=d&safe=value#private"
+    url: "https://user:pass@example.test/?client_secret=a&refresh-token=b&id_token=c&password_reset_token=d&X-Amz-Credential=e&X-Amz-Signature=f&X-Amz-Security-Token=g&GoogleAccessId=h&Signature=i&sig=j&safe=value#private"
   });
 
   const context = harness.tabContext({ maxChars: 500 });
@@ -264,7 +321,18 @@ test("tab context redacts credential query variants and URL credentials", () => 
   assert.equal(sanitized.username, "");
   assert.equal(sanitized.password, "");
   assert.equal(sanitized.hash, "");
-  for (const key of ["client_secret", "refresh-token", "id_token", "password_reset_token"]) {
+  for (const key of [
+    "client_secret",
+    "refresh-token",
+    "id_token",
+    "password_reset_token",
+    "X-Amz-Credential",
+    "X-Amz-Signature",
+    "X-Amz-Security-Token",
+    "GoogleAccessId",
+    "Signature",
+    "sig"
+  ]) {
     assert.equal(sanitized.searchParams.get(key), "[redacted]");
   }
   assert.equal(sanitized.searchParams.get("safe"), "value");

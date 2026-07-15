@@ -1713,6 +1713,7 @@ async function readPage(params) {
     maxNodes: clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes"),
     maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
   };
+  if (params.includeScreenshot === true) await activateTab(tabId);
   await injectA11yScript(tabId);
   const combined = await runInA11yWorld(
     tabId,
