@@ -86,27 +86,62 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
-test("release metadata is synchronized for v1.1.0", async () => {
-  const expectedVersion = "1.1.0";
+test("release metadata is synchronized for v1.2.0", async () => {
+  const expectedVersion = "1.2.0";
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
   const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
   const popupHtml = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
   const popupJs = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
   const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  const bridgeClient = await readFile(path.join(repoRoot, "src", "bridge-client.js"), "utf8");
+  const nativeHost = await readFile(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"), "utf8");
 
   assert.equal(packageJson.version, expectedVersion);
   assert.equal(packageLock.version, expectedVersion);
   assert.equal(packageLock.packages[""].version, expectedVersion);
   assert.equal(manifest.version, expectedVersion);
-  assert.match(popupHtml, /<span id="version">v1\.1\.0<\/span>/u);
-  assert.match(popupJs, /"v1\.1\.0"/u);
-  assert.match(readme, /Version-v1\.1\.0-/u);
-  assert.match(readme, /alt="Version v1\.1\.0"/u);
+  assert.match(popupHtml, /<span id="version">v1\.2\.0<\/span>/u);
+  assert.match(popupJs, /"v1\.2\.0"/u);
+  assert.match(readme, /Version-v1\.2\.0-/u);
+  assert.match(readme, /alt="Version v1\.2\.0"/u);
+  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.2\.0"/u);
+  assert.match(nativeHost, /HOST_VERSION = "1\.2\.0"/u);
   assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.17.20");
+});
+
+test("README documents the exact Browser Intelligence public tools and safeguards", async () => {
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  const extractSection = (contents) => contents.match(
+    /### Browser Intelligence\r?\n([\s\S]*?)(?=\r?\n### )/u
+  )?.[1] ?? "";
+  const section = extractSection(readme);
+  assert.equal(
+    extractSection(readme.replace(/\r?\n/gu, "\r\n")).replace(/\r\n/gu, "\n"),
+    section.replace(/\r\n/gu, "\n")
+  );
+  const documentedTools = [...section.matchAll(/\| `(chrome_[a-z_]+)` \|/gu)].map((match) => match[1]);
+  assert.deepEqual(documentedTools, [
+    "chrome_tab_context",
+    "chrome_read_page",
+    "chrome_find",
+    "chrome_wait_for",
+    "chrome_batch"
+  ]);
+  assert.match(section, /25 actions/iu);
+  assert.match(section, /30,?000 ms/iu);
+  assert.match(section, /120,?000 ms/iu);
+  assert.match(section, /outputDirectory[\s\S]*project/iu);
+  assert.match(section, /atomic[\s\S]*collision-safe/iu);
+  assert.match(section, /one (?:OpenCode )?approval/iu);
+  assert.match(section, /allow once[\s\S]*allow always[\s\S]*deny/iu);
+  assert.match(section, /raw CDP|arbitrary CDP/iu);
+  assert.match(section, /stopOnError/u);
+  assert.match(section, /"type": "findElements"/u);
+  assert.match(section, /"type": "waitFor"/u);
 });
 
 test("public repository includes governance and security documents", async () => {

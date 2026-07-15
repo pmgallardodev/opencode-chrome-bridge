@@ -1,4 +1,25 @@
 const HOST_NAME = "com.opencode.chrome_bridge";
+const BRIDGE_PROTOCOL_VERSION = "1.0.0";
+const BRIDGE_CAPABILITIES = Object.freeze([
+  "bridge.handshake",
+  "browser.accessibility",
+  "browser.batch",
+  "browser.bookmarks",
+  "browser.cdp",
+  "browser.console",
+  "browser.downloads",
+  "browser.events",
+  "browser.find",
+  "browser.history",
+  "browser.navigation",
+  "browser.page-context",
+  "browser.screenshots",
+  "browser.tab-groups",
+  "browser.tabs",
+  "browser.wait",
+  "browser.windows",
+  "session.tab-leases"
+]);
 const RECONNECT_ALARM = "opencode-chrome-bridge-reconnect";
 const DEBUGGER_VERSION = "1.3";
 const OVERLAY_SOURCE = "opencode-bridge";
@@ -23,6 +44,35 @@ const MAX_MOVE_DURATION_MS = 30_000;
 const MAX_TAB_IDS = 200;
 const MAX_CDP_METHODS = 100;
 const MAX_QUERY_CHARS = 1000;
+const MAX_FIND_QUERY_CHARS = 500;
+const MAX_FIND_ROLE_CHARS = 50;
+const MAX_FIND_RESULTS = 100;
+const MAX_WAIT_TIMEOUT_MS = 120_000;
+const MIN_WAIT_TIMEOUT_MS = 50;
+const MAX_WAIT_POLL_MS = 1_000;
+const MIN_WAIT_POLL_MS = 10;
+const MAX_WAIT_VALUE_CHARS = 2_000;
+const MAX_NETWORK_REQUEST_STATES = 1_000;
+const MAX_BATCH_ACTIONS = 25;
+const MAX_BATCH_PAYLOAD_BYTES = 100_000;
+const MIN_BATCH_TIMEOUT_MS = 50;
+const MAX_BATCH_ACTION_TIMEOUT_MS = 30_000;
+const MAX_BATCH_TOTAL_TIMEOUT_MS = 120_000;
+const DEFAULT_BATCH_ACTION_TIMEOUT_MS = 10_000;
+const DEFAULT_BATCH_TOTAL_TIMEOUT_MS = 60_000;
+const BATCH_ACTION_METHODS = Object.freeze({
+  activateTab: "activateTab",
+  back: "back",
+  clickElement: "clickElement",
+  fillElement: "fillElement",
+  findElements: "findElements",
+  forward: "forward",
+  getTab: "getTab",
+  navigate: "navigate",
+  reload: "reload",
+  tabContext: "tabContext",
+  waitFor: "waitFor"
+});
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -46,6 +96,13 @@ const consoleLogAttached = new Set();
 // Tabs with a long-lived debugger attached for CDP event subscriptions
 const cdpEventAttached = new Set();
 const cdpEnabledDomains = new Map();
+// Bounded request state shared by deterministic network-idle waits and the
+// high-level network summaries added in the next roadmap phase.
+const networkRequestStates = new Map();
+const networkTrackerAttached = new Set();
+const networkWaitConsumers = new Map();
+const navigationSequences = new Map();
+const activeNativeCommands = new Map();
 const tabLeases = new Map();
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
@@ -60,11 +117,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // (bridgeReady event) or sends any other message. Once ready, an active
     // ping/pong round trip also detects a host that is present but wedged.
     if (nativePort === null || !nativeHostReady) {
-      sendResponse({ connected: false });
+      sendResponse(disconnectedPopupStatus());
       return false;
     }
     pingNativeHost().then((pong) => {
-      sendResponse({ connected: pong });
+      sendResponse(popupStatusFromPong(pong));
     });
     return true;
   }
@@ -89,6 +146,14 @@ function connectNativeHost() {
     nativePort = chrome.runtime.connectNative(HOST_NAME);
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(() => {
+      const disconnectError = new Error("Native host disconnected");
+      for (const controller of activeNativeCommands.values()) controller.abort(disconnectError);
+      activeNativeCommands.clear();
+      for (const pending of pendingPings.values()) {
+        clearTimeout(pending.timer);
+        pending.resolve(null);
+      }
+      pendingPings.clear();
       nativePort = null;
       nativeHostReady = false;
       scheduleReconnect();
@@ -107,22 +172,100 @@ let pingSeq = 1;
 
 function pingNativeHost(timeoutMs = 1000) {
   const port = nativePort;
-  if (!port) return Promise.resolve(false);
+  if (!port) return Promise.resolve(null);
   return new Promise((resolve) => {
     const id = `ping:${pingSeq++}`;
     const timer = setTimeout(() => {
       pendingPings.delete(id);
-      resolve(false);
+      resolve(null);
     }, timeoutMs);
     pendingPings.set(id, { resolve, timer });
     try {
-      port.postMessage({ type: "ping", id });
+      port.postMessage({ type: "ping", id, handshake: createExtensionHandshake() });
     } catch {
       pendingPings.delete(id);
       clearTimeout(timer);
-      resolve(false);
+      resolve(null);
     }
   });
+}
+
+function createExtensionHandshake() {
+  const manifest = chrome.runtime.getManifest();
+  return {
+    capabilities: [...BRIDGE_CAPABILITIES],
+    extensionId: chrome.runtime.id,
+    extensionName: manifest.name,
+    extensionVersion: manifest.version,
+    hostName: HOST_NAME,
+    protocolVersion: BRIDGE_PROTOCOL_VERSION
+  };
+}
+
+function disconnectedPopupStatus() {
+  return {
+    compatible: false,
+    connected: false,
+    diagnostics: [{
+      code: "EXTENSION_DISCONNECTED",
+      message: "The native host is not connected.",
+      repair: "Reload the extension or reinstall the native host."
+    }],
+    extension: createExtensionHandshake(),
+    host: null,
+    missingCapabilities: []
+  };
+}
+
+function popupStatusFromPong(host) {
+  if (host === null) return disconnectedPopupStatus();
+  const validHost = isVersionString(host.version)
+    && isVersionString(host.protocolMin)
+    && isVersionString(host.protocolMax)
+    && host.name === HOST_NAME;
+  if (!validHost) {
+    return {
+      ...disconnectedPopupStatus(),
+      connected: true,
+      diagnostics: [{
+        code: "HOST_HANDSHAKE_MISSING",
+        message: "The native host does not support protocol negotiation.",
+        repair: "Reinstall the current native host."
+      }]
+    };
+  }
+  const protocolCompatible = compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMin) >= 0
+    && compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMax) <= 0;
+  return {
+    compatible: protocolCompatible,
+    connected: true,
+    diagnostics: protocolCompatible ? [] : [{
+      code: "PROTOCOL_INCOMPATIBLE",
+      message: `Extension protocol ${BRIDGE_PROTOCOL_VERSION} is outside the host range ${host.protocolMin}-${host.protocolMax}.`,
+      repair: "Update the extension and native host together."
+    }],
+    extension: createExtensionHandshake(),
+    host: {
+      name: host.name,
+      protocolMax: host.protocolMax,
+      protocolMin: host.protocolMin,
+      version: host.version
+    },
+    missingCapabilities: []
+  };
+}
+
+function isVersionString(value) {
+  return typeof value === "string" && /^\d+\.\d+\.\d+$/u.test(value);
+}
+
+function compareVersions(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
 }
 
 function scheduleReconnect() {
@@ -141,21 +284,31 @@ async function handleNativeMessage(message) {
     if (pending) {
       pendingPings.delete(message.id);
       clearTimeout(pending.timer);
-      pending.resolve(true);
+      pending.resolve(message.host ?? {});
     }
     return;
   }
+  if (message?.type === "cancel" && typeof message.id === "string") {
+    activeNativeCommands.get(message.id)?.abort(new Error(`Chrome command ${message.id} was cancelled`));
+    return;
+  }
   if (message?.type !== "command" || typeof message.id !== "string") return;
+  const controller = new AbortController();
+  activeNativeCommands.set(message.id, controller);
   try {
-    const result = await executeCommand(message.method, message.params ?? {});
+    const result = await executeCommand(message.method, message.params ?? {}, { signal: controller.signal });
+    if (controller.signal.aborted) return;
     postNativeResponse({ type: "response", id: message.id, ok: true, result });
   } catch (error) {
+    if (controller.signal.aborted) return;
     postNativeResponse({
       type: "response",
       id: message.id,
       ok: false,
       error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS)
     });
+  } finally {
+    if (activeNativeCommands.get(message.id) === controller) activeNativeCommands.delete(message.id);
   }
 }
 
@@ -174,14 +327,20 @@ function postNativeResponse(message) {
   }
 }
 
-async function executeCommand(method, params) {
+async function executeCommand(method, params, options = {}) {
   switch (method) {
+    case "handshake":
+      return createExtensionHandshake();
     case "status":
       return { connected: true, extensionId: chrome.runtime.id, hostName: HOST_NAME };
     case "listTabs":
       return (await chrome.tabs.query({})).map(tabInfo);
-    case "getTab":
-      return tabInfo(await chrome.tabs.get(requireTabId(params)));
+    case "getTab": {
+      throwIfAborted(options.signal);
+      const tab = await chrome.tabs.get(requireTabId(params));
+      throwIfAborted(options.signal);
+      return tabInfo(tab);
+    }
     case "createTab": {
       validateOptionalLeaseParams(params);
       const createUrl = params.url ?? "about:blank";
@@ -194,17 +353,23 @@ async function executeCommand(method, params) {
       await chrome.tabs.remove(requireTabId(params));
       return { closed: true };
     case "activateTab":
-      return activateTab(requireTabId(params));
+      return activateTab(requireTabId(params), options.signal);
     case "navigate":
-      return navigateTab(params);
+      return navigateTab(params, options.signal);
     case "reload":
+      throwIfAborted(options.signal);
       await chrome.tabs.reload(requireTabId(params));
+      throwIfAborted(options.signal);
       return { reloaded: true };
     case "back":
+      throwIfAborted(options.signal);
       await chrome.tabs.goBack(requireTabId(params));
+      throwIfAborted(options.signal);
       return { ok: true };
     case "forward":
+      throwIfAborted(options.signal);
       await chrome.tabs.goForward(requireTabId(params));
+      throwIfAborted(options.signal);
       return { ok: true };
     case "screenshot":
       return captureScreenshot(params);
@@ -213,7 +378,7 @@ async function executeCommand(method, params) {
     case "getConsoleLogs":
       return getConsoleLogs(params);
     case "click":
-      return dispatchClick(params);
+      return dispatchClick(params, options.signal);
     case "doubleClick":
       return dispatchDoubleClick(params);
     case "hover":
@@ -288,10 +453,20 @@ async function executeCommand(method, params) {
       return setFaviconBadge(params);
     case "accessibilityTree":
       return accessibilityTree(params);
+    case "tabContext":
+      return tabContext(params, options.signal);
+    case "readPage":
+      return readPage(params, options.signal);
+    case "findElements":
+      return findElements(params, options.signal);
+    case "waitFor":
+      return waitFor(params, options);
+    case "browserBatch":
+      return browserBatch(params, options);
     case "clickElement":
-      return clickElement(params);
+      return clickElement(params, options.signal);
     case "fillElement":
-      return fillElement(params);
+      return fillElement(params, options.signal);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
@@ -315,20 +490,32 @@ function requireTabId(params) {
   return params.tabId;
 }
 
-async function activateTab(tabId) {
+async function activateTab(tabId, signal) {
+  throwIfAborted(signal);
   const tab = await chrome.tabs.get(tabId);
-  if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-  return tabInfo(await chrome.tabs.update(tabId, { active: true }));
+  throwIfAborted(signal);
+  if (tab.windowId !== undefined) {
+    await chrome.windows.update(tab.windowId, { focused: true });
+    throwIfAborted(signal);
+  }
+  const activated = await chrome.tabs.update(tabId, { active: true });
+  throwIfAborted(signal);
+  return tabInfo(activated);
 }
 
-async function navigateTab(params) {
+async function navigateTab(params, signal) {
   const tabId = requireTabId(params);
   if (typeof params.url !== "string" || params.url.length === 0) throw new Error("url must be a non-empty string");
+  throwIfAborted(signal);
   await assertNavigationAllowed(params.url);
+  throwIfAborted(signal);
   validateOptionalLeaseParams(params);
   // Claim before navigating so a tab owned by another session is left untouched.
   await maybeClaimTabFromParams(tabId, params, "user");
-  return tabInfo(await chrome.tabs.update(tabId, { url: params.url }));
+  throwIfAborted(signal);
+  const navigated = await chrome.tabs.update(tabId, { url: params.url });
+  throwIfAborted(signal);
+  return tabInfo(navigated);
 }
 
 async function tabStillExists(tabId) {
@@ -413,18 +600,22 @@ function assertScreenshotPayloadSize(base64Data) {
   }
 }
 
-async function dispatchClick(params) {
+async function dispatchClick(params, signal) {
   const tabId = requireTabId(params);
   const x = requireFiniteNumber(params.x, "x");
   const y = requireFiniteNumber(params.y, "y");
   const button = requireButton(params.button);
   const modifiers = resolveModifiers(params.modifiers);
+  throwIfAborted(signal);
   await withOverlayInputPassThrough(tabId, { x, y }, async () => {
     await withDebugger(tabId, async (target) => {
+      throwIfAborted(signal);
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, modifiers });
+      throwIfAborted(signal);
       await dispatchMousePressAndRelease(target, { button, clickCount: 1, modifiers, x, y });
     });
-  });
+  }, signal);
+  throwIfAborted(signal);
   return { clicked: true };
 }
 
@@ -1299,7 +1490,7 @@ function debuggerKey(debugTarget) {
 }
 
 function isPersistentDebuggerAttached(tabId) {
-  return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId);
+  return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId) || networkTrackerAttached.has(tabId);
 }
 
 async function withDebuggerLock(key, callback) {
@@ -1320,13 +1511,16 @@ async function withDebuggerLock(key, callback) {
 async function releaseDebuggers(params = {}) {
   const tabIds = Array.isArray(params.tabIds)
     ? (params.tabIds.length === 0 ? [] : requireTabIdArray(params.tabIds))
-    : [...new Set([...consoleLogAttached, ...cdpEventAttached])];
+    : [...new Set([...consoleLogAttached, ...cdpEventAttached, ...networkTrackerAttached])];
   for (const tabId of tabIds) {
     const target = { tabId };
     await withDebuggerLock(debuggerKey(target), async () => {
       const attached = isPersistentDebuggerAttached(tabId);
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkWaitConsumers.delete(tabId);
+      networkRequestStates.delete(tabId);
       cdpSubscriptions.delete(tabId);
       cdpEnabledDomains.delete(tabId);
       consoleLogBuffers.delete(tabId);
@@ -1342,16 +1536,22 @@ async function notifyOverlay(tabId, type, data) {
   await sendOverlayMessage(tabId, type, data);
 }
 
-async function withOverlayInputPassThrough(tabId, point, operation) {
-  const overlayInjected = await injectOverlay(tabId);
-  if (overlayInjected) {
-    await sendOverlayMessage(tabId, "agent-input-start", {});
-    await sendOverlayMessage(tabId, "cursor-click", point);
-  }
+async function withOverlayInputPassThrough(tabId, point, operation, signal) {
+  let inputStarted = false;
   try {
+    throwIfAborted(signal);
+    const overlayInjected = await injectOverlay(tabId);
+    throwIfAborted(signal);
+    if (overlayInjected) {
+      await sendOverlayMessage(tabId, "agent-input-start", {});
+      inputStarted = true;
+      throwIfAborted(signal);
+      await sendOverlayMessage(tabId, "cursor-click", point);
+      throwIfAborted(signal);
+    }
     return await operation();
   } finally {
-    if (overlayInjected) await sendOverlayMessage(tabId, "agent-input-end", {});
+    if (inputStarted) await sendOverlayMessage(tabId, "agent-input-end", {});
   }
 }
 
@@ -1420,10 +1620,14 @@ function sendEvent(event) {
 
 function registerBrowserEventListeners() {
   chrome.tabs.onCreated.addListener((tab) => sendEvent({ category: "tabs", type: "tabCreated", tab: tabInfo(tab) }));
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) =>
-    sendEvent({ category: "tabs", type: "tabUpdated", tabId, changeInfo, tab: tabInfo(tab) })
-  );
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo?.status === "loading" || typeof changeInfo?.url === "string") {
+      navigationSequences.set(tabId, (navigationSequences.get(tabId) ?? 0) + 1);
+    }
+    sendEvent({ category: "tabs", type: "tabUpdated", tabId, changeInfo, tab: tabInfo(tab) });
+  });
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    navigationSequences.delete(tabId);
     const persistence = removeClosedTabLease(tabId);
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
@@ -1433,6 +1637,7 @@ function registerBrowserEventListeners() {
     sendEvent({ category: "tabs", type: "tabActivated", tabId: activeInfo.tabId, windowId: activeInfo.windowId })
   );
   chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    navigationSequences.delete(removedTabId);
     const persistence = replaceClosedTabLease(addedTabId, removedTabId);
     persistence.catch(reportLeasePersistenceError);
     sendEvent({ category: "tabs", type: "tabReplaced", addedTabId, removedTabId });
@@ -1449,6 +1654,7 @@ function registerBrowserEventListeners() {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source?.tabId;
     if (!Number.isInteger(tabId)) return;
+    if (networkTrackerAttached.has(tabId)) trackNetworkEvent(tabId, method, params);
     const subscribed = cdpSubscriptions.get(tabId);
     const collectsConsole = consoleLogAttached.has(tabId) && CONSOLE_LOG_METHODS.includes(method);
     if (!collectsConsole && (!subscribed || !subscribed.has(method))) return;
@@ -1465,6 +1671,9 @@ function registerBrowserEventListeners() {
       consoleLogBufferChars.delete(tabId);
       consoleLogAttached.delete(tabId);
       cdpEventAttached.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkWaitConsumers.delete(tabId);
+      networkRequestStates.delete(tabId);
       cdpEnabledDomains.delete(tabId);
       sendEvent({ category: "cdp", type: "cdpDetached", tabId, reason });
     }
@@ -1589,6 +1798,605 @@ async function accessibilityTree(params) {
   return { tabId, ...result };
 }
 
+async function tabContext(params, signal) {
+  const tabId = requireTabId(params);
+  const maxChars = clampInteger(params.maxChars, 100, 200000, 50000, "maxChars");
+  const maxSelectionChars = clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars");
+  throwIfAborted(signal);
+  await injectA11yScript(tabId);
+  throwIfAborted(signal);
+  const result = await runInA11yWorld(
+    tabId,
+    (options) => window.__opencodeTabContext ? window.__opencodeTabContext(options) : null,
+    [{ maxChars, maxSelectionChars }]
+  );
+  throwIfAborted(signal);
+  validateTabContextResult(result, "tab context");
+  return { tabId, ...result };
+}
+
+async function readPage(params, signal) {
+  const tabId = requireTabId(params);
+  const includeScreenshot = params.includeScreenshot === true;
+  const options = {
+    interactiveOnly: params.interactiveOnly === true,
+    maxChars: clampInteger(params.maxChars, 100, 200000, 50000, "maxChars"),
+    maxNodes: clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes"),
+    maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
+  };
+  throwIfAborted(signal);
+  const activatedTab = includeScreenshot ? await activateTab(tabId, signal) : null;
+  throwIfAborted(signal);
+  await injectA11yScript(tabId);
+  throwIfAborted(signal);
+  const combined = await runInA11yWorld(
+    tabId,
+    (readOptions) => {
+      if (!window.__opencodeTabContext || !window.__opencodeA11yGenerate) return null;
+      return {
+        context: window.__opencodeTabContext(readOptions),
+        accessibility: window.__opencodeA11yGenerate(readOptions)
+      };
+    },
+    [options]
+  );
+  throwIfAborted(signal);
+  validateReadPageResult(combined);
+  let screenshot = null;
+  if (includeScreenshot) {
+    throwIfAborted(signal);
+    const currentTab = await chrome.tabs.get(tabId);
+    throwIfAborted(signal);
+    if (!Number.isInteger(activatedTab.windowId)
+      || currentTab.active !== true
+      || currentTab.windowId !== activatedTab.windowId) {
+      throw new Error("read page target tab changed before screenshot capture");
+    }
+    throwIfAborted(signal);
+    screenshot = await captureScreenshot({
+      format: params.screenshotFormat,
+      quality: params.screenshotQuality,
+      windowId: activatedTab.windowId
+    });
+    throwIfAborted(signal);
+  }
+  return {
+    tabId,
+    context: combined.context,
+    accessibility: combined.accessibility,
+    screenshot
+  };
+}
+
+async function findElements(params, signal) {
+  const tabId = requireTabId(params);
+  if (typeof params.query !== "string" || params.query.trim().length === 0) {
+    throw new Error("query must be a non-empty string");
+  }
+  const query = limitString(params.query, "query", MAX_FIND_QUERY_CHARS);
+  let role;
+  if (params.role != null) {
+    if (typeof params.role !== "string" || params.role.trim().length === 0) {
+      throw new Error("role must be a non-empty string when provided");
+    }
+    role = limitString(params.role, "role", MAX_FIND_ROLE_CHARS);
+  }
+  const options = {
+    interactiveOnly: params.interactiveOnly === true,
+    limit: clampInteger(params.limit, 1, MAX_FIND_RESULTS, 20, "limit"),
+    query,
+    role,
+    visibleOnly: params.visibleOnly !== false
+  };
+  throwIfAborted(signal);
+  await injectA11yScript(tabId);
+  throwIfAborted(signal);
+  const result = await runInA11yWorld(
+    tabId,
+    (findOptions) => window.__opencodeA11yFind ? window.__opencodeA11yFind(findOptions) : null,
+    [options]
+  );
+  throwIfAborted(signal);
+  validateFindElementsResult(result);
+  return { tabId, ...result };
+}
+
+function validateFindElementsResult(result) {
+  if (!isRecord(result)
+    || typeof result.query !== "string"
+    || result.query.length > MAX_FIND_QUERY_CHARS
+    || !Array.isArray(result.matches)
+    || result.matches.length > MAX_FIND_RESULTS
+    || !Number.isInteger(result.totalMatches)
+    || result.totalMatches < result.matches.length
+    || typeof result.truncated !== "boolean") {
+    throw new Error("find elements result is invalid");
+  }
+  for (const match of result.matches) {
+    if (!isRecord(match)
+      || Object.prototype.hasOwnProperty.call(match, "value")
+      || typeof match.ref !== "string"
+      || match.ref.length === 0
+      || match.ref.length > MAX_A11Y_REF_CHARS
+      || typeof match.role !== "string"
+      || match.role.length > MAX_FIND_ROLE_CHARS
+      || typeof match.name !== "string"
+      || match.name.length > 500
+      || typeof match.text !== "string"
+      || match.text.length > 500
+      || typeof match.score !== "number"
+      || !Number.isFinite(match.score)
+      || match.score <= 0
+      || typeof match.visible !== "boolean"
+      || typeof match.interactive !== "boolean") {
+      throw new Error("find elements result is invalid");
+    }
+  }
+}
+
+async function browserBatch(params, { signal } = {}) {
+  const batch = await validateBrowserBatch(params);
+  const startedAt = Date.now();
+  const deadline = startedAt + batch.totalTimeoutMs;
+  const results = [];
+  let stoppedAt = null;
+
+  for (let index = 0; index < batch.actions.length; index += 1) {
+    throwIfAborted(signal);
+    const action = batch.actions[index];
+    try {
+      const result = await runBatchAction(action, index, deadline, batch.totalTimeoutMs, signal);
+      results.push({ index, ok: true, result, type: action.type });
+    } catch (error) {
+      throwIfAborted(signal);
+      results.push({
+        error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS),
+        index,
+        ok: false,
+        type: action.type
+      });
+      if (error?.batchActionTimeout === true || error?.batchTotalTimeout === true || batch.stopOnError) {
+        stoppedAt = index;
+        break;
+      }
+    }
+  }
+
+  return {
+    completed: results.length,
+    elapsedMs: Date.now() - startedAt,
+    ok: results.length === batch.actions.length && results.every((result) => result.ok),
+    results,
+    stoppedAt,
+    totalActions: batch.actions.length
+  };
+}
+
+async function validateBrowserBatch(params) {
+  if (!isRecord(params)) throw new Error("browser batch params must be an object");
+  assertBatchFields(params, ["actions", "stopOnError", "totalTimeoutMs"], "browser batch");
+  let serialized;
+  try {
+    serialized = JSON.stringify(params);
+  } catch {
+    throw new Error("browser batch payload must be JSON serializable");
+  }
+  if (new TextEncoder().encode(serialized).byteLength > MAX_BATCH_PAYLOAD_BYTES) {
+    throw new Error(`browser batch payload is too large; max ${MAX_BATCH_PAYLOAD_BYTES} bytes`);
+  }
+  if (!Array.isArray(params.actions) || params.actions.length === 0) {
+    throw new Error("browser batch requires at least one action");
+  }
+  if (params.actions.length > MAX_BATCH_ACTIONS) {
+    throw new Error(`browser batch supports at most ${MAX_BATCH_ACTIONS} actions`);
+  }
+  if (params.stopOnError != null && typeof params.stopOnError !== "boolean") {
+    throw new Error("browser batch stopOnError must be a boolean");
+  }
+  const totalTimeoutMs = strictBatchInteger(
+    params.totalTimeoutMs,
+    MIN_BATCH_TIMEOUT_MS,
+    MAX_BATCH_TOTAL_TIMEOUT_MS,
+    DEFAULT_BATCH_TOTAL_TIMEOUT_MS,
+    "browser batch totalTimeoutMs"
+  );
+  const actions = [];
+  for (let index = 0; index < params.actions.length; index += 1) {
+    actions.push(await validateBatchAction(params.actions[index], index));
+  }
+  return { actions, stopOnError: params.stopOnError !== false, totalTimeoutMs };
+}
+
+async function validateBatchAction(action, index) {
+  if (!isRecord(action)) throw new Error(`batch action ${index} must be an object`);
+  assertBatchFields(action, ["params", "timeoutMs", "type"], `batch action ${index}`);
+  if (typeof action.type !== "string" || !Object.prototype.hasOwnProperty.call(BATCH_ACTION_METHODS, action.type)) {
+    throw new Error(`batch action ${index} type ${String(action.type)} is not allowed`);
+  }
+  if (!isRecord(action.params)) throw new Error(`batch action ${index} params must be an object`);
+  const timeoutMs = strictBatchInteger(
+    action.timeoutMs,
+    MIN_BATCH_TIMEOUT_MS,
+    MAX_BATCH_ACTION_TIMEOUT_MS,
+    DEFAULT_BATCH_ACTION_TIMEOUT_MS,
+    `batch action ${index} timeoutMs`
+  );
+  const normalizedParams = await validateBatchActionParams(action.type, action.params, index);
+  return { params: normalizedParams, timeoutMs, type: action.type };
+}
+
+async function validateBatchActionParams(type, params, index) {
+  const label = `batch action ${index}`;
+  if (["getTab", "activateTab", "reload", "back", "forward"].includes(type)) {
+    assertBatchFields(params, ["tabId"], label);
+    requireTabId(params);
+    return { ...params };
+  }
+  if (type === "navigate") {
+    assertBatchFields(params, ["tabId", "url"], label);
+    requireTabId(params);
+    if (typeof params.url !== "string" || params.url.length === 0 || params.url.length > MAX_WAIT_VALUE_CHARS) {
+      throw new Error(`${label} url must be a non-empty string of at most ${MAX_WAIT_VALUE_CHARS} characters`);
+    }
+    await assertNavigationAllowed(params.url);
+    return { ...params };
+  }
+  if (type === "tabContext") {
+    assertBatchFields(params, ["maxChars", "maxSelectionChars", "tabId"], label);
+    requireTabId(params);
+    strictBatchInteger(params.maxChars, 100, 200_000, 50_000, `${label} maxChars`);
+    strictBatchInteger(params.maxSelectionChars, 1, 10_000, 2_000, `${label} maxSelectionChars`);
+    return { ...params };
+  }
+  if (type === "findElements") {
+    assertBatchFields(params, ["interactiveOnly", "limit", "query", "role", "tabId", "visibleOnly"], label);
+    requireTabId(params);
+    if (typeof params.query !== "string" || params.query.trim().length === 0 || params.query.length > MAX_FIND_QUERY_CHARS) {
+      throw new Error(`${label} query must be a non-empty string of at most ${MAX_FIND_QUERY_CHARS} characters`);
+    }
+    if (params.role != null
+      && (typeof params.role !== "string" || params.role.trim().length === 0 || params.role.length > MAX_FIND_ROLE_CHARS)) {
+      throw new Error(`${label} role must be a non-empty string of at most ${MAX_FIND_ROLE_CHARS} characters`);
+    }
+    optionalBatchBoolean(params.interactiveOnly, `${label} interactiveOnly`);
+    optionalBatchBoolean(params.visibleOnly, `${label} visibleOnly`);
+    strictBatchInteger(params.limit, 1, MAX_FIND_RESULTS, 20, `${label} limit`);
+    return { ...params };
+  }
+  if (type === "waitFor") {
+    assertBatchFields(params, ["condition", "pollIntervalMs", "tabId", "timeoutMs"], label);
+    const condition = validateWaitCondition(params.condition);
+    if (condition.type !== "download") requireTabId(params);
+    strictBatchInteger(params.timeoutMs, MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS, 10_000, `${label} wait timeoutMs`);
+    strictBatchInteger(params.pollIntervalMs, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, 100, `${label} pollIntervalMs`);
+    return { ...params, condition };
+  }
+  if (type === "clickElement") {
+    assertBatchFields(params, ["button", "modifiers", "ref", "tabId"], label);
+    requireTabId(params);
+    requireElementRef(params);
+    requireButton(params.button);
+    if (params.modifiers != null && (!Array.isArray(params.modifiers) || params.modifiers.length > 5)) {
+      throw new Error(`${label} modifiers must be an array of at most 5 modifier names`);
+    }
+    resolveModifiers(params.modifiers);
+    return { ...params };
+  }
+  assertBatchFields(params, ["clear", "ref", "tabId", "text"], label);
+  requireTabId(params);
+  requireElementRef(params);
+  if (typeof params.text !== "string") throw new Error(`${label} text must be a string`);
+  if (params.text.length > MAX_TEXT_CHARS) {
+    throw new Error(`${label} text is too large; max ${MAX_TEXT_CHARS} characters`);
+  }
+  optionalBatchBoolean(params.clear, `${label} clear`);
+  return { ...params };
+}
+
+function runBatchAction(action, index, deadline, totalTimeoutMs, signal) {
+  throwIfAborted(signal);
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    const error = new Error(`browser batch total timeout reached after ${totalTimeoutMs}ms at action ${index}`);
+    error.batchTotalTimeout = true;
+    throw error;
+  }
+  const totalTimeoutWins = remainingMs <= action.timeoutMs;
+  const timeoutMs = Math.min(action.timeoutMs, remainingMs);
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener("abort", onParentAbort, { once: true });
+  let onActionAbort;
+  const abortPromise = new Promise((_, reject) => {
+    onActionAbort = () => reject(controller.signal.reason);
+    controller.signal.addEventListener("abort", onActionAbort, { once: true });
+  });
+  const timer = setTimeout(() => {
+    const error = totalTimeoutWins
+      ? new Error(`browser batch total timeout reached after ${totalTimeoutMs}ms at action ${index}`)
+      : new Error(`browser batch action ${index} timed out after ${action.timeoutMs}ms`);
+    error.batchActionTimeout = !totalTimeoutWins;
+    error.batchTotalTimeout = totalTimeoutWins;
+    controller.abort(error);
+  }, timeoutMs);
+  const execution = Promise.resolve().then(() => executeCommand(
+    BATCH_ACTION_METHODS[action.type],
+    action.params,
+    { signal: controller.signal }
+  ));
+  return Promise.race([execution, abortPromise]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onParentAbort);
+    controller.signal.removeEventListener("abort", onActionAbort);
+  });
+}
+
+function assertBatchFields(value, allowedFields, label) {
+  const unsupported = Object.keys(value).filter((field) => !allowedFields.includes(field));
+  if (unsupported.length > 0) throw new Error(`${label} contains unsupported fields: ${unsupported.join(", ")}`);
+}
+
+function strictBatchInteger(value, min, max, fallback, label) {
+  if (value == null) return fallback;
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${label} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+function optionalBatchBoolean(value, label) {
+  if (value != null && typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+}
+
+async function waitFor(params, { signal } = {}) {
+  const condition = validateWaitCondition(params.condition);
+  const timeoutMs = clampInteger(params.timeoutMs, MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS, 10_000, "timeoutMs");
+  const pollIntervalMs = clampInteger(params.pollIntervalMs, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, 100, "pollIntervalMs");
+  const tabId = condition.type === "download" ? null : requireTabId(params);
+  if (condition.type === "navigation") condition.baseline = navigationSequences.get(tabId) ?? 0;
+  const startedAt = Date.now();
+  let networkConsumer = false;
+
+  try {
+    throwIfAborted(signal);
+    if (["text", "ref", "selector"].includes(condition.type)) await injectA11yScript(tabId);
+    if (condition.type === "networkIdle") {
+      await acquireNetworkWaitTracker(tabId);
+      networkConsumer = true;
+    }
+    while (true) {
+      throwIfAborted(signal);
+      const result = await checkWaitCondition(tabId, condition);
+      throwIfAborted(signal);
+      if (result.matched === true) {
+        return {
+          ...result,
+          elapsedMs: Date.now() - startedAt,
+          matched: true,
+          type: condition.type
+        };
+      }
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) {
+        throw new Error(`timed out waiting for ${condition.type} after ${timeoutMs}ms`);
+      }
+      await abortableSleep(Math.min(pollIntervalMs, remainingMs), signal);
+    }
+  } finally {
+    if (networkConsumer) await releaseNetworkWaitTracker(tabId);
+  }
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled");
+}
+
+function abortableSleep(ms, signal) {
+  if (!signal) return sleep(ms);
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function validateWaitCondition(condition) {
+  if (!isRecord(condition) || typeof condition.type !== "string") {
+    throw new Error("condition must be a typed object");
+  }
+  const type = condition.type;
+  if (!["url", "navigation", "text", "ref", "selector", "networkIdle", "download"].includes(type)) {
+    throw new Error("condition type must be one of: url, navigation, text, ref, selector, networkIdle, download");
+  }
+  const allowedFields = {
+    url: ["type", "value", "match"],
+    navigation: ["type"],
+    text: ["type", "value", "caseSensitive"],
+    ref: ["type", "ref", "visibleOnly"],
+    selector: ["type", "selector", "visibleOnly"],
+    networkIdle: ["type", "idleMs"],
+    download: ["type", "downloadId"]
+  }[type];
+  const unsupported = Object.keys(condition).filter((key) => !allowedFields.includes(key));
+  if (unsupported.length > 0) throw new Error(`${type} condition contains unsupported fields: ${unsupported.join(", ")}`);
+
+  if (type === "url") {
+    const value = requireWaitString(condition.value, "url condition value");
+    const match = condition.match ?? "contains";
+    if (match !== "contains" && match !== "exact") throw new Error("url condition match must be contains or exact");
+    return { type, value, match };
+  }
+  if (type === "navigation") return { type };
+  if (type === "text") {
+    return {
+      type,
+      value: requireWaitString(condition.value, "text condition value"),
+      caseSensitive: optionalWaitBoolean(condition.caseSensitive, false, "text condition caseSensitive")
+    };
+  }
+  if (type === "ref") {
+    return {
+      type,
+      ref: requireElementRef({ ref: condition.ref }),
+      visibleOnly: optionalWaitBoolean(condition.visibleOnly, true, "ref condition visibleOnly")
+    };
+  }
+  if (type === "selector") {
+    return {
+      type,
+      selector: requireWaitString(condition.selector, "selector condition selector"),
+      visibleOnly: optionalWaitBoolean(condition.visibleOnly, true, "selector condition visibleOnly")
+    };
+  }
+  if (type === "networkIdle") {
+    const idleMs = condition.idleMs ?? 500;
+    if (!Number.isInteger(idleMs) || idleMs < 10 || idleMs > 30_000) {
+      throw new Error("idleMs must be an integer from 10 to 30000");
+    }
+    return { type, idleMs };
+  }
+  if (!Number.isInteger(condition.downloadId) || condition.downloadId < 0) {
+    throw new Error("download condition downloadId must be a non-negative integer");
+  }
+  return { type, downloadId: condition.downloadId };
+}
+
+function optionalWaitBoolean(value, fallback, name) {
+  if (value == null) return fallback;
+  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value;
+}
+
+function requireWaitString(value, name) {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string`);
+  return limitString(value, name, MAX_WAIT_VALUE_CHARS);
+}
+
+async function checkWaitCondition(tabId, condition) {
+  if (condition.type === "url") {
+    const tab = await chrome.tabs.get(tabId);
+    const url = typeof tab.url === "string" ? tab.url : "";
+    const matched = condition.match === "exact" ? url === condition.value : url.includes(condition.value);
+    return { matched, url: sanitizeBrowserUrl(url) };
+  }
+  if (condition.type === "navigation") {
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      throw new Error(`tab ${tabId} closed while waiting for navigation`);
+    }
+    const sequence = navigationSequences.get(tabId) ?? 0;
+    return {
+      matched: sequence > condition.baseline && tab.status === "complete",
+      navigationSequence: sequence,
+      status: typeof tab.status === "string" ? tab.status : "unknown",
+      url: sanitizeBrowserUrl(tab.url)
+    };
+  }
+  if (["text", "ref", "selector"].includes(condition.type)) {
+    const result = await runInA11yWorld(
+      tabId,
+      (pageCondition) => window.__opencodeA11yCheck ? window.__opencodeA11yCheck(pageCondition) : null,
+      [condition]
+    );
+    if (!isRecord(result)
+      || result.type !== condition.type
+      || typeof result.matched !== "boolean") {
+      throw new Error(`${condition.type} wait result is invalid`);
+    }
+    if (result.invalid === true) throw new Error(`${condition.type} is invalid`);
+    return { matched: result.matched };
+  }
+  if (condition.type === "networkIdle") {
+    const snapshot = networkIdleSnapshot(tabId);
+    return {
+      ...snapshot,
+      matched: snapshot.overflowed !== true
+        && snapshot.inFlight === 0
+        && snapshot.idleForMs >= condition.idleMs
+    };
+  }
+  const items = await chrome.downloads.search({ id: condition.downloadId });
+  const item = items.find((candidate) => candidate.id === condition.downloadId);
+  if (!item) return { matched: false };
+  if (item.state === "interrupted") {
+    const reason = truncateString(item.error || "unknown error", 200);
+    throw new Error(`Download ${condition.downloadId} was interrupted: ${reason}`);
+  }
+  return {
+    download: normalizeWaitDownload(item),
+    matched: item.state === "complete"
+  };
+}
+
+function normalizeWaitDownload(item) {
+  return {
+    bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : 0,
+    filename: truncateString(item.filename, 2_000),
+    id: item.id,
+    state: item.state,
+    totalBytes: Number.isFinite(item.totalBytes) ? item.totalBytes : -1,
+    url: sanitizeBrowserUrl(item.url)
+  };
+}
+
+function sanitizeBrowserUrl(value) {
+  try {
+    const url = new URL(String(value ?? ""));
+    url.username = "";
+    url.password = "";
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      const normalized = key.toLowerCase().replace(/[_-]/gu, "");
+      if (/(auth|code|credential|key|pass|password|session|sig|signature|token|secret)/u.test(normalized)) {
+        url.searchParams.set(key, "[redacted]");
+      }
+    }
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function validateReadPageResult(result) {
+  if (!isRecord(result)
+    || !isRecord(result.accessibility)
+    || typeof result.accessibility.tree !== "string"
+    || result.accessibility.tree.length > 200000
+    || !isValidTabContextResult(result.context)) {
+    throw new Error("read page result is invalid");
+  }
+}
+
+function validateTabContextResult(result, label) {
+  if (!isValidTabContextResult(result)) throw new Error(`${label} result is invalid`);
+}
+
+function isValidTabContextResult(result) {
+  if (!isRecord(result)
+    || typeof result.visibleText !== "string"
+    || result.visibleText.length > 200000) return false;
+  if (result.returnedChars != null
+    && (!Number.isInteger(result.returnedChars) || result.returnedChars !== result.visibleText.length)) return false;
+  if (result.totalChars != null
+    && (!Number.isInteger(result.totalChars) || result.totalChars < result.visibleText.length)) return false;
+  return true;
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function requireElementRef(params) {
   if (typeof params.ref !== "string" || params.ref.length === 0 || params.ref.length > MAX_A11Y_REF_CHARS) {
     throw new Error("ref must be a non-empty element reference string from accessibilityTree");
@@ -1596,13 +2404,16 @@ function requireElementRef(params) {
   return params.ref;
 }
 
-async function locateElement(tabId, ref) {
+async function locateElement(tabId, ref, signal) {
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const location = await runInA11yWorld(
     tabId,
     (elementRef) => window.__opencodeA11yLocate ? window.__opencodeA11yLocate(elementRef) : null,
     [ref]
   );
+  throwIfAborted(signal);
   if (location.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
@@ -1615,32 +2426,37 @@ async function locateElement(tabId, ref) {
   return location;
 }
 
-async function clickElement(params) {
+async function clickElement(params, signal) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
-  const location = await locateElement(tabId, ref);
+  const location = await locateElement(tabId, ref, signal);
+  throwIfAborted(signal);
   await dispatchClick({
     tabId,
     x: location.x,
     y: location.y,
     button: params.button,
     modifiers: params.modifiers
-  });
+  }, signal);
+  throwIfAborted(signal);
   return { clicked: true, ref, x: location.x, y: location.y, role: location.role, name: location.name };
 }
 
-async function fillElement(params) {
+async function fillElement(params, signal) {
   const tabId = requireTabId(params);
   const ref = requireElementRef(params);
   if (typeof params.text !== "string") throw new Error("text must be a string");
   if (params.text.length > MAX_TEXT_CHARS) throw new Error(`text is too large; max ${MAX_TEXT_CHARS} characters`);
   const clear = params.clear !== false;
+  throwIfAborted(signal);
   await injectA11yScript(tabId);
+  throwIfAborted(signal);
   const focusResult = await runInA11yWorld(
     tabId,
     (elementRef, selectAll) => window.__opencodeA11yFocus ? window.__opencodeA11yFocus(elementRef, selectAll) : null,
     [ref, clear]
   );
+  throwIfAborted(signal);
   if (focusResult.found !== true) {
     throw new Error(`Element ${ref} was not found; capture a fresh accessibilityTree`);
   }
@@ -1651,8 +2467,10 @@ async function fillElement(params) {
     throw new Error(`Element ${ref} could not be focused; it may be disabled or covered`);
   }
   await withDebugger(tabId, async (target) => {
+    throwIfAborted(signal);
     await chrome.debugger.sendCommand(target, "Input.insertText", { text: params.text });
   });
+  throwIfAborted(signal);
   const verifyResult = await runInA11yWorld(
     tabId,
     (elementRef, text, selectedAll) => window.__opencodeA11yVerifyFill
@@ -1660,6 +2478,7 @@ async function fillElement(params) {
       : null,
     [ref, params.text, clear]
   );
+  throwIfAborted(signal);
   if (verifyResult.found !== true) {
     throw new Error(`Element ${ref} was replaced while filling; capture a fresh accessibilityTree`);
   }
@@ -1778,6 +2597,122 @@ async function assertNavigationAllowed(url) {
       throw new Error(`Navigation blocked by policy pattern: ${pattern}`);
     }
   }
+}
+
+async function acquireNetworkWaitTracker(tabId) {
+  const target = { tabId };
+  await withDebuggerLock(debuggerKey(target), async () => {
+    const consumers = networkWaitConsumers.get(tabId) ?? 0;
+    if (consumers > 0) {
+      networkWaitConsumers.set(tabId, consumers + 1);
+      return;
+    }
+    const reused = isPersistentDebuggerAttached(tabId);
+    let attachedHere = false;
+    try {
+      if (!reused) {
+        await chrome.debugger.attach(target, DEBUGGER_VERSION);
+        attachedHere = true;
+      }
+      const trackingSince = Date.now();
+      networkRequestStates.set(tabId, {
+        lastActivityAt: trackingSince,
+        overflowed: false,
+        requests: new Map(),
+        trackingSince
+      });
+      networkTrackerAttached.add(tabId);
+      networkWaitConsumers.set(tabId, 1);
+      await enableRequiredCdpDomain(target, "Network");
+    } catch (error) {
+      networkWaitConsumers.delete(tabId);
+      networkTrackerAttached.delete(tabId);
+      networkRequestStates.delete(tabId);
+      if (attachedHere) {
+        cdpEnabledDomains.delete(tabId);
+        await chrome.debugger.detach(target).catch(() => {});
+      }
+      throw error;
+    }
+  });
+}
+
+async function releaseNetworkWaitTracker(tabId) {
+  const target = { tabId };
+  await withDebuggerLock(debuggerKey(target), async () => {
+    const consumers = networkWaitConsumers.get(tabId) ?? 0;
+    if (consumers > 1) {
+      networkWaitConsumers.set(tabId, consumers - 1);
+      return;
+    }
+    networkWaitConsumers.delete(tabId);
+    networkTrackerAttached.delete(tabId);
+    networkRequestStates.delete(tabId);
+    if (!isPersistentDebuggerAttached(tabId)) {
+      cdpEnabledDomains.delete(tabId);
+      await chrome.debugger.detach(target).catch(() => {});
+    }
+  });
+}
+
+async function enableRequiredCdpDomain(target, domain) {
+  const tabId = target.tabId;
+  const enabled = cdpEnabledDomains.get(tabId) ?? new Set();
+  if (!enabled.has(domain)) {
+    await chrome.debugger.sendCommand(target, `${domain}.enable`, {});
+    enabled.add(domain);
+    cdpEnabledDomains.set(tabId, enabled);
+  }
+}
+
+function trackNetworkEvent(tabId, method, params) {
+  if (!["Network.requestWillBeSent", "Network.loadingFinished", "Network.loadingFailed"].includes(method)) return;
+  const state = networkRequestStates.get(tabId);
+  const requestId = typeof params?.requestId === "string" ? params.requestId : "";
+  if (!state || requestId.length === 0 || requestId.length > 500) return;
+  const now = Date.now();
+  state.lastActivityAt = now;
+
+  if (method === "Network.requestWillBeSent") {
+    let entry = state.requests.get(requestId);
+    if (!entry && state.requests.size >= MAX_NETWORK_REQUEST_STATES) {
+      const completedId = [...state.requests].find(([, candidate]) => candidate.inFlight === false)?.[0];
+      if (completedId) state.requests.delete(completedId);
+      else {
+        state.overflowed = true;
+        return;
+      }
+    }
+    entry = entry ?? { requestId };
+    entry.inFlight = true;
+    entry.startedAt = now;
+    entry.finishedAt = null;
+    state.requests.delete(requestId);
+    state.requests.set(requestId, entry);
+    return;
+  }
+
+  const entry = state.requests.get(requestId);
+  if (entry) {
+    entry.inFlight = false;
+    entry.finishedAt = now;
+    entry.failed = method === "Network.loadingFailed";
+  }
+}
+
+function networkIdleSnapshot(tabId) {
+  const state = networkRequestStates.get(tabId);
+  if (!state) return { idleForMs: 0, inFlight: 0, overflowed: true, trackingSince: null };
+  let inFlight = 0;
+  for (const request of state.requests.values()) {
+    if (request.inFlight === true) inFlight += 1;
+  }
+  return {
+    idleForMs: Math.max(0, Date.now() - state.lastActivityAt),
+    inFlight,
+    overflowed: state.overflowed,
+    trackingSince: state.trackingSince
+  };
 }
 
 async function ensureConsoleLogDebugger(tabId) {
@@ -1907,8 +2842,10 @@ async function detachCdpEventDebuggerIfIdle(tabId) {
   await withDebuggerLock(debuggerKey(target), async () => {
     if (cdpSubscriptions.has(tabId) || !cdpEventAttached.has(tabId)) return;
     cdpEventAttached.delete(tabId);
-    cdpEnabledDomains.delete(tabId);
-    if (!consoleLogAttached.has(tabId)) await chrome.debugger.detach(target).catch(() => {});
+    if (!isPersistentDebuggerAttached(tabId)) {
+      cdpEnabledDomains.delete(tabId);
+      await chrome.debugger.detach(target).catch(() => {});
+    }
   });
 }
 

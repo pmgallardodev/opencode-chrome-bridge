@@ -3,7 +3,8 @@ import os from "node:os";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin, { TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
+import * as pluginModule from "../src/opencode-plugin.js";
 import { writeDataUrlToFile } from "../src/bridge-client.js";
 import { createLauncher, isSupportedNodeVersion, nativeHostLayout } from "../scripts/lib/platform-support.mjs";
 
@@ -227,6 +228,8 @@ test("native host validates local bridge command requests before forwarding to C
   assert.match(nativeHost, /MAX_EVENT_SUBSCRIBERS/u, "SSE subscribers must be bounded");
   assert.match(nativeHost, /if \(!subscriber\.write/u, "slow SSE subscribers must be disconnected instead of buffering indefinitely");
   assert.match(nativeHost, /server\.headersTimeout/u, "local HTTP headers must have a finite timeout");
+  assert.match(nativeHost, /type:\s*"cancel",\s*id/u, "timed-out commands must cancel extension work");
+  assert.match(nativeHost, /Math\.min\(parsed,\s*125000\)/u, "host timeout must leave five seconds for extension cleanup");
   assert.match(nativeHost, /"Cache-Control": "no-store"/u, "JSON responses containing browser data must not be cached");
   assert.match(nativeHost, /"X-Content-Type-Options": "nosniff"/u, "JSON responses must disable MIME sniffing");
 });
@@ -237,6 +240,7 @@ test("bridge client aborts stalled local HTTP requests", async () => {
   assert.match(source, /AbortController/u, "bridge client must create an AbortController for fetch");
   assert.match(source, /setTimeout/u, "bridge client must enforce a client-side timeout");
   assert.match(source, /clearTimeout/u, "bridge client must clear the timeout after fetch settles");
+  assert.match(source, /MAX_REQUEST_TIMEOUT_MS\s*=\s*126000/u, "client timeout must outlive the maximum native-host command timeout");
   assert.match(source, /await open\(STATE_PATH, "r"\)/u, "bridge client must validate the opened state file rather than a racy path");
   assert.match(source, /stateInfo\.mode & 0o077/u, "bridge client must reject a state token readable by other users");
   assert.match(source, /stateInfo\.uid !== process\.getuid\(\)/u, "bridge client must reject state owned by another user");
@@ -490,6 +494,159 @@ test("OpenCode plugin exposes chrome_wizard_step, chrome_screenshot_region, and 
   );
 });
 
+test("OpenCode plugin exposes bounded tab context and combined page reading tools", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  for (const toolName of ["chrome_tab_context", "chrome_read_page"]) {
+    assert.ok(plugin.tool[toolName], `${toolName} tool missing`);
+    assert.match(plugin.tool[toolName].description, /page|context/iu);
+  }
+  assert.match(plugin.tool.chrome_tab_context.description, /selection|visible text/iu);
+  assert.match(plugin.tool.chrome_read_page.description, /accessibility|screenshot/iu);
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /chrome_tab_context[\s\S]{0,3000}maxChars[\s\S]{0,1000}outputDirectory/u);
+  assert.match(source, /chrome_read_page[\s\S]{0,4000}includeScreenshot[\s\S]{0,1500}outputDirectory/u);
+  assert.match(source, /bridgeCommand\("tabContext"/u);
+  assert.match(source, /bridgeCommand\("readPage"/u);
+});
+
+test("OpenCode plugin exposes ranked page finding with an explicit capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  assert.ok(plugin.tool.chrome_find, "chrome_find tool missing");
+  assert.match(plugin.tool.chrome_find.description, /rank|find|element/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_find],
+    ["bridge.handshake", "browser.find", "browser.tabs"]
+  );
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /bridgeCommand\("findElements"/u);
+  assert.match(source, /chrome_find[\s\S]{0,2500}interactiveOnly[\s\S]{0,1000}visibleOnly/u);
+});
+
+test("OpenCode plugin exposes one typed deterministic wait tool and capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  assert.ok(plugin.tool.chrome_wait_for, "chrome_wait_for tool missing");
+  assert.match(plugin.tool.chrome_wait_for.description, /wait|condition/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_wait_for],
+    ["bridge.handshake", "browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"]
+  );
+  assert.equal(typeof pluginModule.requiredCapabilitiesForTool, "function");
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "download" } }),
+    ["bridge.handshake", "browser.downloads", "browser.wait"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "networkIdle" } }),
+    ["bridge.handshake", "browser.cdp", "browser.tabs", "browser.wait"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_wait_for", { condition: { type: "text" } }),
+    ["bridge.handshake", "browser.tabs", "browser.wait"]
+  );
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /bridgeCommand\("waitFor"/u);
+  for (const type of ["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]) {
+    assert.match(source, new RegExp(`"${type}"`, "u"), `missing wait condition ${type}`);
+  }
+});
+
+test("wait condition schemas are strict discriminated unions for every condition type", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const conditionSchema = plugin.tool.chrome_wait_for.args.condition;
+  const validConditions = [
+    { type: "url", value: "/ready", match: "contains" },
+    { type: "navigation" },
+    { type: "text", value: "Ready", caseSensitive: false },
+    { type: "ref", ref: "e1", visibleOnly: true },
+    { type: "selector", selector: "button", visibleOnly: false },
+    { type: "networkIdle", idleMs: 500 },
+    { type: "download", downloadId: 7 }
+  ];
+  for (const condition of validConditions) {
+    assert.equal(conditionSchema.safeParse(condition).success, true, `valid ${condition.type} condition rejected`);
+  }
+
+  const invalidConditions = [
+    { type: "url" },
+    { type: "navigation", value: "/wrong-field" },
+    { type: "text", caseSensitive: false },
+    { type: "ref", visibleOnly: true },
+    { type: "selector", visibleOnly: true },
+    { type: "networkIdle", idleMs: 9 },
+    { type: "download" },
+    { type: "text", value: "Ready", selector: "button" }
+  ];
+  for (const condition of invalidConditions) {
+    assert.equal(conditionSchema.safeParse(condition).success, false, `invalid ${condition.type} condition accepted`);
+  }
+});
+
+test("OpenCode plugin exposes one approved typed batch with negotiated action capabilities", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  assert.ok(plugin.tool.chrome_batch, "chrome_batch tool missing");
+  assert.match(plugin.tool.chrome_batch.description, /sequential|batch/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_batch],
+    ["bridge.handshake", "browser.batch"]
+  );
+  assert.deepEqual(
+    pluginModule.requiredCapabilitiesForTool("chrome_batch", {
+      actions: [
+        { type: "getTab", params: { tabId: 7 } },
+        { type: "findElements", params: { tabId: 7, query: "Checkout" } },
+        { type: "waitFor", params: { tabId: 7, condition: { type: "text", value: "Done" } } }
+      ]
+    }),
+    ["bridge.handshake", "browser.batch", "browser.find", "browser.tabs", "browser.wait"]
+  );
+
+  const asks = [];
+  await assert.rejects(
+    plugin.tool.chrome_batch.execute({
+      actions: [
+        { type: "getTab", params: { tabId: 7 } },
+        { type: "getTab", params: { tabId: 8 } }
+      ]
+    }, {
+      directory: repoRoot,
+      ask: async (request) => {
+        asks.push(request);
+        throw new Error("approval probe");
+      }
+    }),
+    /approval probe/u
+  );
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0].permission, "chrome_batch");
+  assert.equal(asks[0].metadata.actionCount, 2);
+});
+
+test("chrome_batch publishes a strict bounded allowlist without raw CDP or meta-actions", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  for (const type of [
+    "getTab", "activateTab", "navigate", "reload", "back", "forward",
+    "tabContext", "findElements", "waitFor", "clickElement", "fillElement"
+  ]) {
+    assert.match(source, new RegExp(`batchAction[\\s\\S]{0,12000}\"${type}\"`, "u"), `batch schema missing ${type}`);
+  }
+  assert.match(source, /actions:[\s\S]{0,300}\.min\(1\)\.max\(25\)/u);
+  assert.match(source, /totalTimeoutMs:[\s\S]{0,200}\.min\(50\)\.max\(120000\)/u);
+  assert.doesNotMatch(source, /batchAction[\s\S]{0,12000}literal\("(?:cdpCommand|browserBatch|workflow|scheduler|meta)"\)/u);
+  const actionsSchema = plugin.tool.chrome_batch.args.actions;
+  const getTab = (timeoutMs) => [{ type: "getTab", params: { tabId: 7 }, timeoutMs }];
+  assert.equal(actionsSchema.safeParse(getTab(50)).success, true);
+  assert.equal(actionsSchema.safeParse(getTab(30_000)).success, true);
+  assert.equal(actionsSchema.safeParse(getTab(49)).success, false);
+  assert.equal(actionsSchema.safeParse(getTab(30_001)).success, false);
+});
+
 test("dangerous and private-data tools require user approval before running", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const gatedTools = Object.keys(plugin.tool).filter((name) => name !== "chrome_status");
@@ -516,6 +673,14 @@ test("only the bridge status probe runs without browser-data approval", async ()
   const context = { directory: repoRoot, ask: async () => { asked = true; } };
   await plugin.tool.chrome_status.execute({}, context).catch(() => {});
   assert.equal(asked, false);
+});
+
+test("approved browser tools preflight negotiated capabilities before execution", async () => {
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+
+  assert.match(source, /requireBridgeCapabilities/u);
+  assert.match(source, /requiredCapabilitiesForTool\(name, args\)/u);
+  assert.match(source, /await context\.ask[\s\S]*await requireBridgeCapabilities/u);
 });
 
 test("approval gate fails closed when the host runtime lacks context.ask", async () => {

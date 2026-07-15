@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
+import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/opencode-plugin.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const backgroundSource = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
@@ -206,6 +207,21 @@ test("bridge status reports connected only after the native host sends a message
   assert.equal(await harness.bridgeStatus(), true);
 });
 
+test("extension handshake exposes a stable sorted capability contract", async () => {
+  const harness = createBackgroundHarness();
+
+  const result = await harness.execute("handshake", {});
+
+  assert.equal(result.extensionId, "test-extension");
+  assert.equal(result.extensionVersion, "1.2.0");
+  assert.equal(result.hostName, "com.opencode.chrome_bridge");
+  assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
+  assert.ok(result.capabilities.includes("bridge.handshake"));
+  assert.equal(JSON.stringify(result.capabilities), JSON.stringify([...result.capabilities].sort()));
+  assert.equal(new Set(result.capabilities).size, result.capabilities.length);
+  assert.equal(JSON.stringify(result.capabilities), JSON.stringify(ALL_TOOL_REQUIRED_CAPABILITIES));
+});
+
 test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {
   let tabGone = false;
   const harness = createBackgroundHarness({
@@ -282,6 +298,719 @@ test("accessibilityTree injects the snapshot script and returns its result", asy
   const funcCall = injections.find((injection) => typeof injection.func === "function");
   assert.equal(funcCall.args[0].maxNodes, 800);
   assert.equal(funcCall.args[0].interactiveOnly, false);
+});
+
+test("tabContext injects the isolated page reader with bounded options", async () => {
+  const injections = [];
+  const contextResult = {
+    dimensions: {
+      document: { height: 2000, width: 1200 },
+      viewport: { deviceScaleFactor: 2, height: 700, scrollX: 0, scrollY: 10, width: 1100 }
+    },
+    mimeType: "text/html",
+    selectedElementRefs: ["e4"],
+    selection: { refs: ["e4"], text: "Selected" },
+    title: "Example",
+    truncated: { selection: false, visibleText: false },
+    url: "https://example.com/",
+    visibleText: "Visible page text"
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      return injection.files ? [] : [{ result: contextResult }];
+    }
+  });
+
+  const result = await harness.execute("tabContext", {
+    maxChars: 3210,
+    maxSelectionChars: 456,
+    tabId: 7
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.visibleText, "Visible page text");
+  assert.deepEqual([...result.selectedElementRefs], ["e4"]);
+  assert.ok(injections.some((injection) => injection.files?.[0] === "content-scripts/a11y.js"));
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, { maxChars: 3210, maxSelectionChars: 456 });
+});
+
+test("readPage returns one combined context and accessibility result with an optional screenshot", async () => {
+  const injections = [];
+  const captures = [];
+  const order = [];
+  let tabReads = 0;
+  const combined = {
+    accessibility: {
+      nodeCount: 1,
+      title: "Example",
+      tree: '[e1] button "Continue"',
+      truncated: false,
+      url: "https://example.com/"
+    },
+    context: {
+      dimensions: {
+        document: { height: 1200, width: 900 },
+        viewport: { deviceScaleFactor: 1, height: 720, scrollX: 0, scrollY: 0, width: 900 }
+      },
+      mimeType: "text/html",
+      selectedElementRefs: [],
+      selection: { refs: [], text: "" },
+      title: "Example",
+      truncated: { selection: false, visibleText: false },
+      url: "https://example.com/",
+      visibleText: "Page text"
+    }
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      order.push(injection.files ? "inject" : "read");
+      injections.push(injection);
+      return injection.files ? [] : [{ result: combined }];
+    },
+    tabsCaptureVisibleTab: async (windowId, options) => {
+      order.push("capture");
+      captures.push({ options, windowId });
+      return "data:image/jpeg;base64,/9j/2Q==";
+    },
+    tabsGet: async (tabId) => {
+      tabReads += 1;
+      order.push("get");
+      return { active: tabReads > 1, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    },
+    tabsUpdate: async (tabId) => {
+      order.push("activate");
+      return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 };
+    },
+    windowsUpdate: async (windowId) => {
+      order.push("focus");
+      return { id: windowId };
+    }
+  });
+
+  const result = await harness.execute("readPage", {
+    includeScreenshot: true,
+    interactiveOnly: false,
+    maxChars: 4000,
+    maxNodes: 200,
+    maxSelectionChars: 300,
+    screenshotFormat: "jpeg",
+    screenshotQuality: 72,
+    tabId: 7
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.context.visibleText, "Page text");
+  assert.match(result.accessibility.tree, /Continue/u);
+  assert.equal(result.screenshot.dataUrl, "data:image/jpeg;base64,/9j/2Q==");
+  assert.equal(
+    JSON.stringify(captures),
+    JSON.stringify([{ options: { format: "jpeg", quality: 72 }, windowId: 1 }])
+  );
+  assert.equal(injections.filter((injection) => injection.files).length, 1);
+  assert.equal(injections.filter((injection) => typeof injection.func === "function").length, 1);
+  assert.deepEqual(order, ["get", "focus", "activate", "inject", "read", "get", "capture"]);
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, {
+    interactiveOnly: false,
+    maxChars: 4000,
+    maxNodes: 200,
+    maxSelectionChars: 300
+  });
+});
+
+test("readPage fails before capture when the activated tab changes", async () => {
+  let captures = 0;
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    },
+    tabsGet: async (tabId) => {
+      tabReads += 1;
+      return {
+        active: false,
+        id: tabId,
+        index: 0,
+        title: "Example",
+        url: "https://example.com",
+        windowId: 1
+      };
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("readPage", { includeScreenshot: true, tabId: 7 }),
+    /target tab changed before screenshot capture/u
+  );
+  assert.equal(tabReads, 2);
+  assert.equal(captures, 0);
+});
+
+test("readPage omits screenshot capture unless explicitly requested", async () => {
+  let captures = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+
+  const result = await harness.execute("readPage", { tabId: 7 });
+
+  assert.equal(result.screenshot, null);
+  assert.equal(captures, 0);
+});
+
+test("readPage cancellation stops browser work before screenshot capture", async () => {
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  const delayedRead = new Promise((resolve) => { releaseRead = resolve; });
+  let captures = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      markReadStarted();
+      await delayedRead;
+      return [{
+        result: {
+          accessibility: { nodeCount: 0, tree: "", truncated: false },
+          context: { visibleText: "Page text" }
+        }
+      }];
+    },
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+  const controller = new AbortController();
+
+  const result = harness.execute(
+    "readPage",
+    { includeScreenshot: true, tabId: 7 },
+    { signal: controller.signal }
+  );
+  await readStarted;
+  controller.abort(new Error("read page cancelled"));
+  releaseRead();
+
+  await assert.rejects(result, /cancelled/u);
+  assert.equal(captures, 0);
+});
+
+test("tabContext and readPage fail closed on malformed isolated-world results", async () => {
+  const malformedContext = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { visibleText: 42 } }]
+  });
+  await assert.rejects(
+    malformedContext.execute("tabContext", { tabId: 7 }),
+    /tab context result is invalid/u
+  );
+
+  const malformedRead = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { accessibility: null, context: null } }]
+  });
+  await assert.rejects(
+    malformedRead.execute("readPage", { tabId: 7 }),
+    /read page result is invalid/u
+  );
+});
+
+test("findElements injects the isolated finder and returns bounded ranked matches", async () => {
+  const injections = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      return injection.files ? [] : [{
+        result: {
+          matches: [{
+            interactive: true,
+            name: "Save account",
+            ref: "e2",
+            role: "button",
+            score: 2200,
+            text: "Save account",
+            visible: true
+          }],
+          query: "save account",
+          totalMatches: 1,
+          truncated: false
+        }
+      }];
+    }
+  });
+
+  const result = await harness.execute("findElements", {
+    interactiveOnly: true,
+    limit: 7,
+    query: "save account",
+    role: "button",
+    tabId: 7,
+    visibleOnly: true
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.matches[0].ref, "e2");
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, {
+    interactiveOnly: true,
+    limit: 7,
+    query: "save account",
+    role: "button",
+    visibleOnly: true
+  });
+});
+
+test("findElements validates query limits and isolated-world output", async () => {
+  let injectionCalls = 0;
+  const invalidInput = createBackgroundHarness({
+    scriptingExecuteScript: async () => { injectionCalls += 1; return []; }
+  });
+  await assert.rejects(
+    invalidInput.execute("findElements", { tabId: 7, query: "" }),
+    /query must be a non-empty string/u
+  );
+  await assert.rejects(
+    invalidInput.execute("findElements", { tabId: 7, query: "x".repeat(501) }),
+    /query is too large/u
+  );
+  assert.equal(injectionCalls, 0);
+
+  const malformedOutput = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { matches: [{ ref: "e1", score: "high" }] } }]
+  });
+  await assert.rejects(
+    malformedOutput.execute("findElements", { tabId: 7, query: "save" }),
+    /find elements result is invalid/u
+  );
+});
+
+test("waitFor validates one typed condition and bounds its timing controls", async () => {
+  const harness = createBackgroundHarness();
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "url", value: "https://example.com", selector: "#also" },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 50
+    }),
+    /url condition contains unsupported fields/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", { condition: { type: "text" }, tabId: 7, timeoutMs: 50 }),
+    /text condition value must be a non-empty string/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", { condition: { type: "unknown" }, tabId: 7, timeoutMs: 50 }),
+    /condition type must be one of/u
+  );
+  for (const condition of [
+    { type: "text", value: "ready", caseSensitive: "false" },
+    { type: "ref", ref: "e1", visibleOnly: 1 },
+    { type: "selector", selector: "button", visibleOnly: "true" }
+  ]) {
+    await assert.rejects(
+      harness.execute("waitFor", { condition, tabId: 7, timeoutMs: 50 }),
+      /must be a boolean/u
+    );
+  }
+  for (const idleMs of [9, 30_001]) {
+    await assert.rejects(
+      harness.execute("waitFor", {
+        condition: { type: "networkIdle", idleMs },
+        tabId: 7,
+        timeoutMs: 50
+      }),
+      /idleMs must be an integer from 10 to 30000/u
+    );
+  }
+});
+
+test("waitFor observes URL and only navigation that starts after the wait baseline", async () => {
+  let urlReads = 0;
+  const urlHarness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: true,
+      id: tabId,
+      status: "complete",
+      url: ++urlReads < 2 ? "https://example.com/start" : "https://example.com/ready",
+      windowId: 1
+    })
+  });
+  const urlResult = await urlHarness.execute("waitFor", {
+    condition: { type: "url", value: "/ready", match: "contains" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  assert.equal(urlResult.matched, true);
+  assert.equal(urlResult.type, "url");
+  assert.match(urlResult.url, /\/ready$/u);
+
+  const alreadyComplete = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ id: tabId, status: "complete", url: "https://example.com/ready", windowId: 1 })
+  });
+  await assert.rejects(alreadyComplete.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 50
+  }), /timed out waiting for navigation/u);
+
+  let status = "complete";
+  const navigationHarness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: true,
+      id: tabId,
+      status,
+      url: "https://example.com/same-url",
+      windowId: 1
+    })
+  });
+  const navigationWaiting = navigationHarness.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  status = "loading";
+  await navigationHarness.events.tabsOnUpdated.emit(7, { status: "loading" }, {
+    id: 7, status, url: "https://example.com/same-url", windowId: 1
+  });
+  status = "complete";
+  await navigationHarness.events.tabsOnUpdated.emit(7, { status: "complete" }, {
+    id: 7, status, url: "https://example.com/same-url", windowId: 1
+  });
+  const navigationResult = await navigationWaiting;
+  assert.equal(navigationResult.type, "navigation");
+  assert.equal(navigationResult.status, "complete");
+  assert.equal(navigationResult.url, "https://example.com/same-url");
+});
+
+test("waitFor navigation fails promptly when its tab closes", async () => {
+  let closed = false;
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      if (closed) throw new Error(`No tab with id: ${tabId}`);
+      return { id: tabId, status: "complete", url: "https://example.com", windowId: 1 };
+    }
+  });
+
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "navigation" },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  closed = true;
+  await harness.events.tabsOnRemoved.emit(7, { windowId: 1, isWindowClosing: false });
+
+  await assert.rejects(waiting, /tab 7 closed while waiting for navigation/iu);
+});
+
+test("waitFor checks text, live refs, and selectors only through the isolated helper", async () => {
+  const callsByType = new Map();
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      if (injection.files) return [];
+      const condition = injection.args[0];
+      callsByType.set(condition.type, (callsByType.get(condition.type) ?? 0) + 1);
+      if (condition.type === "selector" && condition.selector === "[") {
+        return [{ result: { invalid: true, matched: false, type: "selector" } }];
+      }
+      return [{ result: {
+        matched: condition.type === "ref" ? false : (callsByType.get(condition.type) >= 2),
+        type: condition.type
+      } }];
+    }
+  });
+
+  for (const condition of [
+    { type: "text", value: "Ready", caseSensitive: false },
+    { type: "selector", selector: "[data-ready]", visibleOnly: true }
+  ]) {
+    const result = await harness.execute("waitFor", {
+      condition,
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 200
+    });
+    assert.equal(result.type, condition.type);
+    assert.equal(result.matched, true);
+  }
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "ref", ref: "e99", visibleOnly: true },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 50
+    }),
+    /timed out waiting for ref after 50ms/u
+  );
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "selector", selector: "[", visibleOnly: true },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 100
+    }),
+    /selector is invalid/u
+  );
+});
+
+test("network-idle waits reset on activity and preserve console debugger consumers", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7 });
+
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 500
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.requestWillBeSent",
+    { requestId: "request-1", timestamp: 1 }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.loadingFinished",
+    { requestId: "request-1", timestamp: 2 }
+  );
+
+  const result = await waiting;
+  assert.equal(result.type, "networkIdle");
+  assert.equal(result.inFlight, 0);
+  assert.ok(result.idleForMs >= 40);
+  assert.ok(Number.isFinite(result.trackingSince), "network waits must disclose when request observation began");
+  assert.equal(harness.calls.debuggerDetach.length, 0, "network wait cleanup must preserve the console debugger");
+
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Console.messageAdded",
+    { message: { level: "info", text: "still collecting" } }
+  );
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs[0].text, "still collecting");
+});
+
+test("network-idle tracks requests emitted while Network.enable is in flight", async () => {
+  let harness;
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Network.enable") {
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 },
+          "Network.requestWillBeSent",
+          { requestId: "during-enable", timestamp: 1 }
+        );
+      }
+      return {};
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("waitFor", {
+      condition: { type: "networkIdle", idleMs: 30 },
+      pollIntervalMs: 10,
+      tabId: 7,
+      timeoutMs: 80
+    }),
+    /timed out waiting for networkIdle after 80ms/u
+  );
+});
+
+test("network-idle request accounting is bounded and overflow fails closed", async () => {
+  const harness = createBackgroundHarness();
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 30 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 100
+  });
+  const rejection = assert.rejects(waiting, /timed out waiting for networkIdle after 100ms/u);
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  for (let index = 0; index <= 1_000; index += 1) {
+    await harness.events.debuggerOnEvent.emit(
+      { tabId: 7 },
+      "Network.requestWillBeSent",
+      { requestId: `request-${index}`, timestamp: index }
+    );
+  }
+
+  const state = harness.networkTrackerState(7);
+  assert.equal(state.inFlight, 1_000);
+  assert.equal(state.overflowed, true);
+  assert.equal(state.requestCount, 1_000);
+  await rejection;
+});
+
+test("native cancel aborts waitFor promptly, releases its debugger, and suppresses a late response", async () => {
+  const harness = createBackgroundHarness();
+  const commandHandling = harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "command-cancel-1",
+    method: "waitFor",
+    params: {
+      condition: { type: "networkIdle", idleMs: 30_000 },
+      pollIntervalMs: 1_000,
+      tabId: 7,
+      timeoutMs: 5_000
+    }
+  });
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(harness.calls.debuggerAttach.length, 1);
+
+  const cancelledAt = Date.now();
+  await harness.events.nativeOnMessage.emit({ type: "cancel", id: "command-cancel-1" });
+  await commandHandling;
+
+  assert.ok(Date.now() - cancelledAt < 200, "cancel must not wait for the next polling deadline");
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.equal(harness.activeNativeCommandCount(), 0);
+  assert.equal(
+    harness.calls.nativeMessages.some((message) => message.type === "response" && message.id === "command-cancel-1"),
+    false,
+    "a cancelled command must not post a response after the host has timed out"
+  );
+});
+
+test("native cancel ignores unknown or already completed command ids", async () => {
+  const harness = createBackgroundHarness();
+
+  await assert.doesNotReject(() => harness.events.nativeOnMessage.emit({ type: "cancel", id: "unknown-command" }));
+  await harness.events.nativeOnMessage.emit({ type: "command", id: "completed-command", method: "status", params: {} });
+  await assert.doesNotReject(() => harness.events.nativeOnMessage.emit({ type: "cancel", id: "completed-command" }));
+  assert.equal(harness.activeNativeCommandCount(), 0);
+});
+
+test("native disconnect aborts active waits and releases debugger resources promptly", async () => {
+  const harness = createBackgroundHarness();
+  const commandHandling = harness.events.nativeOnMessage.emit({
+    type: "command",
+    id: "disconnect-active-wait",
+    method: "waitFor",
+    params: {
+      condition: { type: "networkIdle", idleMs: 30_000 },
+      pollIntervalMs: 1_000,
+      tabId: 7,
+      timeoutMs: 200
+    }
+  });
+  for (let attempt = 0; attempt < 50 && harness.calls.debuggerAttach.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+
+  const disconnectedAt = Date.now();
+  await harness.events.nativeOnDisconnect.emit();
+  await commandHandling;
+
+  assert.ok(Date.now() - disconnectedAt < 100, "disconnect cleanup must not wait for the command timeout");
+  assert.equal(harness.activeNativeCommandCount(), 0);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+});
+
+test("CDP unsubscription does not detach an active network-idle consumer", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Network.responseReceived"] });
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 200
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  await harness.execute("unsubscribeCdpEvents", { tabId: 7 });
+  assert.equal(harness.calls.debuggerDetach.length, 0, "CDP cleanup must leave the network consumer attached");
+
+  await waiting;
+  assert.equal(harness.calls.debuggerDetach.length, 1, "the final network consumer owns the eventual detach");
+});
+
+test("network-idle timeout cleans its debugger consumer in finally", async () => {
+  const harness = createBackgroundHarness();
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 40 },
+    pollIntervalMs: 10,
+    tabId: 7,
+    timeoutMs: 80
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await harness.events.debuggerOnEvent.emit(
+    { tabId: 7 },
+    "Network.requestWillBeSent",
+    { requestId: "never-finishes", timestamp: 1 }
+  );
+
+  await assert.rejects(waiting, /timed out waiting for networkIdle after 80ms/u);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+});
+
+test("waitFor returns completed downloads and rejects interrupted downloads", async () => {
+  const completeHarness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{
+      id,
+      bytesReceived: 100,
+      filename: "/tmp/report.pdf",
+      state: "complete",
+      totalBytes: 100,
+      url: "https://example.com/report.pdf"
+    }]
+  });
+  const complete = await completeHarness.execute("waitFor", {
+    condition: { type: "download", downloadId: 42 },
+    pollIntervalMs: 10,
+    timeoutMs: 100
+  });
+  assert.equal(complete.type, "download");
+  assert.equal(complete.download.id, 42);
+  assert.equal(complete.download.state, "complete");
+
+  const interruptedHarness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{
+      id,
+      error: "NETWORK_FAILED",
+      filename: "/tmp/report.pdf",
+      state: "interrupted",
+      url: "https://example.com/report.pdf"
+    }]
+  });
+  await assert.rejects(
+    interruptedHarness.execute("waitFor", {
+      condition: { type: "download", downloadId: 42 },
+      pollIntervalMs: 10,
+      timeoutMs: 100
+    }),
+    /Download 42 was interrupted: NETWORK_FAILED/u
+  );
 });
 
 test("clickElement locates the reference and clicks its center through CDP", async () => {
@@ -844,34 +1573,258 @@ test("window creation rejects empty lease identifiers before opening a window", 
   assert.equal(createCalls, 0);
 });
 
+test("typed browser batches execute actions sequentially and preserve result order", async () => {
+  const order = [];
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      order.push(`get:${tabId}`);
+      return { active: true, id: tabId, index: 0, title: `Tab ${tabId}`, url: "https://example.com", windowId: 1 };
+    },
+    tabsUpdate: async (tabId, update) => {
+      order.push(`navigate:${tabId}`);
+      return { active: true, id: tabId, index: 0, title: "Navigated", url: update.url, windowId: 1 };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 } },
+      { type: "navigate", params: { tabId: 8, url: "https://example.com/next" } },
+      { type: "getTab", params: { tabId: 9 } }
+    ],
+    stopOnError: true,
+    totalTimeoutMs: 5_000
+  });
+
+  assert.deepEqual(order, ["get:7", "navigate:8", "get:9"]);
+  assert.equal(result.ok, true);
+  assert.equal(result.completed, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.results.map(({ index, type, ok }) => ({ index, type, ok })))), [
+    { index: 0, type: "getTab", ok: true },
+    { index: 1, type: "navigate", ok: true },
+    { index: 2, type: "getTab", ok: true }
+  ]);
+});
+
+test("browser batches continue or stop on action-indexed failures", async () => {
+  const calls = [];
+  const makeHarness = () => createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      calls.push(tabId);
+      if (tabId === 7) throw new Error("tab unavailable");
+      return { active: true, id: tabId, index: 0, title: "Ready", url: "https://example.com", windowId: 1 };
+    }
+  });
+  const actions = [
+    { type: "getTab", params: { tabId: 7 } },
+    { type: "getTab", params: { tabId: 8 } }
+  ];
+
+  const stopped = await makeHarness().execute("browserBatch", { actions, stopOnError: true });
+  assert.deepEqual(calls, [7]);
+  assert.equal(stopped.ok, false);
+  assert.equal(stopped.stoppedAt, 0);
+  assert.equal(stopped.results[0].index, 0);
+  assert.equal(stopped.results[0].ok, false);
+  assert.match(stopped.results[0].error, /tab unavailable/u);
+
+  calls.length = 0;
+  const continued = await makeHarness().execute("browserBatch", { actions, stopOnError: false });
+  assert.deepEqual(calls, [7, 8]);
+  assert.equal(continued.ok, false);
+  assert.equal(continued.stoppedAt, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(continued.results.map(({ index, ok }) => ({ index, ok })))), [
+    { index: 0, ok: false },
+    { index: 1, ok: true }
+  ]);
+});
+
+test("browser batches enforce per-action and total timeouts", async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve({ id: 7 }), 500));
+  const harness = createBackgroundHarness({ tabsGet: async () => pending });
+
+  const perActionStarted = Date.now();
+  const perAction = await harness.execute("browserBatch", {
+    actions: [{ type: "getTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    totalTimeoutMs: 1_000
+  });
+  assert.ok(Date.now() - perActionStarted < 300, "per-action timeout should not await a late Chrome callback");
+  assert.equal(perAction.results[0].index, 0);
+  assert.match(perAction.results[0].error, /action 0.*timed out.*50ms/iu);
+
+  const totalStarted = Date.now();
+  const total = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 }, timeoutMs: 1_000 },
+      { type: "getTab", params: { tabId: 8 }, timeoutMs: 1_000 }
+    ],
+    stopOnError: false,
+    totalTimeoutMs: 50
+  });
+  assert.ok(Date.now() - totalStarted < 300, "total timeout should bound the batch");
+  assert.equal(total.results.length, 1);
+  assert.equal(total.results[0].index, 0);
+  assert.match(total.results[0].error, /total timeout.*50ms/iu);
+  assert.equal(total.stoppedAt, 0);
+});
+
+test("a timed-out batch action never overlaps a later action", async () => {
+  const calls = [];
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      calls.push(tabId);
+      if (tabId === 7) return new Promise((resolve) => setTimeout(() => resolve({ id: tabId }), 500));
+      return { id: tabId };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [
+      { type: "getTab", params: { tabId: 7 }, timeoutMs: 50 },
+      { type: "getTab", params: { tabId: 8 }, timeoutMs: 1_000 }
+    ],
+    stopOnError: false,
+    totalTimeoutMs: 1_000
+  });
+
+  assert.deepEqual(calls, [7]);
+  assert.equal(result.stoppedAt, 0);
+  assert.match(result.results[0].error, /action 0.*timed out/iu);
+});
+
+test("a timed-out batch action cannot start mutations after delayed preparation resolves", async () => {
+  let resolveTabLookup;
+  const delayedTabLookup = new Promise((resolve) => { resolveTabLookup = resolve; });
+  let tabActivations = 0;
+  let windowFocuses = 0;
+  const harness = createBackgroundHarness({
+    tabsGet: async () => delayedTabLookup,
+    tabsUpdate: async (tabId) => {
+      tabActivations += 1;
+      return { active: true, id: tabId, index: 0, title: "Late", url: "https://example.com", windowId: 1 };
+    },
+    windowsUpdate: async (windowId) => {
+      windowFocuses += 1;
+      return { id: windowId };
+    }
+  });
+
+  const result = await harness.execute("browserBatch", {
+    actions: [{ type: "activateTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    totalTimeoutMs: 1_000
+  });
+  assert.equal(result.stoppedAt, 0);
+  resolveTabLookup({ active: false, id: 7, index: 0, title: "Ready", url: "https://example.com", windowId: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(windowFocuses, 0, "a late tab lookup must not focus the window after timeout");
+  assert.equal(tabActivations, 0, "a late tab lookup must not activate the tab after timeout");
+});
+
+test("browser batches reject forbidden and malformed actions before side effects", async () => {
+  let getCalls = 0;
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => {
+      getCalls += 1;
+      return { id: tabId };
+    }
+  });
+  for (const type of ["browserBatch", "workflow", "scheduler", "meta", "cdpCommand"]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type, params: {} }
+        ]
+      }),
+      /batch action 1.*not allowed/iu
+    );
+  }
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: [{ type: "getTab", params: { tabId: 7, unexpected: true } }]
+    }),
+    /batch action 0.*unsupported fields.*unexpected/iu
+  );
+  for (const condition of [
+    { type: "text", value: "ready", caseSensitive: "false" },
+    { type: "selector", selector: "button", visibleOnly: 1 },
+    { type: "networkIdle", idleMs: 30_001 }
+  ]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type: "waitFor", params: { tabId: 7, condition } }
+        ]
+      }),
+      /batch action 1|must be a boolean|idleMs must be an integer from 10 to 30000/iu
+    );
+  }
+  for (const modifiers of ["Shift", ["Shift", "Shift", "Shift", "Shift", "Shift", "Shift"]]) {
+    await assert.rejects(
+      harness.execute("browserBatch", {
+        actions: [
+          { type: "getTab", params: { tabId: 7 } },
+          { type: "clickElement", params: { tabId: 7, ref: "e1", modifiers } }
+        ]
+      }),
+      /batch action 1.*modifiers/iu
+    );
+  }
+  assert.equal(getCalls, 0, "the complete batch must validate before its first action");
+});
+
+test("browser batches bound action count and serialized payload size", async () => {
+  const harness = createBackgroundHarness();
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: Array.from({ length: 26 }, () => ({ type: "getTab", params: { tabId: 7 } }))
+    }),
+    /at most 25 actions/iu
+  );
+  await assert.rejects(
+    harness.execute("browserBatch", {
+      actions: [{ type: "fillElement", params: { tabId: 7, ref: "e1", text: "x".repeat(100_001) } }]
+    }),
+    /payload is too large|text is too large/iu
+  );
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
   debuggerSendCommand = async () => ({}),
   consoleError = () => {},
+  downloadsSearch = async () => [],
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
   scriptingExecuteScript = null,
   storageLocalGet = async () => ({}),
   storageManagedGet = null,
+  tabsCaptureVisibleTab = async () => "data:image/png;base64,iVBORw0KGgo=",
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
+  tabsUpdate = async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
-  windowsGet = async (windowId) => ({ id: windowId })
+  windowsGet = async (windowId) => ({ id: windowId }),
+  windowsUpdate = async (windowId) => ({ id: windowId })
 } = {}) {
-  const calls = { executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { debuggerAttach: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent(),
+    nativeOnDisconnect: createEvent(),
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
     tabsOnRemoved: createEvent(),
-    tabsOnReplaced: createEvent()
+    tabsOnReplaced: createEvent(),
+    tabsOnUpdated: createEvent()
   };
   const nativePort = {
-    onDisconnect: createEvent(),
+    onDisconnect: events.nativeOnDisconnect,
     onMessage: events.nativeOnMessage,
     postMessage(message) {
       if (nativePostMessage) return nativePostMessage(message);
@@ -894,8 +1847,8 @@ function createBackgroundHarness({
     },
     bookmarks: { search: async () => [] },
     debugger: {
-      attach: async () => {},
-      detach: async () => {},
+      attach: async (target) => { calls.debuggerAttach.push(target); },
+      detach: async (target) => { calls.debuggerDetach.push(target); },
       getTargets: async () => debuggerTargets,
       onDetach: events.debuggerOnDetach,
       onEvent: events.debuggerOnEvent,
@@ -904,12 +1857,13 @@ function createBackgroundHarness({
     downloads: {
       onChanged: createEvent(),
       onCreated: createEvent(),
-      search: async () => [],
+      search: downloadsSearch,
       showDefaultFolder: downloadsShowDefaultFolder
     },
     history: { search: async () => [] },
     runtime: {
       connectNative: () => nativePort,
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.2.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,
@@ -924,32 +1878,34 @@ function createBackgroundHarness({
     storage,
     tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
     tabs: {
+      captureVisibleTab: tabsCaptureVisibleTab,
       create: tabsCreate,
       get: tabsGet,
       onActivated: createEvent(),
       onCreated: createEvent(),
       onRemoved: events.tabsOnRemoved,
       onReplaced: events.tabsOnReplaced,
-      onUpdated: createEvent(),
+      onUpdated: events.tabsOnUpdated,
       query: async () => [],
       remove: tabsRemove,
       sendMessage: async (_tabId, message) => {
         calls.sendMessage += 1;
         calls.overlayMessages.push(message);
       },
-      update: async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 })
+      update: tabsUpdate
     },
     windows: {
       create: windowsCreate,
       get: windowsGet,
       getCurrent: async () => ({ id: 1 }),
       onFocusChanged: createEvent(),
-      update: async (windowId) => ({ id: windowId })
+      update: windowsUpdate
     }
   };
   const harnessConsole = Object.create(console);
   harnessConsole.error = consoleError;
   const context = vm.createContext({
+    AbortController,
     chrome,
     console: harnessConsole,
     navigator: { platform: "MacIntel" },
@@ -961,6 +1917,20 @@ function createBackgroundHarness({
   vm.runInContext(backgroundSource, context, { filename: "extension/background.js" });
 
   return {
+    activeNativeCommandCount() {
+      return vm.runInContext("activeNativeCommands.size", context);
+    },
+    networkTrackerState(tabId) {
+      context.__testTabId = tabId;
+      return vm.runInContext(`(() => {
+        const state = networkRequestStates.get(__testTabId);
+        return state ? {
+          inFlight: [...state.requests.values()].filter((request) => request.inFlight === true).length,
+          overflowed: state.overflowed,
+          requestCount: state.requests.size
+        } : null;
+      })()`, context);
+    },
     calls,
     events,
     setDebuggerTargets(targets) {
@@ -984,10 +1954,11 @@ function createBackgroundHarness({
       }
       return response?.connected === true;
     },
-    execute(method, params) {
+    execute(method, params, options = {}) {
       context.__testMethod = method;
       context.__testParams = params;
-      return vm.runInContext("executeCommand(__testMethod, __testParams)", context);
+      context.__testOptions = options;
+      return vm.runInContext("executeCommand(__testMethod, __testParams, __testOptions)", context);
     },
     reloadTabLeases() {
       return vm.runInContext(

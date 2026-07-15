@@ -14,6 +14,14 @@ const MAX_COMMAND_METHOD_CHARS = 128;
 const MAX_PENDING_COMMANDS = 100;
 const MAX_EVENT_SUBSCRIBERS = 16;
 const COMMAND_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*$/u;
+const HOST_NAME = "com.opencode.chrome_bridge";
+const HOST_VERSION = "1.2.0";
+const HOST_PROTOCOL_MIN = "1.0.0";
+const HOST_PROTOCOL_MAX = "1.0.0";
+const DEFAULT_CLIENT_NAME = "opencode-plugin";
+const STATUS_HANDSHAKE_TIMEOUT_MS = 1000;
+const VERSION_RE = /^\d+\.\d+\.\d+$/u;
+const CAPABILITY_RE = /^[a-z][a-z0-9.-]{0,99}$/u;
 
 const pending = new Map();
 const eventSubscribers = new Set();
@@ -90,7 +98,7 @@ function handleNativeMessage(payload) {
     pending.delete(message.id);
     clearTimeout(entry.timeout);
     if (message.ok) entry.resolve(message.result);
-    else entry.reject(new Error(message.error || "Chrome extension command failed"));
+    else entry.reject(new ExtensionCommandError(message.error || "Chrome extension command failed"));
     return;
   }
   if (message?.type === "event") {
@@ -101,7 +109,7 @@ function handleNativeMessage(payload) {
     // Liveness probe from the extension: reply so the popup can distinguish a
     // healthy host from a present-but-wedged one.
     const id = typeof message.id === "string" ? message.id : null;
-    writeNativeMessage({ type: "pong", id }).catch((error) => {
+    writeNativeMessage({ type: "pong", id, host: hostHandshake() }).catch((error) => {
       log(`could not answer ping: ${error?.message ?? error}`);
     });
     return;
@@ -116,7 +124,7 @@ async function handleHttp(req, res) {
       return;
     }
     if (req.method === "GET" && requestUrl.pathname === "/status") {
-      sendJson(res, 200, { ok: true, pid: process.pid, pending: pending.size });
+      sendJson(res, 200, await negotiateStatus(req));
       return;
     }
     if (req.method === "POST" && requestUrl.pathname === "/command") {
@@ -139,6 +147,207 @@ async function handleHttp(req, res) {
     const statusCode = error instanceof HttpError ? error.statusCode : 500;
     sendJson(res, statusCode, { ok: false, error: error?.message || "Internal bridge error" });
   }
+}
+
+async function negotiateStatus(req) {
+  const diagnostics = [];
+  const client = clientHandshake(req.headers, diagnostics);
+  const requiredCapabilities = client.requiredCapabilities;
+  let connected = true;
+  let extension;
+  try {
+    extension = normalizeExtensionHandshake(
+      await sendCommand("handshake", {}, STATUS_HANDSHAKE_TIMEOUT_MS),
+      diagnostics
+    );
+  } catch (error) {
+    if (error instanceof CommandTimeoutError) {
+      connected = false;
+      extension = null;
+      diagnostics.push({
+        code: "EXTENSION_DISCONNECTED",
+        message: "The Chrome extension did not answer the handshake.",
+        repair: "Reload Chrome or reinstall the native host."
+      });
+    } else {
+      extension = incompatibleExtensionPlaceholder();
+      diagnostics.push({
+        code: error instanceof ExtensionCommandError ? "HANDSHAKE_UNSUPPORTED" : "HANDSHAKE_FAILED",
+        message: "The connected Chrome extension could not negotiate the bridge protocol.",
+        repair: "Update and reload the extension, then reinstall the native host."
+      });
+    }
+  }
+
+  const missingCapabilities = extension === null
+    ? []
+    : requiredCapabilities.filter((capability) => !extension.capabilities.includes(capability)).sort();
+  if (missingCapabilities.length > 0) {
+    diagnostics.push({
+      code: "MISSING_CAPABILITIES",
+      message: `The extension is missing required capabilities: ${missingCapabilities.join(", ")}.`,
+      repair: "Update and reload the extension."
+    });
+  }
+  const protocolCompatible = extension !== null
+    && isVersionInRange(extension.protocolVersion, HOST_PROTOCOL_MIN, HOST_PROTOCOL_MAX)
+    && isVersionInRange(extension.protocolVersion, client.protocolMin, client.protocolMax);
+  if (connected && !protocolCompatible && !diagnostics.some((entry) => entry.code.includes("HANDSHAKE"))) {
+    diagnostics.push({
+      code: "PROTOCOL_INCOMPATIBLE",
+      message: `Extension protocol ${extension.protocolVersion} is outside the supported host/client ranges.`,
+      repair: "Update the OpenCode plugin, native host, and extension together."
+    });
+  }
+
+  return {
+    client: {
+      name: client.name,
+      protocolMax: client.protocolMax,
+      protocolMin: client.protocolMin,
+      version: client.version
+    },
+    compatible: connected && protocolCompatible && missingCapabilities.length === 0 && diagnostics.length === 0,
+    connected,
+    diagnostics,
+    extension,
+    host: hostHandshake(),
+    hostReachable: true,
+    legacy: false,
+    missingCapabilities,
+    ok: true,
+    pending: pending.size,
+    pid: process.pid
+  };
+}
+
+function hostHandshake() {
+  return {
+    name: HOST_NAME,
+    protocolMax: HOST_PROTOCOL_MAX,
+    protocolMin: HOST_PROTOCOL_MIN,
+    version: HOST_VERSION
+  };
+}
+
+function clientHandshake(headers, diagnostics) {
+  const rawVersion = singleHeader(headers["x-opencode-bridge-client-version"]);
+  const rawMin = singleHeader(headers["x-opencode-bridge-protocol-min"]);
+  const rawMax = singleHeader(headers["x-opencode-bridge-protocol-max"]);
+  const version = validVersionOrFallback(rawVersion, HOST_VERSION, diagnostics, "CLIENT_VERSION_INVALID");
+  const protocolMin = validVersionOrFallback(rawMin, HOST_PROTOCOL_MIN, diagnostics, "CLIENT_PROTOCOL_INVALID");
+  const protocolMax = validVersionOrFallback(rawMax, HOST_PROTOCOL_MAX, diagnostics, "CLIENT_PROTOCOL_INVALID");
+  let requiredCapabilities = ["bridge.handshake"];
+  const rawCapabilities = singleHeader(headers["x-opencode-bridge-capabilities"]);
+  if (rawCapabilities !== null) {
+    const parsed = rawCapabilities.split(",").filter(Boolean);
+    if (rawCapabilities.length > 10_000 || parsed.length > 200 || parsed.some((entry) => !CAPABILITY_RE.test(entry))) {
+      diagnostics.push({
+        code: "CLIENT_CAPABILITIES_INVALID",
+        message: "The client sent an invalid capability requirement list.",
+        repair: "Update the OpenCode bridge plugin."
+      });
+      requiredCapabilities = ["bridge.invalid-client-capabilities"];
+    } else {
+      requiredCapabilities = [...new Set(["bridge.handshake", ...parsed])].sort();
+    }
+  }
+  if (compareVersions(protocolMin, protocolMax) > 0) {
+    diagnostics.push({
+      code: "CLIENT_PROTOCOL_INVALID",
+      message: "The client protocol range is invalid.",
+      repair: "Update the OpenCode bridge plugin."
+    });
+    return {
+      name: DEFAULT_CLIENT_NAME,
+      protocolMax: "0.0.0",
+      protocolMin: "0.0.0",
+      requiredCapabilities,
+      version
+    };
+  }
+  return { name: DEFAULT_CLIENT_NAME, protocolMax, protocolMin, requiredCapabilities, version };
+}
+
+function normalizeExtensionHandshake(value, diagnostics) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    diagnostics.push(invalidExtensionDiagnostic());
+    return incompatibleExtensionPlaceholder();
+  }
+  const capabilities = Array.isArray(value.capabilities)
+    && value.capabilities.length <= 200
+    && value.capabilities.every((entry) => typeof entry === "string" && CAPABILITY_RE.test(entry))
+    ? [...new Set(value.capabilities)].sort()
+    : null;
+  const valid = typeof value.extensionId === "string" && value.extensionId.length > 0 && value.extensionId.length <= 256
+    && VERSION_RE.test(value.extensionVersion)
+    && typeof value.hostName === "string" && value.hostName === HOST_NAME
+    && VERSION_RE.test(value.protocolVersion)
+    && capabilities !== null;
+  if (!valid) {
+    diagnostics.push(invalidExtensionDiagnostic());
+    return incompatibleExtensionPlaceholder();
+  }
+  return {
+    capabilities,
+    extensionId: value.extensionId,
+    extensionName: typeof value.extensionName === "string" && value.extensionName.length <= 256
+      ? value.extensionName
+      : undefined,
+    extensionVersion: value.extensionVersion,
+    hostName: value.hostName,
+    protocolVersion: value.protocolVersion
+  };
+}
+
+function incompatibleExtensionPlaceholder() {
+  return {
+    capabilities: [],
+    extensionId: "unknown",
+    extensionVersion: "0.0.0",
+    hostName: HOST_NAME,
+    protocolVersion: "0.0.0"
+  };
+}
+
+function invalidExtensionDiagnostic() {
+  return {
+    code: "EXTENSION_HANDSHAKE_INVALID",
+    message: "The extension returned an invalid bridge handshake.",
+    repair: "Update and reload the extension."
+  };
+}
+
+function validVersionOrFallback(value, fallback, diagnostics, code) {
+  if (value === null) return fallback;
+  if (VERSION_RE.test(value)) return value;
+  diagnostics.push({
+    code,
+    message: "The client sent a malformed bridge version.",
+    repair: "Update the OpenCode bridge plugin."
+  });
+  return "0.0.0";
+}
+
+function singleHeader(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value.length === 1 ? String(value[0]) : "";
+  return String(value);
+}
+
+function isVersionInRange(version, minimum, maximum) {
+  return VERSION_RE.test(version)
+    && compareVersions(version, minimum) >= 0
+    && compareVersions(version, maximum) <= 0;
+}
+
+function compareVersions(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
 }
 
 function isAuthorized(req) {
@@ -209,7 +418,10 @@ function sendCommand(method, params, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pending.delete(id);
-      reject(new Error(`Timed out waiting for Chrome command ${method}`));
+      writeNativeMessage({ type: "cancel", id }).catch((error) => {
+        log(`could not cancel timed-out Chrome command ${id}: ${error?.message ?? error}`);
+      });
+      reject(new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
     }, clampTimeout(timeoutMs));
     pending.set(id, { resolve, reject, timeout });
     writeNativeMessage(message).catch((error) => {
@@ -319,7 +531,7 @@ function sendJson(res, statusCode, payload) {
 function clampTimeout(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 15000;
-  return Math.max(1000, Math.min(parsed, 120000));
+  return Math.max(1000, Math.min(parsed, 125000));
 }
 
 async function writeState(port) {
@@ -377,6 +589,10 @@ async function shutdown(code) {
 function log(message) {
   process.stderr.write(`[opencode-chrome-native-host] ${message}\n`);
 }
+
+class CommandTimeoutError extends Error {}
+
+class ExtensionCommandError extends Error {}
 
 class HttpError extends Error {
   constructor(statusCode, message) {

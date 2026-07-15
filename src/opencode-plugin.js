@@ -1,11 +1,199 @@
 import path from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { bridgeCommand, bridgeStatus, writeDataUrlToFile, pollEvents } from "./bridge-client.js";
+import {
+  bridgeCommand,
+  bridgeStatus,
+  pollEvents,
+  requireBridgeCapabilities,
+  writeDataUrlToFile
+} from "./bridge-client.js";
+import {
+  materializeContextText,
+  materializeReadPageArtifacts
+} from "./workspace-artifacts.js";
+
+const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
+
+const BATCH_ACTION_CAPABILITIES = Object.freeze({
+  activateTab: ["browser.tabs", "browser.windows"],
+  back: ["browser.navigation", "browser.tabs"],
+  clickElement: ["browser.accessibility", "browser.cdp", "browser.tabs"],
+  fillElement: ["browser.accessibility", "browser.cdp", "browser.tabs"],
+  findElements: ["browser.find", "browser.tabs"],
+  forward: ["browser.navigation", "browser.tabs"],
+  getTab: ["browser.tabs"],
+  navigate: ["browser.navigation", "browser.tabs"],
+  reload: ["browser.navigation", "browser.tabs"],
+  tabContext: ["browser.page-context", "browser.tabs"]
+});
+
+export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
+  chrome_accessibility_tree: capabilities("browser.accessibility", "browser.tabs"),
+  chrome_activate_tab: capabilities("browser.tabs", "browser.windows"),
+  chrome_back: capabilities("browser.navigation", "browser.tabs"),
+  chrome_batch: capabilities("browser.batch"),
+  chrome_blocked_urls: capabilities("browser.navigation"),
+  chrome_bookmarks: capabilities("browser.bookmarks"),
+  chrome_cdp: capabilities("browser.cdp"),
+  chrome_cdp_targets: capabilities("browser.cdp"),
+  chrome_claim_tab: capabilities("browser.tabs", "session.tab-leases"),
+  chrome_click: capabilities("browser.cdp", "browser.tabs"),
+  chrome_click_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_close_tab: capabilities("browser.tabs"),
+  chrome_cursor_state: capabilities("browser.tabs"),
+  chrome_dom_content: capabilities("browser.cdp", "browser.tabs"),
+  chrome_double_click: capabilities("browser.cdp", "browser.tabs"),
+  chrome_download_cancel: capabilities("browser.downloads"),
+  chrome_download_pause: capabilities("browser.downloads"),
+  chrome_download_resume: capabilities("browser.downloads"),
+  chrome_download_show: capabilities("browser.downloads"),
+  chrome_downloads_list: capabilities("browser.downloads"),
+  chrome_drag: capabilities("browser.cdp", "browser.tabs"),
+  chrome_end_turn: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
+  chrome_evaluate: capabilities("browser.cdp", "browser.tabs"),
+  chrome_events: capabilities("browser.events"),
+  chrome_favicon_badge: capabilities("browser.tabs"),
+  chrome_fill_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_find: capabilities("browser.find", "browser.tabs"),
+  chrome_finalize_tabs: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
+  chrome_forward: capabilities("browser.navigation", "browser.tabs"),
+  chrome_get_console_logs: capabilities("browser.cdp", "browser.console", "browser.tabs"),
+  chrome_get_tab: capabilities("browser.tabs"),
+  chrome_get_window_state: capabilities("browser.windows"),
+  chrome_group_tabs: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_history: capabilities("browser.history"),
+  chrome_hover: capabilities("browser.cdp", "browser.tabs"),
+  chrome_keypress: capabilities("browser.cdp", "browser.tabs"),
+  chrome_move: capabilities("browser.cdp", "browser.tabs"),
+  chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
+  chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
+  chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
+  chrome_read_page: capabilities("browser.accessibility", "browser.page-context", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_release_debuggers: capabilities("browser.cdp"),
+  chrome_reload: capabilities("browser.navigation", "browser.tabs"),
+  chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_screenshot: capabilities("browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_screenshot_region: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_scroll: capabilities("browser.cdp", "browser.tabs"),
+  chrome_set_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_set_window_state: capabilities("browser.windows"),
+  chrome_subscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_tab_group_create: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_group_update: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_groups: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_context: capabilities("browser.page-context", "browser.tabs"),
+  chrome_tabs: capabilities("browser.tabs"),
+  chrome_type: capabilities("browser.cdp", "browser.tabs"),
+  chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
+  chrome_wait_for: capabilities("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
+  chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
+});
+
+export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
+  [...new Set(Object.values(TOOL_CAPABILITY_REQUIREMENTS).flat())].sort()
+);
 
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
   const schema = tool.schema;
+  const waitConditionSchema = schema.discriminatedUnion("type", [
+    schema.strictObject({
+      type: schema.literal("url"),
+      value: schema.string().min(1).max(2000),
+      match: schema.enum(["contains", "exact"]).optional()
+    }),
+    schema.strictObject({ type: schema.literal("navigation") }),
+    schema.strictObject({
+      type: schema.literal("text"),
+      value: schema.string().min(1).max(2000),
+      caseSensitive: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("ref"),
+      ref: schema.string().min(1).max(50),
+      visibleOnly: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("selector"),
+      selector: schema.string().min(1).max(2000),
+      visibleOnly: schema.boolean().optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("networkIdle"),
+      idleMs: schema.number().int().min(10).max(30000).optional()
+    }),
+    schema.strictObject({
+      type: schema.literal("download"),
+      downloadId: schema.number().int().min(0)
+    })
+  ]);
+  const batchActionTimeoutMs = schema.number().int().min(50).max(30000).optional();
+  const batchTabIdParams = schema.strictObject({ tabId: schema.number().int() });
+  const batchAction = schema.discriminatedUnion("type", [
+    schema.strictObject({ type: schema.literal("getTab"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("activateTab"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({
+      type: schema.literal("navigate"),
+      params: schema.strictObject({ tabId: schema.number().int(), url: schema.string().min(1).max(2000) }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({ type: schema.literal("reload"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("back"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({ type: schema.literal("forward"), params: batchTabIdParams, timeoutMs: batchActionTimeoutMs }),
+    schema.strictObject({
+      type: schema.literal("tabContext"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        maxChars: schema.number().int().min(100).max(200000).optional(),
+        maxSelectionChars: schema.number().int().min(1).max(10000).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("findElements"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        query: schema.string().min(1).max(500),
+        role: schema.string().min(1).max(50).optional(),
+        interactiveOnly: schema.boolean().optional(),
+        visibleOnly: schema.boolean().optional(),
+        limit: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("waitFor"),
+      params: schema.strictObject({
+        tabId: schema.number().int().optional(),
+        condition: waitConditionSchema,
+        timeoutMs: schema.number().int().min(50).max(120000).optional(),
+        pollIntervalMs: schema.number().int().min(10).max(1000).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("clickElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        ref: schema.string().min(1).max(50),
+        button: schema.enum(["left", "middle", "right"]).optional(),
+        modifiers: schema.array(schema.enum(["Alt", "Control", "ControlOrMeta", "Meta", "Shift"])).max(5).optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    }),
+    schema.strictObject({
+      type: schema.literal("fillElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        ref: schema.string().min(1).max(50),
+        text: schema.string().max(100000),
+        clear: schema.boolean().optional()
+      }),
+      timeoutMs: batchActionTimeoutMs
+    })
+  ]);
 
   return {
     tool: requireApprovals({
@@ -13,7 +201,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "Check whether the local OpenCode Chrome Bridge native host is reachable.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeStatus(), null, 2);
+          return JSON.stringify(await bridgeStatus(ALL_TOOL_REQUIRED_CAPABILITIES), null, 2);
         }
       }),
       chrome_tabs: tool({
@@ -145,6 +333,109 @@ export default async function OpenCodeChromeBridgePlugin() {
         },
         async execute(args) {
           return JSON.stringify(await bridgeCommand("pageText", args), null, 2);
+        }
+      }),
+      chrome_tab_context: tool({
+        description: "Read bounded visible text, page metadata, current selection, selected element references, MIME type, and document dimensions from a Chrome tab.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          maxChars: schema.number().int().min(100).max(200000).default(50000).describe("Maximum visible-text characters returned by the extension."),
+          outputDirectory: schema.string().optional().describe("Project-relative directory where oversized or explicitly requested text is written as a collision-safe artifact."),
+          maxSelectionChars: schema.number().int().min(1).max(10000).default(2000).describe("Maximum selected-text characters to return."),
+          previewChars: schema.number().int().min(100).max(20000).default(12000).describe("Inline text preview size when an artifact is written."),
+          saveText: schema.boolean().default(false).describe("Write visible text as an artifact even when it fits in the inline preview. Requires outputDirectory.")
+        },
+        async execute(args, context) {
+          requireArtifactDirectoryWhenRequested(args);
+          const result = await bridgeCommand("tabContext", {
+            maxChars: args.maxChars,
+            maxSelectionChars: args.maxSelectionChars,
+            tabId: args.tabId
+          });
+          const materialized = await maybeMaterializeContext(result, args, context.directory);
+          return JSON.stringify({
+            ...materialized.context,
+            visibleTextArtifact: materialized.artifact
+          }, null, 2);
+        }
+      }),
+      chrome_read_page: tool({
+        description: "Read one coherent page result containing bounded tab context, an accessibility snapshot, and an optional screenshot workspace artifact.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          maxChars: schema.number().int().min(100).max(200000).default(50000).describe("Maximum visible-text characters returned by the extension."),
+          maxSelectionChars: schema.number().int().min(1).max(10000).default(2000).describe("Maximum selected-text characters to return."),
+          maxNodes: schema.number().int().min(1).max(2000).default(800).describe("Maximum accessibility nodes to return."),
+          interactiveOnly: schema.boolean().default(false).describe("Return only interactive accessibility nodes."),
+          includeScreenshot: schema.boolean().default(false).describe("Capture the visible viewport and write it below outputDirectory."),
+          outputDirectory: schema.string().optional().describe("Project-relative directory for screenshot and oversized text artifacts."),
+          screenshotFormat: schema.enum(["png", "jpeg"]).default("png").describe("Screenshot image format."),
+          screenshotQuality: schema.number().int().min(1).max(100).default(80).describe("JPEG screenshot quality. Ignored for PNG."),
+          previewChars: schema.number().int().min(100).max(20000).default(12000).describe("Inline text preview size when an artifact is written."),
+          saveText: schema.boolean().default(false).describe("Write visible text as an artifact even when it fits in the inline preview. Requires outputDirectory.")
+        },
+        async execute(args, context) {
+          requireArtifactDirectoryWhenRequested(args);
+          const result = await bridgeCommand("readPage", {
+            includeScreenshot: args.includeScreenshot,
+            interactiveOnly: args.interactiveOnly,
+            maxChars: args.maxChars,
+            maxNodes: args.maxNodes,
+            maxSelectionChars: args.maxSelectionChars,
+            screenshotFormat: args.screenshotFormat,
+            screenshotQuality: args.screenshotQuality,
+            tabId: args.tabId
+          }, { timeoutMs: args.includeScreenshot ? 30000 : undefined });
+          return JSON.stringify(await materializeReadPageArtifacts({
+            forceText: args.saveText === true,
+            outputDirectory: args.outputDirectory,
+            previewChars: args.previewChars,
+            projectDirectory: context.directory,
+            result
+          }), null, 2);
+        }
+      }),
+      chrome_find: tool({
+        description: "Find and rank page elements deterministically by reference, role, accessible name, label, placeholder, and visible text.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          query: schema.string().min(1).max(500).describe("Natural-language or reference query used to rank elements."),
+          role: schema.string().min(1).max(50).optional().describe("Optional exact accessibility role filter, such as button or textbox."),
+          interactiveOnly: schema.boolean().default(false).describe("Only return interactive elements."),
+          visibleOnly: schema.boolean().default(true).describe("Only return currently visible elements."),
+          limit: schema.number().int().min(1).max(100).default(20).describe("Maximum ranked matches to return.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("findElements", args), null, 2);
+        }
+      }),
+      chrome_wait_for: tool({
+        description: "Wait deterministically for exactly one typed condition: URL, navigation, text, ref, selector, network idle, or download completion.",
+        args: {
+          tabId: schema.number().int().optional().describe("Chrome tab id. Required for every condition except download."),
+          condition: waitConditionSchema.describe("One typed wait condition. Fields not belonging to the selected type are rejected."),
+          timeoutMs: schema.number().int().min(50).max(120000).default(10000).describe("Overall wait timeout."),
+          pollIntervalMs: schema.number().int().min(10).max(1000).default(100).describe("Polling interval for deterministic checks.")
+        },
+        async execute(args) {
+          const timeoutMs = args.timeoutMs ?? 10_000;
+          return JSON.stringify(await bridgeCommand("waitFor", args, {
+            timeoutMs: Math.min(125_000, timeoutMs + 5_000)
+          }), null, 2);
+        }
+      }),
+      chrome_batch: tool({
+        description: "Run a bounded batch of typed high-level browser actions sequentially after one OpenCode approval, with ordered action-indexed results.",
+        args: {
+          actions: schema.array(batchAction).min(1).max(25).describe("One to 25 typed actions. Nested batches, workflow/scheduler meta-actions, and raw CDP are not allowed."),
+          stopOnError: schema.boolean().default(true).describe("Stop after the first failed action. Set false to continue after ordinary action errors."),
+          totalTimeoutMs: schema.number().int().min(50).max(120000).default(60000).describe("Overall batch execution budget in milliseconds.")
+        },
+        async execute(args) {
+          const totalTimeoutMs = args.totalTimeoutMs ?? 60_000;
+          return JSON.stringify(await bridgeCommand("browserBatch", args, {
+            timeoutMs: Math.min(125_000, totalTimeoutMs + 5_000)
+          }), null, 2);
         }
       }),
       chrome_dom_content: tool({
@@ -702,9 +993,17 @@ export default async function OpenCodeChromeBridgePlugin() {
 const APPROVAL_EXEMPT_TOOLS = new Set(["chrome_status"]);
 
 const APPROVAL_METADATA = {
+  chrome_batch: (args) => ({
+    action: "Run one prevalidated sequential browser batch",
+    actionCount: Array.isArray(args.actions) ? args.actions.length : 0,
+    actionTypes: Array.isArray(args.actions) ? args.actions.slice(0, 25).map((entry) => entry?.type) : [],
+    stopOnError: args.stopOnError,
+    totalTimeoutMs: args.totalTimeoutMs
+  }),
   chrome_cdp: (args) => ({ action: "Run a full Chrome DevTools Protocol command", method: args.method, tabId: args.tabId, targetId: args.targetId }),
   chrome_evaluate: (args) => ({ action: "Evaluate JavaScript in the page", tabId: args.tabId, expression: previewText(args.expression) }),
   chrome_wizard_step: (args) => ({ action: "Click, then optionally evaluate JavaScript and screenshot", tabId: args.tabId, expression: previewText(args.expression) }),
+  chrome_wait_for: (args) => ({ action: "Wait for one browser condition", tabId: args.tabId, condition: args.condition?.type, timeoutMs: args.timeoutMs }),
   chrome_open: (args) => ({ action: "Open or navigate a tab", url: args.url, tabId: args.tabId }),
   chrome_open_window: (args) => ({ action: "Open a new browser window", url: args.url }),
   chrome_click: (args) => ({ action: "Click in the page", tabId: args.tabId, x: args.x, y: args.y, button: args.button }),
@@ -718,9 +1017,12 @@ const APPROVAL_METADATA = {
   chrome_history: (args) => ({ action: "Search the user's browsing history", query: args.query }),
   chrome_bookmarks: (args) => ({ action: "Search the user's bookmarks", query: args.query }),
   chrome_page_text: (args) => ({ action: "Read the page text", tabId: args.tabId }),
+  chrome_tab_context: (args) => ({ action: "Read bounded page context and selection", tabId: args.tabId, outputDirectory: args.outputDirectory }),
+  chrome_read_page: (args) => ({ action: "Read page context, accessibility, and optional screenshot", tabId: args.tabId, includeScreenshot: args.includeScreenshot, outputDirectory: args.outputDirectory }),
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
+  chrome_find: (args) => ({ action: "Find ranked page elements", tabId: args.tabId, query: previewText(args.query), role: args.role }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
@@ -747,6 +1049,8 @@ function requireApprovals(tools) {
           always: [name],
           metadata: describe(args)
         });
+        const requiredCapabilities = requiredCapabilitiesForTool(name, args);
+        await requireBridgeCapabilities(requiredCapabilities);
         return run(args, context);
       }
     };
@@ -754,9 +1058,69 @@ function requireApprovals(tools) {
   return guarded;
 }
 
+export function requiredCapabilitiesForTool(name, args) {
+  const required = TOOL_CAPABILITY_REQUIREMENTS[name];
+  if (!required) throw new Error(`Browser tool ${name} is missing an explicit capability declaration`);
+  if (name === "chrome_batch") {
+    if (!Array.isArray(args?.actions) || args.actions.length === 0 || args.actions.length > 25) {
+      throw new Error("chrome_batch requires between 1 and 25 typed actions");
+    }
+    const union = new Set(required);
+    for (const action of args.actions) {
+      for (const capability of requiredCapabilitiesForBatchAction(action)) union.add(capability);
+    }
+    return [...union].sort();
+  }
+  if (name === "chrome_read_page" && args?.includeScreenshot !== true) {
+    return required.filter((capability) => capability !== "browser.screenshots" && capability !== "browser.windows");
+  }
+  if (name === "chrome_wait_for") {
+    if (args?.condition?.type === "download") {
+      return required.filter((capability) => capability !== "browser.cdp" && capability !== "browser.tabs");
+    }
+    if (args?.condition?.type !== "networkIdle") {
+      return required.filter((capability) => capability !== "browser.cdp" && capability !== "browser.downloads");
+    }
+    return required.filter((capability) => capability !== "browser.downloads");
+  }
+  return required;
+}
+
+function requiredCapabilitiesForBatchAction(action) {
+  if (action?.type === "waitFor") {
+    const conditionType = action.params?.condition?.type;
+    if (conditionType === "download") return ["browser.downloads", "browser.wait"];
+    if (conditionType === "networkIdle") return ["browser.cdp", "browser.tabs", "browser.wait"];
+    return ["browser.tabs", "browser.wait"];
+  }
+  const required = BATCH_ACTION_CAPABILITIES[action?.type];
+  if (!required) throw new Error(`chrome_batch action type ${String(action?.type)} is not allowed`);
+  return required;
+}
+
 function previewText(value) {
   if (typeof value !== "string") return undefined;
   return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+}
+
+function requireArtifactDirectoryWhenRequested(args) {
+  if ((args.includeScreenshot === true || args.saveText === true)
+    && (typeof args.outputDirectory !== "string" || args.outputDirectory.length === 0)) {
+    throw new Error("outputDirectory is required when includeScreenshot or saveText is enabled");
+  }
+}
+
+async function maybeMaterializeContext(context, args, projectDirectory) {
+  if (typeof args.outputDirectory !== "string" || args.outputDirectory.length === 0) {
+    return { artifact: null, context };
+  }
+  return materializeContextText({
+    context,
+    force: args.saveText === true,
+    outputDirectory: args.outputDirectory,
+    previewChars: args.previewChars,
+    projectDirectory
+  });
 }
 
 async function resolveProjectOutputPath(projectDirectory, outputPath, fieldName) {

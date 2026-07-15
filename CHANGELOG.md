@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.2.0 — 2026-07-15
+
+### Added
+
+- **Browser Intelligence.** `chrome_tab_context` reads bounded visible text, selection,
+  selected element refs, MIME type, and dimensions. `chrome_read_page` returns one
+  coherent context + accessibility snapshot with an optional screenshot artifact.
+- **Deterministic discovery and waits.** `chrome_find` ranks elements by accessible
+  signals with stable document-order ties. `chrome_wait_for` supports one typed URL,
+  navigation, text, ref, selector, network-idle, or download condition with bounded
+  polling, timeouts, and transport cancellation.
+- **Typed browser batches.** `chrome_batch` prevalidates up to 25 high-level actions,
+  requests one OpenCode approval, runs actions sequentially with per-action and total
+  budgets, and returns ordered action-indexed results. Nested/meta actions and raw CDP
+  are not part of its allowlist.
+- **Versioned capability negotiation.** The extension, native host, bridge client, and
+  plugin now negotiate protocol compatibility and exact tool capabilities before an
+  approved tool executes.
+
+### Security
+
+- Page context and ranked finding omit sensitive subtrees and bound all traversals,
+  strings, and result collections.
+- Workspace artifacts are atomically written to collision-safe paths below an explicit
+  project-relative output directory; symlink and path escapes fail closed.
+- Network-idle tracking is bounded, cleans up debugger consumers on cancellation, and
+  reports only redacted request state needed for the wait.
+
 ## v1.1.0 — 2026-07-15
 
 ### Added
