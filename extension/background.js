@@ -910,13 +910,20 @@ async function claimTab(params) {
   return withTabLeaseMutation(async () => {
     const tab = await chrome.tabs.get(tabId);
     assertClaimableTab(tab);
+    const windowId = requireTabWindowId(tab);
     await ensureTabLeasesLoaded();
     const existing = tabLeases.get(tabId);
     if (existing && existing.sessionId !== sessionId) {
       throw new Error(`Tab ${tabId} is already part of browser session ${existing.sessionId}`);
     }
-    const preferredGroupId = sessionGroupId(sessionId);
-    const groupId = await ensureManagedSessionGroup(sessionId, [tabId], preferredGroupId);
+    const preferredGroupId = sessionGroupId(sessionId, windowId);
+    let groupId;
+    try {
+      groupId = await ensureManagedSessionGroup(sessionId, [tabId], preferredGroupId);
+    } catch (error) {
+      await restoreTabGroups([{ originalGroupId: tab.groupId, tabId, windowId }]);
+      throw error;
+    }
     const nextLeases = new Map(tabLeases);
     nextLeases.set(tabId, {
       claimedAt: Date.now(),
@@ -925,7 +932,8 @@ async function claimTab(params) {
       sessionId,
       state: "active",
       tabId,
-      turnId
+      turnId,
+      windowId
     });
     try {
       await persistTabLeases(nextLeases);
@@ -940,9 +948,14 @@ async function claimTab(params) {
   });
 }
 
-function sessionGroupId(sessionId) {
+function sessionGroupId(sessionId, windowId) {
   for (const lease of tabLeases.values()) {
-    if (lease.sessionId === sessionId && Number.isInteger(lease.groupId) && lease.groupId >= 0) return lease.groupId;
+    if (
+      lease.sessionId === sessionId
+      && lease.windowId === windowId
+      && Number.isInteger(lease.groupId)
+      && lease.groupId >= 0
+    ) return lease.groupId;
   }
   return null;
 }
@@ -965,17 +978,41 @@ async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = n
   return groupId;
 }
 
+function requireTabWindowId(tab) {
+  if (!Number.isInteger(tab?.windowId)) throw new Error(`Tab ${tab?.id ?? "unknown"} has no valid window`);
+  return tab.windowId;
+}
+
+async function restoreTabGroups(records) {
+  const grouped = new Map();
+  const ungrouped = [];
+  for (const record of records) {
+    if (Number.isInteger(record.originalGroupId) && record.originalGroupId >= 0) {
+      const key = `${record.windowId}:${record.originalGroupId}`;
+      if (!grouped.has(key)) grouped.set(key, { groupId: record.originalGroupId, tabIds: [] });
+      grouped.get(key).tabIds.push(record.tabId);
+    } else {
+      ungrouped.push(record.tabId);
+    }
+  }
+  for (const entry of grouped.values()) await chrome.tabs.group(entry).catch(() => {});
+  await ungroupTabsIfAvailable(ungrouped);
+}
+
+function isClaimableUrl(value) {
+  if (value === "about:blank") return true;
+  if (typeof value !== "string" || value.length === 0) return false;
+  try {
+    return ["http:", "https:", "file:"].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
 function isAdoptableNavigationTarget(tab, eventUrl) {
   const candidates = [eventUrl, tab?.url].filter((value) => typeof value === "string" && value.length > 0);
   if (candidates.length === 0) return false;
-  return candidates.every((value) => {
-    if (value === "about:blank") return true;
-    try {
-      return ["http:", "https:", "file:"].includes(new URL(value).protocol);
-    } catch {
-      return false;
-    }
-  });
+  return candidates.every(isClaimableUrl);
 }
 
 async function adoptCreatedNavigationTarget(details) {
@@ -984,6 +1021,7 @@ async function adoptCreatedNavigationTarget(details) {
     await ensureTabLeasesLoaded();
     const sourceLease = tabLeases.get(details.sourceTabId);
     if (!sourceLease) return { adopted: false, reason: "unleased-source" };
+    if (sourceLease.state !== "active") return { adopted: false, reason: "inactive-source" };
     const existing = tabLeases.get(details.tabId);
     if (existing && existing.sessionId !== sourceLease.sessionId) {
       return { adopted: false, reason: "cross-session" };
@@ -997,10 +1035,15 @@ async function adoptCreatedNavigationTarget(details) {
     }
     if (!isAdoptableNavigationTarget(tab, details.url)) return { adopted: false, reason: "internal" };
     assertClaimableTab(tab);
-    const groupId = Number.isInteger(sourceLease.groupId) && sourceLease.groupId >= 0
-      ? sourceLease.groupId
-      : null;
-    if (groupId === null) return { adopted: false, reason: "missing-group" };
+    const windowId = requireTabWindowId(tab);
+    const preferredGroupId = sessionGroupId(sourceLease.sessionId, windowId);
+    let groupId;
+    try {
+      groupId = await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], preferredGroupId);
+    } catch (error) {
+      await restoreTabGroups([{ originalGroupId: tab.groupId, tabId: details.tabId, windowId }]);
+      throw error;
+    }
     const adoptedLease = {
       claimedAt: Date.now(),
       groupId,
@@ -1008,16 +1051,11 @@ async function adoptCreatedNavigationTarget(details) {
       sessionId: sourceLease.sessionId,
       state: "active",
       tabId: details.tabId,
-      turnId: sourceLease.turnId
+      turnId: sourceLease.turnId,
+      windowId
     };
     const nextLeases = new Map(tabLeases);
     nextLeases.set(details.tabId, adoptedLease);
-    try {
-      await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], groupId, false);
-    } catch (error) {
-      await ungroupTabsIfAvailable([details.tabId]);
-      throw error;
-    }
     try {
       await persistTabLeases(nextLeases);
     } catch (error) {
@@ -1038,7 +1076,7 @@ async function resumeSession(params) {
   return withTabLeaseMutation(async () => {
     await ensureTabLeasesLoaded();
     const nextLeases = new Map(tabLeases);
-    const liveLeases = [];
+    const liveRecords = [];
     const recoveredTabIds = [];
     const skipped = [];
     const rejectedLiveTabIds = [];
@@ -1054,52 +1092,67 @@ async function resumeSession(params) {
       }
       try {
         assertClaimableTab(tab);
+        requireTabWindowId(tab);
       } catch {
         nextLeases.delete(lease.tabId);
         rejectedLiveTabIds.push(lease.tabId);
         skipped.push({ reason: "internal", tabId: lease.tabId });
         continue;
       }
-      const resumed = lease.state === "handoff"
-        ? { ...lease, claimedAt: Date.now(), state: "active", turnId }
-        : lease;
       if (lease.state === "handoff") recoveredTabIds.push(lease.tabId);
-      nextLeases.set(lease.tabId, resumed);
-      liveLeases.push(resumed);
+      liveRecords.push({
+        lease,
+        originalGroupId: tab.groupId,
+        tab,
+        tabId: lease.tabId,
+        windowId: tab.windowId
+      });
+    }
+
+    const recordsByWindow = new Map();
+    for (const record of liveRecords) {
+      if (!recordsByWindow.has(record.windowId)) recordsByWindow.set(record.windowId, []);
+      recordsByWindow.get(record.windowId).push(record);
+    }
+    const groups = [];
+    try {
+      for (const [windowId, records] of [...recordsByWindow.entries()].sort(([left], [right]) => left - right)) {
+        const preferredGroupId = records.find((record) => (
+          Number.isInteger(record.lease.groupId)
+          && record.lease.groupId >= 0
+        ))?.lease.groupId ?? null;
+        const groupId = await ensureManagedSessionGroup(sessionId, records.map((record) => record.tabId), preferredGroupId);
+        groups.push({ groupId, windowId });
+        for (const record of records) {
+          const resumed = record.lease.state === "handoff"
+            ? { ...record.lease, claimedAt: Date.now(), state: "active", turnId }
+            : record.lease;
+          nextLeases.set(record.tabId, { ...resumed, groupId, windowId });
+        }
+      }
+      for (const tabId of recoveredTabIds) await chrome.tabs.update(tabId, { active: true });
+    } catch (error) {
+      await restoreTabGroups(liveRecords);
+      throw error;
     }
 
     await persistTabLeases(nextLeases);
     replaceTabLeases(nextLeases);
-    if (rejectedLiveTabIds.length > 0 && typeof chrome.tabs.ungroup === "function") {
-      await chrome.tabs.ungroup(rejectedLiveTabIds).catch(() => {});
-    }
-
-    let groupId = null;
-    if (liveLeases.length > 0) {
-      const preferredGroupId = liveLeases.find((lease) => Number.isInteger(lease.groupId) && lease.groupId >= 0)?.groupId ?? null;
-      groupId = await ensureManagedSessionGroup(sessionId, liveLeases.map((lease) => lease.tabId), preferredGroupId);
-      if (liveLeases.some((lease) => lease.groupId !== groupId)) {
-        const regroupedLeases = new Map(tabLeases);
-        for (const lease of liveLeases) regroupedLeases.set(lease.tabId, { ...regroupedLeases.get(lease.tabId), groupId });
-        await persistTabLeases(regroupedLeases);
-        replaceTabLeases(regroupedLeases);
-      }
-    }
-    for (const tabId of recoveredTabIds) await chrome.tabs.update(tabId, { active: true });
-    return { groupId, recoveredTabIds, sessionId, skipped, turnId };
+    await ungroupTabsIfAvailable(rejectedLiveTabIds);
+    return {
+      groupId: groups.length === 1 ? groups[0].groupId : null,
+      groups,
+      recoveredTabIds,
+      sessionId,
+      skipped,
+      turnId
+    };
   });
 }
 
 function assertClaimableTab(tab) {
-  if (typeof tab.url !== "string") return;
-  let parsed;
-  try {
-    parsed = new URL(tab.url);
-  } catch {
-    return;
-  }
-  if (parsed.protocol === "chrome:" || parsed.protocol === "chrome-extension:") {
-    throw new Error(`Chrome internal tab ${tab.id} cannot be claimed`);
+  if (!isClaimableUrl(tab?.url)) {
+    throw new Error(`Chrome internal tab ${tab?.id ?? "unknown"} cannot be claimed because its URL is unsupported or invalid`);
   }
 }
 
@@ -1264,6 +1317,7 @@ function isValidStoredTabLease(tabId, value) {
     && (value.state === "active" || value.state === "handoff")
     && Number.isFinite(value.claimedAt)
     && (value.groupId === undefined || (Number.isInteger(value.groupId) && value.groupId >= 0))
+    && (value.windowId === undefined || Number.isInteger(value.windowId))
     && (value.state !== "handoff" || value.handoffStatus === "handoff" || value.handoffStatus === "deliverable");
 }
 

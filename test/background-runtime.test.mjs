@@ -170,6 +170,36 @@ test("claimed tabs reuse one named colored group per browser session", async () 
   assert.equal(stored.opencodeTabLeases["8"].groupId, 41);
 });
 
+test("claimTab restores the original UI group and leaves no lease when group styling fails", async () => {
+  let stored = {};
+  let failUpdate = true;
+  const ungrouped = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ groupId: -1, id: tabId, url: "https://example.com", windowId: 1 }),
+    tabsGroup: async (options) => options.groupId ?? 41,
+    tabsUngroup: async (tabIds) => { ungrouped.push(...tabIds); },
+    tabGroupsUpdate: async (groupId, update) => {
+      if (failUpdate) throw new Error("group update failed");
+      return { id: groupId, ...update };
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" }),
+    /group update failed/u
+  );
+  assert.equal(stored.opencodeTabLeases, undefined);
+  assert.deepEqual(ungrouped, [7]);
+
+  failUpdate = false;
+  const claimed = await harness.execute("claimTab", {
+    tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user"
+  });
+  assert.equal(claimed.sessionId, "session-b");
+});
+
 test("created navigation targets are adopted only from their own leased web session", async () => {
   let stored = {};
   const grouped = [];
@@ -270,6 +300,29 @@ test("created navigation targets adopt a legitimate about:blank popup", async ()
   assert.equal(stored.opencodeTabLeases["8"].groupId, 41);
 });
 
+test("created navigation targets ignore handoff sources", async () => {
+  const sourceLease = {
+    claimedAt: 1, groupId: 41, origin: "user", sessionId: "session-a",
+    state: "handoff", handoffStatus: "handoff", tabId: 7, turnId: "turn-a"
+  };
+  let stored = { opencodeTabLeases: { "7": sourceLease } };
+  let grouped = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com", windowId: 1 }),
+    tabsGroup: async () => { grouped += 1; return 41; }
+  });
+
+  await harness.events.webNavigationOnCreatedNavigationTarget.emit({
+    sourceTabId: 7, tabId: 8, url: "https://child.example"
+  });
+  await harness.awaitTabLeaseQueue();
+
+  assert.equal(stored.opencodeTabLeases["8"], undefined);
+  assert.equal(grouped, 0);
+});
+
 test("resumeSession recovers handoff tabs after restart and removes stale leases", async () => {
   const lease = (tabId, state, extra = {}) => ({
     claimedAt: 1, groupId: 41, origin: "agent", sessionId: "session-a",
@@ -306,6 +359,104 @@ test("resumeSession recovers handoff tabs after restart and removes stale leases
   assert.equal(activated.length, 1);
   assert.equal(activated[0].tabId, 7);
   assert.equal(activated[0].update.active, true);
+});
+
+for (const failureStage of ["group", "groupUpdate", "activate", "persist"]) {
+  test(`resumeSession preserves handoff and succeeds on retry after ${failureStage} failure`, async () => {
+    const handoff = {
+      claimedAt: 1, groupId: 41, origin: "agent", sessionId: "session-a",
+      state: "handoff", handoffStatus: "handoff", tabId: 7, turnId: "turn-old"
+    };
+    let stored = { opencodeTabLeases: { "7": handoff } };
+    let failureEnabled = true;
+    const harness = createBackgroundHarness({
+      storageGet: async () => stored,
+      storageSet: async (value) => {
+        if (failureStage === "persist" && failureEnabled) throw new Error("persist failed");
+        stored = structuredClone(value);
+      },
+      tabsGet: async (tabId) => ({ groupId: 41, id: tabId, url: "https://live.example", windowId: 1 }),
+      tabsGroup: async (options) => {
+        if (failureStage === "group" && failureEnabled) throw new Error("group failed");
+        return options.groupId ?? 51;
+      },
+      tabGroupsUpdate: async (groupId, update) => {
+        if (failureStage === "groupUpdate" && failureEnabled) throw new Error("group update failed");
+        return { id: groupId, ...update };
+      },
+      tabsUpdate: async (tabId, update) => {
+        if (failureStage === "activate" && failureEnabled) throw new Error("activate failed");
+        return { active: true, id: tabId, url: "https://live.example", windowId: 1, ...update };
+      }
+    });
+
+    await assert.rejects(
+      harness.execute("resumeSession", { sessionId: "session-a", turnId: "turn-new" }),
+      /failed/u
+    );
+    assert.equal(stored.opencodeTabLeases["7"].state, "handoff");
+    assert.equal(stored.opencodeTabLeases["7"].turnId, "turn-old");
+
+    failureEnabled = false;
+    const retry = await harness.execute("resumeSession", { sessionId: "session-a", turnId: "turn-new" });
+    assert.equal(JSON.stringify(retry.recoveredTabIds), JSON.stringify([7]));
+    assert.equal(stored.opencodeTabLeases["7"].state, "active");
+    assert.equal(stored.opencodeTabLeases["7"].turnId, "turn-new");
+  });
+}
+
+test("resumeSession creates one managed group per window and repairs stale group ids", async () => {
+  const handoff = (tabId, groupId) => ({
+    claimedAt: 1, groupId, origin: "agent", sessionId: "session-a",
+    state: "handoff", handoffStatus: "handoff", tabId, turnId: "turn-old"
+  });
+  let stored = { opencodeTabLeases: { "7": handoff(7, 41), "8": handoff(8, 42) } };
+  const grouped = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ groupId: tabId === 7 ? -1 : 42, id: tabId, url: "https://live.example", windowId: tabId === 7 ? 1 : 2 }),
+    tabsGroup: async (options) => {
+      grouped.push(structuredClone(options));
+      if (options.groupId === 41) throw new Error("stale group");
+      return options.groupId ?? 51;
+    }
+  });
+
+  const result = await harness.execute("resumeSession", { sessionId: "session-a", turnId: "turn-new" });
+
+  assert.equal(JSON.stringify(result.groups), JSON.stringify([
+    { groupId: 51, windowId: 1 },
+    { groupId: 42, windowId: 2 }
+  ]));
+  assert.equal(stored.opencodeTabLeases["7"].groupId, 51);
+  assert.equal(stored.opencodeTabLeases["7"].windowId, 1);
+  assert.equal(stored.opencodeTabLeases["8"].groupId, 42);
+  assert.equal(stored.opencodeTabLeases["8"].windowId, 2);
+  assert.equal(grouped.some((entry) => entry.tabIds.includes(7) && entry.tabIds.includes(8)), false);
+});
+
+test("resumeSession removes malformed and internal tabs without activating them", async () => {
+  const handoff = (tabId) => ({
+    claimedAt: 1, groupId: 41, origin: "agent", sessionId: "session-a",
+    state: "handoff", handoffStatus: "handoff", tabId, turnId: "turn-old"
+  });
+  let stored = { opencodeTabLeases: Object.fromEntries([7, 8, 9, 10, 11].map((tabId) => [String(tabId), handoff(tabId)])) };
+  const urls = new Map([[7, undefined], [8, "not a url"], [9, "devtools://devtools/bundled/inspector.html"], [10, "chrome-untrusted://new-tab-page"], [11, "https://safe.example"]]);
+  const activated = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ groupId: 41, id: tabId, url: urls.get(tabId), windowId: 1 }),
+    tabsGroup: async (options) => options.groupId ?? 41,
+    tabsUpdate: async (tabId, update) => { activated.push(tabId); return { id: tabId, ...update }; }
+  });
+
+  const result = await harness.execute("resumeSession", { sessionId: "session-a", turnId: "turn-new" });
+
+  assert.equal(JSON.stringify(result.recoveredTabIds), JSON.stringify([11]));
+  assert.equal(JSON.stringify(activated), JSON.stringify([11]));
+  for (const tabId of [7, 8, 9, 10]) assert.equal(stored.opencodeTabLeases[String(tabId)], undefined);
 });
 
 test("child adoption remains grouped and fail closed when session storage cannot persist", async () => {
