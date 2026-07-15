@@ -157,6 +157,7 @@ test("claimed tabs reuse one named colored group per browser session", async () 
   await harness.execute("claimTab", { tabId: 8, sessionId: "session-a", turnId: "turn-a", origin: "agent" });
 
   assert.equal(JSON.stringify(grouped[0].tabIds), JSON.stringify([7]));
+  assert.equal(grouped[0].createProperties.windowId, 1);
   assert.equal(grouped[0].groupId, undefined);
   assert.equal(JSON.stringify(grouped[1].tabIds), JSON.stringify([8]));
   assert.equal(grouped[1].groupId, 41);
@@ -198,6 +199,45 @@ test("claimTab restores the original UI group and leaves no lease when group sty
     tabId: 7, sessionId: "session-b", turnId: "turn-b", origin: "user"
   });
   assert.equal(claimed.sessionId, "session-b");
+});
+
+test("claimTab recreates a deleted original group with its metadata when managed styling fails", async () => {
+  let stored = {};
+  const groupCalls = [];
+  const updates = [];
+  const harness = createBackgroundHarness({
+    storageGet: async () => stored,
+    storageSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ groupId: 9, id: tabId, url: "https://example.com", windowId: 3 }),
+    tabGroupsGet: async (groupId) => {
+      if (groupId !== 9) throw new Error("missing group");
+      return { collapsed: true, color: "red", id: 9, title: "Original", windowId: 3 };
+    },
+    tabsGroup: async (options) => {
+      groupCalls.push(structuredClone(options));
+      if (options.groupId === 9) throw new Error("No group with id: 9");
+      if (options.createProperties?.windowId === 3 && groupCalls.length === 1) return 41;
+      return 77;
+    },
+    tabGroupsUpdate: async (groupId, update) => {
+      updates.push({ groupId, update: structuredClone(update) });
+      if (groupId === 41) throw new Error("managed style failed");
+      return { id: groupId, ...update };
+    }
+  });
+
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" }),
+    /managed style failed/u
+  );
+
+  assert.equal(stored.opencodeTabLeases, undefined);
+  assert.ok(groupCalls.some((entry) => entry.groupId === 9));
+  assert.ok(groupCalls.some((entry) => entry.createProperties?.windowId === 3 && entry.groupId === undefined));
+  assert.deepEqual(updates.at(-1), {
+    groupId: 77,
+    update: { collapsed: true, color: "red", title: "Original" }
+  });
 });
 
 test("created navigation targets are adopted only from their own leased web session", async () => {
@@ -416,9 +456,12 @@ test("resumeSession creates one managed group per window and repairs stale group
     storageGet: async () => stored,
     storageSet: async (value) => { stored = structuredClone(value); },
     tabsGet: async (tabId) => ({ groupId: tabId === 7 ? -1 : 42, id: tabId, url: "https://live.example", windowId: tabId === 7 ? 1 : 2 }),
+    tabGroupsGet: async (groupId) => {
+      if (groupId === 41) return { color: "blue", id: 41, title: "OpenCode · session-a", windowId: 9 };
+      return { color: "blue", id: groupId, title: "OpenCode · session-a", windowId: 2 };
+    },
     tabsGroup: async (options) => {
       grouped.push(structuredClone(options));
-      if (options.groupId === 41) throw new Error("stale group");
       return options.groupId ?? 51;
     }
   });
@@ -434,6 +477,8 @@ test("resumeSession creates one managed group per window and repairs stale group
   assert.equal(stored.opencodeTabLeases["8"].groupId, 42);
   assert.equal(stored.opencodeTabLeases["8"].windowId, 2);
   assert.equal(grouped.some((entry) => entry.tabIds.includes(7) && entry.tabIds.includes(8)), false);
+  assert.equal(grouped.some((entry) => entry.groupId === 41), false);
+  assert.ok(grouped.some((entry) => entry.createProperties?.windowId === 1));
 });
 
 test("resumeSession removes malformed and internal tabs without activating them", async () => {
@@ -2160,6 +2205,9 @@ function createBackgroundHarness({
   tabsUngroup = async () => {},
   tabsUpdate = async (tabId, update) => ({ active: true, id: tabId, index: 0, title: "Example", url: update.url, windowId: 1 }),
   tabGroupsUpdate = async (groupId, update) => ({ id: groupId, ...update }),
+  tabGroupsGet = async (groupId) => ({
+    color: "blue", id: groupId, title: "OpenCode · session-a", windowId: groupId === 42 ? 2 : 1
+  }),
   windowsCreate = async () => ({ id: 2, tabs: [] }),
   windowsGet = async (windowId) => ({ id: windowId }),
   windowsUpdate = async (windowId) => ({ id: windowId })
@@ -2232,6 +2280,7 @@ function createBackgroundHarness({
     storage,
     tabGroups: {
       onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent(),
+      get: tabGroupsGet,
       update: tabGroupsUpdate
     },
     tabs: {

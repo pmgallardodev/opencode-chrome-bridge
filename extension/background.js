@@ -917,12 +917,12 @@ async function claimTab(params) {
       throw new Error(`Tab ${tabId} is already part of browser session ${existing.sessionId}`);
     }
     const preferredGroupId = sessionGroupId(sessionId, windowId);
+    const originalGroup = await captureOriginalTabGroup(tab);
     let groupId;
     try {
-      groupId = await ensureManagedSessionGroup(sessionId, [tabId], preferredGroupId);
+      groupId = await ensureManagedSessionGroup(sessionId, [tabId], windowId, preferredGroupId);
     } catch (error) {
-      await restoreTabGroups([{ originalGroupId: tab.groupId, tabId, windowId }]);
-      throw error;
+      await restoreOrThrow([{ originalGroup, tabId, windowId }], error);
     }
     const nextLeases = new Map(tabLeases);
     nextLeases.set(tabId, {
@@ -960,22 +960,49 @@ function sessionGroupId(sessionId, windowId) {
   return null;
 }
 
-async function ensureManagedSessionGroup(sessionId, tabIds, preferredGroupId = null, allowFallback = true) {
+async function ensureManagedSessionGroup(sessionId, tabIds, windowId, preferredGroupId = null) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) throw new Error("managed session group requires at least one tab");
-  const groupOptions = { tabIds: [...new Set(tabIds)] };
-  if (Number.isInteger(preferredGroupId) && preferredGroupId >= 0) groupOptions.groupId = preferredGroupId;
+  if (!Number.isInteger(windowId)) throw new Error("managed session group requires a valid windowId");
+  const uniqueTabIds = [...new Set(tabIds)];
+  let reusableGroupId = null;
+  if (Number.isInteger(preferredGroupId) && preferredGroupId >= 0) {
+    try {
+      const group = await chrome.tabGroups.get(preferredGroupId);
+      if (
+        group?.id === preferredGroupId
+        && group.windowId === windowId
+        && group.title === managedGroupTitle(sessionId)
+        && group.color === MANAGED_GROUP_COLOR
+      ) reusableGroupId = preferredGroupId;
+    } catch {
+      reusableGroupId = null;
+    }
+  }
   let groupId;
-  try {
-    groupId = await chrome.tabs.group(groupOptions);
-  } catch (error) {
-    if (groupOptions.groupId === undefined || !allowFallback) throw error;
-    groupId = await chrome.tabs.group({ tabIds: groupOptions.tabIds });
+  if (reusableGroupId !== null) {
+    try {
+      groupId = await chrome.tabs.group({ groupId: reusableGroupId, tabIds: uniqueTabIds });
+    } catch {
+      groupId = await chrome.tabs.group({
+        createProperties: { windowId },
+        tabIds: uniqueTabIds
+      });
+    }
+  } else {
+    groupId = await chrome.tabs.group({
+      createProperties: { windowId },
+      tabIds: uniqueTabIds
+    });
   }
   await chrome.tabGroups.update(groupId, {
     color: MANAGED_GROUP_COLOR,
-    title: `${MANAGED_GROUP_TITLE_PREFIX}${sessionId}`.slice(0, 255)
+    title: managedGroupTitle(sessionId)
   });
   return groupId;
+}
+
+function managedGroupTitle(sessionId) {
+  return `${MANAGED_GROUP_TITLE_PREFIX}${sessionId}`.slice(0, 255);
 }
 
 function requireTabWindowId(tab) {
@@ -983,20 +1010,62 @@ function requireTabWindowId(tab) {
   return tab.windowId;
 }
 
+async function captureOriginalTabGroup(tab) {
+  if (!Number.isInteger(tab?.groupId) || tab.groupId < 0) return null;
+  const group = await chrome.tabGroups.get(tab.groupId);
+  if (!group || group.id !== tab.groupId || group.windowId !== tab.windowId) {
+    throw new Error(`Tab ${tab.id} has invalid original group metadata`);
+  }
+  return {
+    collapsed: group.collapsed === true,
+    color: group.color,
+    id: group.id,
+    title: typeof group.title === "string" ? group.title : "",
+    windowId: group.windowId
+  };
+}
+
+async function restoreOrThrow(records, originalError) {
+  try {
+    await restoreTabGroups(records);
+  } catch (rollbackError) {
+    throw new Error(
+      `${originalError?.message || originalError}; rollback failed: ${rollbackError?.message || rollbackError}`,
+      { cause: originalError }
+    );
+  }
+  throw originalError;
+}
+
 async function restoreTabGroups(records) {
   const grouped = new Map();
   const ungrouped = [];
   for (const record of records) {
-    if (Number.isInteger(record.originalGroupId) && record.originalGroupId >= 0) {
-      const key = `${record.windowId}:${record.originalGroupId}`;
-      if (!grouped.has(key)) grouped.set(key, { groupId: record.originalGroupId, tabIds: [] });
+    if (record.originalGroup !== null) {
+      const key = `${record.originalGroup.windowId}:${record.originalGroup.id}`;
+      if (!grouped.has(key)) grouped.set(key, { group: record.originalGroup, tabIds: [] });
       grouped.get(key).tabIds.push(record.tabId);
     } else {
       ungrouped.push(record.tabId);
     }
   }
-  for (const entry of grouped.values()) await chrome.tabs.group(entry).catch(() => {});
-  await ungroupTabsIfAvailable(ungrouped);
+  for (const { group, tabIds } of grouped.values()) {
+    let restoredGroupId = group.id;
+    try {
+      await chrome.tabs.group({ groupId: group.id, tabIds });
+    } catch {
+      restoredGroupId = await chrome.tabs.group({
+        createProperties: { windowId: group.windowId },
+        tabIds
+      });
+    }
+    await chrome.tabGroups.update(restoredGroupId, {
+      collapsed: group.collapsed,
+      color: group.color,
+      title: group.title
+    });
+  }
+  if (ungrouped.length > 0) await chrome.tabs.ungroup(ungrouped);
 }
 
 function isClaimableUrl(value) {
@@ -1037,12 +1106,12 @@ async function adoptCreatedNavigationTarget(details) {
     assertClaimableTab(tab);
     const windowId = requireTabWindowId(tab);
     const preferredGroupId = sessionGroupId(sourceLease.sessionId, windowId);
+    const originalGroup = await captureOriginalTabGroup(tab);
     let groupId;
     try {
-      groupId = await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], preferredGroupId);
+      groupId = await ensureManagedSessionGroup(sourceLease.sessionId, [details.tabId], windowId, preferredGroupId);
     } catch (error) {
-      await restoreTabGroups([{ originalGroupId: tab.groupId, tabId: details.tabId, windowId }]);
-      throw error;
+      await restoreOrThrow([{ originalGroup, tabId: details.tabId, windowId }], error);
     }
     const adoptedLease = {
       claimedAt: Date.now(),
@@ -1102,7 +1171,7 @@ async function resumeSession(params) {
       if (lease.state === "handoff") recoveredTabIds.push(lease.tabId);
       liveRecords.push({
         lease,
-        originalGroupId: tab.groupId,
+        originalGroup: await captureOriginalTabGroup(tab),
         tab,
         tabId: lease.tabId,
         windowId: tab.windowId
@@ -1121,7 +1190,12 @@ async function resumeSession(params) {
           Number.isInteger(record.lease.groupId)
           && record.lease.groupId >= 0
         ))?.lease.groupId ?? null;
-        const groupId = await ensureManagedSessionGroup(sessionId, records.map((record) => record.tabId), preferredGroupId);
+        const groupId = await ensureManagedSessionGroup(
+          sessionId,
+          records.map((record) => record.tabId),
+          windowId,
+          preferredGroupId
+        );
         groups.push({ groupId, windowId });
         for (const record of records) {
           const resumed = record.lease.state === "handoff"
@@ -1132,8 +1206,7 @@ async function resumeSession(params) {
       }
       for (const tabId of recoveredTabIds) await chrome.tabs.update(tabId, { active: true });
     } catch (error) {
-      await restoreTabGroups(liveRecords);
-      throw error;
+      await restoreOrThrow(liveRecords, error);
     }
 
     await persistTabLeases(nextLeases);
