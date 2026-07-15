@@ -300,6 +300,149 @@ test("accessibilityTree injects the snapshot script and returns its result", asy
   assert.equal(funcCall.args[0].interactiveOnly, false);
 });
 
+test("tabContext injects the isolated page reader with bounded options", async () => {
+  const injections = [];
+  const contextResult = {
+    dimensions: {
+      document: { height: 2000, width: 1200 },
+      viewport: { deviceScaleFactor: 2, height: 700, scrollX: 0, scrollY: 10, width: 1100 }
+    },
+    mimeType: "text/html",
+    selectedElementRefs: ["e4"],
+    selection: { refs: ["e4"], text: "Selected" },
+    title: "Example",
+    truncated: { selection: false, visibleText: false },
+    url: "https://example.com/",
+    visibleText: "Visible page text"
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      return injection.files ? [] : [{ result: contextResult }];
+    }
+  });
+
+  const result = await harness.execute("tabContext", {
+    maxChars: 3210,
+    maxSelectionChars: 456,
+    tabId: 7
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.visibleText, "Visible page text");
+  assert.deepEqual([...result.selectedElementRefs], ["e4"]);
+  assert.ok(injections.some((injection) => injection.files?.[0] === "content-scripts/a11y.js"));
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, { maxChars: 3210, maxSelectionChars: 456 });
+});
+
+test("readPage returns one combined context and accessibility result with an optional screenshot", async () => {
+  const injections = [];
+  const captures = [];
+  const combined = {
+    accessibility: {
+      nodeCount: 1,
+      title: "Example",
+      tree: '[e1] button "Continue"',
+      truncated: false,
+      url: "https://example.com/"
+    },
+    context: {
+      dimensions: {
+        document: { height: 1200, width: 900 },
+        viewport: { deviceScaleFactor: 1, height: 720, scrollX: 0, scrollY: 0, width: 900 }
+      },
+      mimeType: "text/html",
+      selectedElementRefs: [],
+      selection: { refs: [], text: "" },
+      title: "Example",
+      truncated: { selection: false, visibleText: false },
+      url: "https://example.com/",
+      visibleText: "Page text"
+    }
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => {
+      injections.push(injection);
+      return injection.files ? [] : [{ result: combined }];
+    },
+    tabsCaptureVisibleTab: async (windowId, options) => {
+      captures.push({ options, windowId });
+      return "data:image/jpeg;base64,/9j/2Q==";
+    }
+  });
+
+  const result = await harness.execute("readPage", {
+    includeScreenshot: true,
+    interactiveOnly: false,
+    maxChars: 4000,
+    maxNodes: 200,
+    maxSelectionChars: 300,
+    screenshotFormat: "jpeg",
+    screenshotQuality: 72,
+    tabId: 7
+  });
+
+  assert.equal(result.tabId, 7);
+  assert.equal(result.context.visibleText, "Page text");
+  assert.match(result.accessibility.tree, /Continue/u);
+  assert.equal(result.screenshot.dataUrl, "data:image/jpeg;base64,/9j/2Q==");
+  assert.equal(
+    JSON.stringify(captures),
+    JSON.stringify([{ options: { format: "jpeg", quality: 72 }, windowId: 1 }])
+  );
+  assert.equal(injections.filter((injection) => injection.files).length, 1);
+  assert.equal(injections.filter((injection) => typeof injection.func === "function").length, 1);
+  const funcCall = injections.find((injection) => typeof injection.func === "function");
+  assert.deepEqual({ ...funcCall.args[0] }, {
+    interactiveOnly: false,
+    maxChars: 4000,
+    maxNodes: 200,
+    maxSelectionChars: 300
+  });
+});
+
+test("readPage omits screenshot capture unless explicitly requested", async () => {
+  let captures = 0;
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => {
+      captures += 1;
+      return "data:image/png;base64,iVBORw0KGgo=";
+    }
+  });
+
+  const result = await harness.execute("readPage", { tabId: 7 });
+
+  assert.equal(result.screenshot, null);
+  assert.equal(captures, 0);
+});
+
+test("tabContext and readPage fail closed on malformed isolated-world results", async () => {
+  const malformedContext = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { visibleText: 42 } }]
+  });
+  await assert.rejects(
+    malformedContext.execute("tabContext", { tabId: 7 }),
+    /tab context result is invalid/u
+  );
+
+  const malformedRead = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files
+      ? []
+      : [{ result: { accessibility: null, context: null } }]
+  });
+  await assert.rejects(
+    malformedRead.execute("readPage", { tabId: 7 }),
+    /read page result is invalid/u
+  );
+});
+
 test("clickElement locates the reference and clicks its center through CDP", async () => {
   const mouseEvents = [];
   const harness = createBackgroundHarness({
@@ -870,6 +1013,7 @@ function createBackgroundHarness({
   scriptingExecuteScript = null,
   storageLocalGet = async () => ({}),
   storageManagedGet = null,
+  tabsCaptureVisibleTab = async () => "data:image/png;base64,iVBORw0KGgo=",
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
   tabsGet = async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }),
   tabsRemove = async () => {},
@@ -941,6 +1085,7 @@ function createBackgroundHarness({
     storage,
     tabGroups: { onCreated: createEvent(), onMoved: createEvent(), onRemoved: createEvent(), onUpdated: createEvent() },
     tabs: {
+      captureVisibleTab: tabsCaptureVisibleTab,
       create: tabsCreate,
       get: tabsGet,
       onActivated: createEvent(),

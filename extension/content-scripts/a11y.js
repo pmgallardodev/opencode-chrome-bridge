@@ -182,6 +182,174 @@ if (!window.__opencodeA11yInstalled) {
     return element.shadowRoot ?? null;
   }
 
+  function sanitizePageUrl(value) {
+    try {
+      const url = new URL(String(value));
+      url.username = "";
+      url.password = "";
+      url.hash = "";
+      for (const key of [...url.searchParams.keys()]) {
+        if (/^(?:access[_-]?token|api[_-]?key|auth|authorization|code|credential|key|pass|password|secret|session|token)$/iu.test(key)) {
+          url.searchParams.set(key, "[redacted]");
+        }
+      }
+      return url.href;
+    } catch {
+      return "";
+    }
+  }
+
+  function boundedText(value, maxChars) {
+    const text = String(value ?? "").replace(/\s+/gu, " ").trim();
+    return {
+      text: text.slice(0, maxChars),
+      truncated: text.length > maxChars
+    };
+  }
+
+  function visiblePageText(root, maxChars) {
+    let text = "";
+    let truncated = false;
+
+    function append(value) {
+      if (truncated) return;
+      const normalized = String(value ?? "").replace(/\s+/gu, " ").trim();
+      if (!normalized) return;
+      const separator = text ? " " : "";
+      const available = maxChars - text.length;
+      if (available <= separator.length) {
+        truncated = true;
+        return;
+      }
+      const candidate = `${separator}${normalized}`;
+      if (candidate.length > available) {
+        text += candidate.slice(0, available);
+        truncated = true;
+        return;
+      }
+      text += candidate;
+    }
+
+    function walkElement(element) {
+      if (truncated || !element || SKIP_TAGS.has(element.tagName)) return;
+      if (typeof element.getClientRects === "function" && !isVisible(element)) return;
+
+      if (isSensitiveField(element)) {
+        if (element.value || element.textContent || (element.childNodes?.length ?? 0) > 0) append("[redacted]");
+        return;
+      }
+
+      const tag = String(element.tagName ?? "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") {
+        const rawValue = tag === "select"
+          ? element.options?.[element.selectedIndex]?.textContent
+          : element.value;
+        if (rawValue) append(rawValue);
+      }
+
+      for (const node of element.childNodes ?? []) {
+        if (truncated) return;
+        if (node.nodeType === Node.TEXT_NODE) append(node.textContent);
+        else if (node?.tagName) walkElement(node);
+      }
+      const shadow = shadowRootOf(element);
+      if (shadow) {
+        for (const child of shadow.children ?? []) walkElement(child);
+      }
+    }
+
+    for (const element of root?.children ?? []) walkElement(element);
+    return { text, truncated };
+  }
+
+  function elementFromSelectionNode(node) {
+    if (!node) return null;
+    return node.tagName ? node : node.parentElement ?? null;
+  }
+
+  function hasSensitiveAncestor(element) {
+    let current = element;
+    while (current) {
+      if (isSensitiveField(current)) return true;
+      current = current.parentElement ?? null;
+    }
+    return false;
+  }
+
+  function selectionContext(maxSelectionChars) {
+    const active = document.activeElement;
+    const tag = String(active?.tagName ?? "").toLowerCase();
+    if ((tag === "input" || tag === "textarea")
+      && Number.isInteger(active.selectionStart)
+      && Number.isInteger(active.selectionEnd)
+      && active.selectionEnd > active.selectionStart) {
+      const selection = isSensitiveField(active)
+        ? { text: "[redacted]", truncated: false }
+        : boundedText(String(active.value ?? "").slice(active.selectionStart, active.selectionEnd), maxSelectionChars);
+      const ref = refFor(active);
+      return { ...selection, refs: [ref] };
+    }
+
+    const browserSelection = window.getSelection?.();
+    if (!browserSelection || browserSelection.rangeCount === 0) {
+      return { refs: [], text: "", truncated: false };
+    }
+    const selectedElements = [
+      elementFromSelectionNode(browserSelection.anchorNode),
+      elementFromSelectionNode(browserSelection.focusNode)
+    ].filter(Boolean);
+    const refs = [...new Set(selectedElements.map((element) => refFor(element)))];
+    const sensitive = selectedElements.some((element) => hasSensitiveAncestor(element));
+    const selection = sensitive
+      ? { text: "[redacted]", truncated: false }
+      : boundedText(browserSelection.toString(), maxSelectionChars);
+    return { ...selection, refs };
+  }
+
+  function finiteDimension(...values) {
+    const finite = values.filter((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
+    return finite.length > 0 ? Math.round(Math.max(...finite)) : 0;
+  }
+
+  window.__opencodeTabContext = function (options) {
+    const maxChars = clampInt(options?.maxChars, 100, 200000, 50000);
+    const maxSelectionChars = clampInt(options?.maxSelectionChars, 1, 10000, 2000);
+    const visible = visiblePageText(document.body ?? document.documentElement, maxChars);
+    const selection = selectionContext(maxSelectionChars);
+    const documentElement = document.documentElement ?? {};
+    const body = document.body ?? {};
+    return {
+      url: sanitizePageUrl(location.href),
+      title: boundedText(document.title, 1000).text,
+      mimeType: boundedText(document.contentType || "", 200).text,
+      visibleText: visible.text,
+      returnedChars: visible.text.length,
+      totalChars: visible.truncated ? null : visible.text.length,
+      selection: {
+        text: selection.text,
+        refs: selection.refs
+      },
+      selectedElementRefs: selection.refs,
+      dimensions: {
+        viewport: {
+          width: finiteDimension(window.innerWidth, documentElement.clientWidth),
+          height: finiteDimension(window.innerHeight, documentElement.clientHeight),
+          scrollX: finiteDimension(window.scrollX),
+          scrollY: finiteDimension(window.scrollY),
+          deviceScaleFactor: finiteDimension(window.devicePixelRatio) || 1
+        },
+        document: {
+          width: finiteDimension(documentElement.scrollWidth, documentElement.clientWidth, body.scrollWidth, body.clientWidth),
+          height: finiteDimension(documentElement.scrollHeight, documentElement.clientHeight, body.scrollHeight, body.clientHeight)
+        }
+      },
+      truncated: {
+        visibleText: visible.truncated,
+        selection: selection.truncated
+      }
+    };
+  };
+
   window.__opencodeA11yGenerate = function (options) {
     const maxNodes = clampInt(options?.maxNodes, 1, 2000, 800);
     const maxChars = clampInt(options?.maxChars, 100, 200000, 50000);

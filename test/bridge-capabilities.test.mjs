@@ -490,6 +490,23 @@ test("OpenCode plugin exposes chrome_wizard_step, chrome_screenshot_region, and 
   );
 });
 
+test("OpenCode plugin exposes bounded tab context and combined page reading tools", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+
+  for (const toolName of ["chrome_tab_context", "chrome_read_page"]) {
+    assert.ok(plugin.tool[toolName], `${toolName} tool missing`);
+    assert.match(plugin.tool[toolName].description, /page|context/iu);
+  }
+  assert.match(plugin.tool.chrome_tab_context.description, /selection|visible text/iu);
+  assert.match(plugin.tool.chrome_read_page.description, /accessibility|screenshot/iu);
+
+  const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
+  assert.match(source, /chrome_tab_context[\s\S]{0,3000}maxChars[\s\S]{0,1000}outputDirectory/u);
+  assert.match(source, /chrome_read_page[\s\S]{0,4000}includeScreenshot[\s\S]{0,1500}outputDirectory/u);
+  assert.match(source, /bridgeCommand\("tabContext"/u);
+  assert.match(source, /bridgeCommand\("readPage"/u);
+});
+
 test("dangerous and private-data tools require user approval before running", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const gatedTools = Object.keys(plugin.tool).filter((name) => name !== "chrome_status");

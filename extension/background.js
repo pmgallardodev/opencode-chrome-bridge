@@ -10,6 +10,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.events",
   "browser.history",
   "browser.navigation",
+  "browser.page-context",
   "browser.screenshots",
   "browser.tab-groups",
   "browser.tabs",
@@ -385,6 +386,10 @@ async function executeCommand(method, params) {
       return setFaviconBadge(params);
     case "accessibilityTree":
       return accessibilityTree(params);
+    case "tabContext":
+      return tabContext(params);
+    case "readPage":
+      return readPage(params);
     case "clickElement":
       return clickElement(params);
     case "fillElement":
@@ -1684,6 +1689,85 @@ async function accessibilityTree(params) {
     [{ maxNodes, maxChars, interactiveOnly }]
   );
   return { tabId, ...result };
+}
+
+async function tabContext(params) {
+  const tabId = requireTabId(params);
+  const maxChars = clampInteger(params.maxChars, 100, 200000, 50000, "maxChars");
+  const maxSelectionChars = clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars");
+  await injectA11yScript(tabId);
+  const result = await runInA11yWorld(
+    tabId,
+    (options) => window.__opencodeTabContext ? window.__opencodeTabContext(options) : null,
+    [{ maxChars, maxSelectionChars }]
+  );
+  validateTabContextResult(result, "tab context");
+  return { tabId, ...result };
+}
+
+async function readPage(params) {
+  const tabId = requireTabId(params);
+  const options = {
+    interactiveOnly: params.interactiveOnly === true,
+    maxChars: clampInteger(params.maxChars, 100, 200000, 50000, "maxChars"),
+    maxNodes: clampInteger(params.maxNodes, 1, 2000, 800, "maxNodes"),
+    maxSelectionChars: clampInteger(params.maxSelectionChars, 1, 10000, 2000, "maxSelectionChars")
+  };
+  await injectA11yScript(tabId);
+  const combined = await runInA11yWorld(
+    tabId,
+    (readOptions) => {
+      if (!window.__opencodeTabContext || !window.__opencodeA11yGenerate) return null;
+      return {
+        context: window.__opencodeTabContext(readOptions),
+        accessibility: window.__opencodeA11yGenerate(readOptions)
+      };
+    },
+    [options]
+  );
+  validateReadPageResult(combined);
+  const screenshot = params.includeScreenshot === true
+    ? await captureScreenshot({
+        format: params.screenshotFormat,
+        quality: params.screenshotQuality,
+        tabId
+      })
+    : null;
+  return {
+    tabId,
+    context: combined.context,
+    accessibility: combined.accessibility,
+    screenshot
+  };
+}
+
+function validateReadPageResult(result) {
+  if (!isRecord(result)
+    || !isRecord(result.accessibility)
+    || typeof result.accessibility.tree !== "string"
+    || result.accessibility.tree.length > 200000
+    || !isValidTabContextResult(result.context)) {
+    throw new Error("read page result is invalid");
+  }
+}
+
+function validateTabContextResult(result, label) {
+  if (!isValidTabContextResult(result)) throw new Error(`${label} result is invalid`);
+}
+
+function isValidTabContextResult(result) {
+  if (!isRecord(result)
+    || typeof result.visibleText !== "string"
+    || result.visibleText.length > 200000) return false;
+  if (result.returnedChars != null
+    && (!Number.isInteger(result.returnedChars) || result.returnedChars !== result.visibleText.length)) return false;
+  if (result.totalChars != null
+    && (!Number.isInteger(result.totalChars) || result.totalChars < result.visibleText.length)) return false;
+  return true;
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function requireElementRef(params) {

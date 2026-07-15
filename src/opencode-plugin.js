@@ -8,6 +8,10 @@ import {
   requireBridgeCapabilities,
   writeDataUrlToFile
 } from "./bridge-client.js";
+import {
+  materializeContextText,
+  materializeReadPageArtifacts
+} from "./workspace-artifacts.js";
 
 const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
 
@@ -50,6 +54,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
   chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
+  chrome_read_page: capabilities("browser.accessibility", "browser.page-context", "browser.screenshots", "browser.tabs", "browser.windows"),
   chrome_release_debuggers: capabilities("browser.cdp"),
   chrome_reload: capabilities("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
@@ -62,6 +67,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_tab_group_create: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_tab_group_update: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_tab_groups: capabilities("browser.tab-groups", "browser.tabs"),
+  chrome_tab_context: capabilities("browser.page-context", "browser.tabs"),
   chrome_tabs: capabilities("browser.tabs"),
   chrome_type: capabilities("browser.cdp", "browser.tabs"),
   chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
@@ -215,6 +221,66 @@ export default async function OpenCodeChromeBridgePlugin() {
         },
         async execute(args) {
           return JSON.stringify(await bridgeCommand("pageText", args), null, 2);
+        }
+      }),
+      chrome_tab_context: tool({
+        description: "Read bounded visible text, page metadata, current selection, selected element references, MIME type, and document dimensions from a Chrome tab.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          maxChars: schema.number().int().min(100).max(200000).default(50000).describe("Maximum visible-text characters returned by the extension."),
+          outputDirectory: schema.string().optional().describe("Project-relative directory where oversized or explicitly requested text is written as a collision-safe artifact."),
+          maxSelectionChars: schema.number().int().min(1).max(10000).default(2000).describe("Maximum selected-text characters to return."),
+          previewChars: schema.number().int().min(100).max(20000).default(12000).describe("Inline text preview size when an artifact is written."),
+          saveText: schema.boolean().default(false).describe("Write visible text as an artifact even when it fits in the inline preview. Requires outputDirectory.")
+        },
+        async execute(args, context) {
+          requireArtifactDirectoryWhenRequested(args);
+          const result = await bridgeCommand("tabContext", {
+            maxChars: args.maxChars,
+            maxSelectionChars: args.maxSelectionChars,
+            tabId: args.tabId
+          });
+          const materialized = await maybeMaterializeContext(result, args, context.directory);
+          return JSON.stringify({
+            ...materialized.context,
+            visibleTextArtifact: materialized.artifact
+          }, null, 2);
+        }
+      }),
+      chrome_read_page: tool({
+        description: "Read one coherent page result containing bounded tab context, an accessibility snapshot, and an optional screenshot workspace artifact.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          maxChars: schema.number().int().min(100).max(200000).default(50000).describe("Maximum visible-text characters returned by the extension."),
+          maxSelectionChars: schema.number().int().min(1).max(10000).default(2000).describe("Maximum selected-text characters to return."),
+          maxNodes: schema.number().int().min(1).max(2000).default(800).describe("Maximum accessibility nodes to return."),
+          interactiveOnly: schema.boolean().default(false).describe("Return only interactive accessibility nodes."),
+          includeScreenshot: schema.boolean().default(false).describe("Capture the visible viewport and write it below outputDirectory."),
+          outputDirectory: schema.string().optional().describe("Project-relative directory for screenshot and oversized text artifacts."),
+          screenshotFormat: schema.enum(["png", "jpeg"]).default("png").describe("Screenshot image format."),
+          screenshotQuality: schema.number().int().min(1).max(100).default(80).describe("JPEG screenshot quality. Ignored for PNG."),
+          previewChars: schema.number().int().min(100).max(20000).default(12000).describe("Inline text preview size when an artifact is written."),
+          saveText: schema.boolean().default(false).describe("Write visible text as an artifact even when it fits in the inline preview. Requires outputDirectory.")
+        },
+        async execute(args, context) {
+          requireArtifactDirectoryWhenRequested(args);
+          const result = await bridgeCommand("readPage", {
+            includeScreenshot: args.includeScreenshot,
+            interactiveOnly: args.interactiveOnly,
+            maxChars: args.maxChars,
+            maxNodes: args.maxNodes,
+            maxSelectionChars: args.maxSelectionChars,
+            screenshotFormat: args.screenshotFormat,
+            screenshotQuality: args.screenshotQuality,
+            tabId: args.tabId
+          }, { timeoutMs: args.includeScreenshot ? 30000 : undefined });
+          return JSON.stringify(await materializeReadPageArtifacts({
+            forceText: args.saveText === true,
+            outputDirectory: args.outputDirectory,
+            previewChars: args.previewChars,
+            projectDirectory: context.directory,
+            result
+          }), null, 2);
         }
       }),
       chrome_dom_content: tool({
@@ -788,6 +854,8 @@ const APPROVAL_METADATA = {
   chrome_history: (args) => ({ action: "Search the user's browsing history", query: args.query }),
   chrome_bookmarks: (args) => ({ action: "Search the user's bookmarks", query: args.query }),
   chrome_page_text: (args) => ({ action: "Read the page text", tabId: args.tabId }),
+  chrome_tab_context: (args) => ({ action: "Read bounded page context and selection", tabId: args.tabId, outputDirectory: args.outputDirectory }),
+  chrome_read_page: (args) => ({ action: "Read page context, accessibility, and optional screenshot", tabId: args.tabId, includeScreenshot: args.includeScreenshot, outputDirectory: args.outputDirectory }),
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
@@ -835,6 +903,26 @@ function requiredCapabilitiesForTool(name) {
 function previewText(value) {
   if (typeof value !== "string") return undefined;
   return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+}
+
+function requireArtifactDirectoryWhenRequested(args) {
+  if ((args.includeScreenshot === true || args.saveText === true)
+    && (typeof args.outputDirectory !== "string" || args.outputDirectory.length === 0)) {
+    throw new Error("outputDirectory is required when includeScreenshot or saveText is enabled");
+  }
+}
+
+async function maybeMaterializeContext(context, args, projectDirectory) {
+  if (typeof args.outputDirectory !== "string" || args.outputDirectory.length === 0) {
+    return { artifact: null, context };
+  }
+  return materializeContextText({
+    context,
+    force: args.saveText === true,
+    outputDirectory: args.outputDirectory,
+    previewChars: args.previewChars,
+    projectDirectory
+  });
 }
 
 async function resolveProjectOutputPath(projectDirectory, outputPath, fieldName) {

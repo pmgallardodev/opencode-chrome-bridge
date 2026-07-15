@@ -1,12 +1,11 @@
 import os from "node:os";
 import path from "node:path";
 import { open, writeFile } from "node:fs/promises";
+import { decodeSupportedImageDataUrl } from "./workspace-artifacts.js";
 
 const STATE_DIR = process.env.OPENCODE_CHROME_BRIDGE_STATE_DIR || path.join(os.homedir(), ".opencode", "chrome-bridge");
 const STATE_PATH = path.join(STATE_DIR, "state.json");
 const TOKEN_RE = /^[A-Za-z0-9._~+/=-]{20,256}$/u;
-const MAX_DATA_URL_BYTES = 10 * 1024 * 1024;
-const ALLOWED_DATA_URL_MIME_TYPES = new Set(["image/png", "image/jpeg"]);
 const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 const MAX_REQUEST_TIMEOUT_MS = 125000;
 const MAX_CAPABILITY_HEADER_CHARS = 10_000;
@@ -206,39 +205,9 @@ export async function pollEvents(since = 0) {
 }
 
 export async function writeDataUrlToFile(dataUrl, outputPath) {
-  const match = /^data:([^;,]+)(;base64)?,(.*)$/u.exec(dataUrl);
-  if (!match) throw new Error("Screenshot response was not a data URL");
-  const mimeType = match[1].toLowerCase();
-  if (!ALLOWED_DATA_URL_MIME_TYPES.has(mimeType)) {
-    throw new Error("Screenshot response used an unsupported MIME type");
-  }
-  const isBase64 = match[2] === ";base64";
-  if (!isBase64) throw new Error("Screenshot response must use base64 encoding");
-  const data = decodeBase64DataUrl(match[3]);
-  validateImageSignature(data, mimeType);
-  if (data.length > MAX_DATA_URL_BYTES) {
-    throw new Error("Screenshot response is too large to write");
-  }
+  const { data, mimeType } = decodeSupportedImageDataUrl(dataUrl);
   await writeFile(outputPath, data);
   return { bytes: data.length, mimeType, path: outputPath };
-}
-
-function decodeBase64DataUrl(value) {
-  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)) {
-    throw new Error("Screenshot response contained invalid base64 data");
-  }
-  const decoded = Buffer.from(value, "base64");
-  if (decoded.toString("base64") !== value) {
-    throw new Error("Screenshot response contained invalid base64 data");
-  }
-  return decoded;
-}
-
-function validateImageSignature(data, mimeType) {
-  const valid = mimeType === "image/png"
-    ? data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-    : data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
-  if (!valid) throw new Error(`Screenshot response did not contain a valid ${mimeType} signature`);
 }
 
 async function request(method, pathname, body, extraHeaders = {}) {
