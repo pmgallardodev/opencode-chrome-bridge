@@ -4042,7 +4042,9 @@ async function checkWaitCondition(tabId, condition) {
     const snapshot = networkIdleSnapshot(tabId);
     return {
       ...snapshot,
-      matched: snapshot.overflowed !== true
+      matched: snapshot.proven === true
+        && snapshot.provenancePending === false
+        && snapshot.overflowed !== true
         && snapshot.inFlight === 0
         && snapshot.idleForMs >= condition.idleMs
     };
@@ -4683,15 +4685,39 @@ function trimNetworkRequestState(state) {
 
 function networkIdleSnapshot(tabId) {
   const state = networkRequestStates.get(tabId);
-  if (!state) return { idleForMs: 0, inFlight: 0, overflowed: true, trackingSince: null };
+  if (!state) return {
+    idleForMs: 0,
+    inFlight: 0,
+    overflowed: true,
+    proven: false,
+    provenancePending: true,
+    trackingSince: null
+  };
   let inFlight = 0;
   for (const request of state.requests.values()) {
     if (request.inFlight === true) inFlight += 1;
   }
+  const current = tabPageProvenance.get(tabId);
+  const epoch = tabMainFrameEpochs.get(tabId);
+  const proven = Boolean(state.awaitingTopLevelDocument === false
+    && current
+    && epoch
+    && typeof state.frameId === "string"
+    && typeof state.loaderId === "string"
+    && state.documentId === current.documentId
+    && state.navigationGeneration === current.navigationGeneration
+    && state.pageScope === current.pageScope
+    && epoch.pageScope === current.pageScope
+    && state.frameId === epoch.frameId
+    && state.loaderId === epoch.loaderId
+    && state.documentId === epoch.documentId
+    && state.navigationGeneration === epoch.navigationGeneration);
   return {
-    idleForMs: Math.max(0, Date.now() - state.lastActivityAt),
+    idleForMs: proven ? Math.max(0, Date.now() - state.lastActivityAt) : 0,
     inFlight,
     overflowed: state.overflowed,
+    proven,
+    provenancePending: !proven,
     trackingSince: state.trackingSince
   };
 }

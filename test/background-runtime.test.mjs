@@ -2114,6 +2114,61 @@ test("network-idle waits reset on activity and preserve console debugger consume
   assert.equal(logs.logs[0].text, "still collecting");
 });
 
+test("network-idle remains pending until a delayed main-loader reconciliation is proven", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Page.getFrameTree"
+      ? { frameTree: { frame: { id: "frame-a", loaderId: "loader-a", url: "https://example.com/" } } }
+      : {},
+    fillNetworkProvenance: false
+  });
+  let settled = false;
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 30 }, pollIntervalMs: 10, tabId: 7, timeoutMs: 300
+  }).finally(() => { settled = true; });
+  for (let attempt = 0; attempt < 50
+    && !harness.calls.debuggerCommands.some((entry) => entry.method === "Network.enable"); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-7", frameId: 0, tabId: 7, timeStamp: 1, url: "https://next.example/"
+  });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(settled, false, "pending provenance must not become idle after idleMs");
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-b", loaderId: "loader-b", url: "https://next.example/" }
+  });
+  const provenAt = Date.now();
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-b", frameId: 0, tabId: 7, timeStamp: 2, url: "https://next.example/"
+  });
+  const result = await waiting;
+  assert.equal(result.proven, true);
+  assert.equal(result.provenancePending, false);
+  assert.ok(Date.now() - provenAt >= 25, "idle timer must restart from loader reconciliation");
+});
+
+test("network-idle times out fail closed when navigation never yields a proven loader", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Page.getFrameTree"
+      ? { frameTree: { frame: { id: "frame-a", loaderId: "loader-a", url: "https://example.com/" } } }
+      : {},
+    fillNetworkProvenance: false
+  });
+  const waiting = harness.execute("waitFor", {
+    condition: { type: "networkIdle", idleMs: 50 }, pollIntervalMs: 10, tabId: 7, timeoutMs: 120
+  });
+  for (let attempt = 0; attempt < 50
+    && !harness.calls.debuggerCommands.some((entry) => entry.method === "Network.enable"); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-7", frameId: 0, tabId: 7, timeStamp: 1, url: "https://missing.example/"
+  });
+  await assert.rejects(waiting, /timed out waiting for networkIdle after 120ms/iu);
+  const summaries = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(summaries.count, 0);
+});
+
 test("network request summaries merge lifecycle events and redact sensitive URLs", async () => {
   const harness = createBackgroundHarness();
   const initial = await harness.execute("networkRequests", { tabId: 7 });
