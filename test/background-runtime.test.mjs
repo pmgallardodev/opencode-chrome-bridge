@@ -134,6 +134,184 @@ test("scoped Fetch barrier keeps an IPC-entry navigation from moving native inpu
   assert.ok(harness.calls.debuggerCommands.some(({ method }) => method === "Fetch.continueRequest"));
 });
 
+test("scoped Fetch cleanup owns and releases requests arriving while the barrier drains", async () => {
+  let harness;
+  let emittedDuringContinue = false;
+  let emittedDuringDisable = false;
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved") {
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 }, "Fetch.requestPaused",
+          { requestId: "nav-first", resourceType: "Document", request: { url: "https://b.example/" } }
+        );
+      }
+      if (method === "Fetch.continueRequest" && params.requestId === "nav-first" && !emittedDuringContinue) {
+        emittedDuringContinue = true;
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 }, "Fetch.requestPaused",
+          { requestId: "nav-during-drain", resourceType: "Document", request: { url: "https://c.example/" } }
+        );
+      }
+      if (method === "Fetch.disable" && !emittedDuringDisable) {
+        emittedDuringDisable = true;
+        await harness.events.debuggerOnEvent.emit(
+          { tabId: 7 }, "Fetch.requestPaused",
+          { requestId: "nav-during-disable", resourceType: "Document", request: { url: "https://d.example/" } }
+        );
+      }
+      return {};
+    }
+  });
+  await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"], method: "click",
+    params: { button: "left", tabId: 7, x: 10, y: 10 }
+  });
+  assert.deepEqual(
+    harness.calls.debuggerCommands
+      .filter(({ method }) => method === "Fetch.continueRequest")
+      .map(({ params }) => params.requestId),
+    ["nav-first", "nav-during-drain", "nav-during-disable"]
+  );
+  assert.equal(harness.navigationBarrierCount(), 0);
+});
+
+test("scoped one-action native browserBatch uses the navigation barrier", async () => {
+  let harness;
+  let documentId = "document-a";
+  const effectDocuments = [];
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { found: true, point: { x: 10, y: 10 } } } };
+      }
+      if (method === "Input.dispatchMouseEvent") {
+        effectDocuments.push({ documentId, type: params.type });
+        if (params.type === "mouseMoved") {
+          await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+          await harness.events.debuggerOnEvent.emit(
+            { tabId: 7 }, "Fetch.requestPaused",
+            { requestId: "batch-nav-b", resourceType: "Document", request: { url: "https://b.example/" } }
+          );
+        }
+      }
+      if (method === "Fetch.continueRequest") documentId = "document-b";
+      return {};
+    },
+    scriptingExecuteScript: async () => [{ result: {
+      found: true, height: 20, name: "Continue", role: "button", visible: true, width: 20, x: 10, y: 10
+    } }],
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 })
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/", "document-a")],
+    expectedScopes: ["https://example.com:443/"], method: "browserBatch",
+    params: { actions: [{ type: "clickElement", params: { tabId: 7, ref: "e1" } }], totalTimeoutMs: 1000 }
+  }), /document changed|not authorized/iu);
+  assert.ok(effectDocuments.every((entry) => entry.documentId === "document-a"));
+  assert.equal(effectDocuments.some((entry) => entry.type === "mousePressed"), false);
+  assert.ok(harness.calls.debuggerCommands.some(({ method }) => method === "Fetch.continueRequest"));
+});
+
+test("Fetch-domain subscriptions fail before debugger ownership or enable side effects", async () => {
+  const harness = createBackgroundHarness();
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "subscribeCdpEvents", params: { tabId: 7, methods: ["Fetch.requestPaused"] }
+  }), /Fetch.*not allowed|navigation barrier/iu);
+  assert.equal(harness.calls.debuggerAttach.length, 0);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+  assert.deepEqual(harness.persistentDebuggerState(7), {
+    console: false, domains: [], events: false, network: false, subscriptions: []
+  });
+});
+
+test("scoped persistent debugger acquisition rolls back when navigation starts during domain enable", async () => {
+  for (const [method, params, enabledDomain] of [
+    ["getConsoleLogs", { autoAttach: true, tabId: 7 }, "Console"],
+    ["networkRequests", { autoAttach: true, tabId: 7 }, "Network"],
+    ["subscribeCdpEvents", { methods: ["Console.messageAdded"], tabId: 7 }, "Console"]
+  ]) {
+    let harness;
+    let navigated = false;
+    harness = createBackgroundHarness({
+      debuggerSendCommand: async (_target, cdpMethod) => {
+        if (cdpMethod === `${enabledDomain}.enable` && !navigated) {
+          navigated = true;
+          await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+          await harness.events.debuggerOnEvent.emit(
+            { tabId: 7 }, "Fetch.requestPaused",
+            { requestId: `${method}-nav`, resourceType: "Document", request: { url: "https://b.example/" } }
+          );
+        }
+        return {};
+      }
+    });
+    await assert.rejects(() => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"], method, params
+    }), /document changed|not authorized/iu, method);
+    const state = harness.persistentDebuggerState(7);
+    assert.deepEqual(state, {
+      console: false, domains: [], events: false, network: false, subscriptions: []
+    }, method);
+    assert.ok(harness.calls.debuggerCommands.some(({ method: command }) => command === `${enabledDomain}.disable`), method);
+    assert.equal(harness.calls.debuggerDetach.length, 1, method);
+  }
+});
+
+test("scoped unsubscription rolls back ownership when navigation starts before mutation", async () => {
+  let harness;
+  let navigateOnBarrierEnable = false;
+  harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Fetch.enable" && navigateOnBarrierEnable) {
+        await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://b.example/" });
+      }
+      return {};
+    }
+  });
+  await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Console.messageAdded"] });
+  navigateOnBarrierEnable = true;
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "unsubscribeCdpEvents", params: { tabId: 7, methods: ["Console.messageAdded"] }
+  }), /document changed|not authorized/iu);
+  assert.deepEqual(harness.persistentDebuggerState(7), {
+    console: false, domains: ["Console"], events: true, network: false, subscriptions: ["Console.messageAdded"]
+  });
+  assert.equal(harness.calls.debuggerDetach.length, 0);
+});
+
+test("cancelling a scoped barrier during Fetch enable drains ownership without hanging", async () => {
+  let releaseEnable;
+  const enableStarted = new Promise((resolve) => { releaseEnable = resolve; });
+  let notifyEnableStarted;
+  const started = new Promise((resolve) => { notifyEnableStarted = resolve; });
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Fetch.enable") {
+        notifyEnableStarted();
+        await enableStarted;
+      }
+      return {};
+    }
+  });
+  const controller = new AbortController();
+  const pending = harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "getConsoleLogs", params: { autoAttach: true, tabId: 7 }
+  }, { signal: controller.signal });
+  await started;
+  controller.abort(new Error("cancelled scoped debugger acquisition"));
+  releaseEnable();
+  await assert.rejects(pending, /cancelled/u);
+  assert.equal(harness.navigationBarrierCount(), 0);
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.deepEqual(harness.persistentDebuggerState(7), {
+    console: false, domains: [], events: false, network: false, subscriptions: []
+  });
+});
+
 test("cleanup never releases mouse input into a changed document", async () => {
   let harness;
   let documentId = "document-a";
@@ -295,7 +473,10 @@ test("scoped batch mutation has zero effect when navigation wins the action race
     method: "browserBatch",
     params: { actions: [{ type: "clickElement", params: { tabId: 7, ref: "e1" } }], totalTimeoutMs: 1000 }
   }), /scope.*changed|not authorized/iu);
-  assert.equal(harness.calls.debuggerCommands.length, 0);
+  assert.equal(
+    harness.calls.debuggerCommands.some(({ method }) => /^(?:Input|Runtime)\./u.test(method)),
+    false
+  );
 });
 
 test("top-level B to A navigation cannot expose old or late B console entries", async () => {
@@ -3308,6 +3489,19 @@ function createBackgroundHarness({
           requestCount: state.requests.size
         } : null;
       })()`, context);
+    },
+    navigationBarrierCount() {
+      return vm.runInContext("navigationBarriers.size", context);
+    },
+    persistentDebuggerState(tabId) {
+      context.__testTabId = tabId;
+      return JSON.parse(vm.runInContext(`JSON.stringify({
+        console: consoleLogAttached.has(__testTabId),
+        domains: [...(cdpEnabledDomains.get(__testTabId) ?? [])].sort(),
+        events: cdpEventAttached.has(__testTabId),
+        network: networkCaptureAttached.has(__testTabId),
+        subscriptions: [...(cdpSubscriptions.get(__testTabId) ?? [])].sort()
+      })`, context));
     },
     calls,
     events,

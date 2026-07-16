@@ -215,7 +215,8 @@ test("raw CDP allowlist rejects global storage, cookie, and browser domains", as
   const plugin = await OpenCodeChromeBridgePlugin();
   for (const method of [
     "Storage.getCookies", "Storage.clearDataForOrigin", "Network.getAllCookies",
-    "Network.setCookie", "Browser.getVersion", "Security.enable", "SystemInfo.getInfo"
+    "Network.setCookie", "Browser.getVersion", "Security.enable", "SystemInfo.getInfo",
+    "Fetch.enable", "Fetch.disable"
   ]) {
     const bridge = installBridge(({ method: bridgeMethod }) => bridgeMethod === "getTab"
       ? { id: 7, url: "https://example.com/app" }

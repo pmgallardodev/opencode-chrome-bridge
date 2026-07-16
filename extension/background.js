@@ -120,8 +120,13 @@ const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
 ]);
 const NAVIGATION_BARRIER_COMMANDS = new Set([
   "cdpCommand", "click", "clickElement", "doubleClick", "evaluate", "fillElement", "hover",
-  "keypress", "moveSequence", "screenshotRegion", "scroll", "setViewport", "resetViewport", "type"
+  "getConsoleLogs", "keypress", "moveSequence", "networkRequests", "screenshotRegion", "scroll",
+  "setViewport", "resetViewport", "subscribeCdpEvents", "type", "unsubscribeCdpEvents"
 ]);
+const NAVIGATION_BARRIER_PERSISTENT_COMMANDS = new Set([
+  "getConsoleLogs", "networkRequests", "subscribeCdpEvents", "unsubscribeCdpEvents"
+]);
+const NAVIGATION_BARRIER_BATCH_ACTIONS = new Set(["clickElement", "fillElement"]);
 
 let nativePort = null;
 let nativeHostReady = false;
@@ -557,7 +562,9 @@ async function executeScopedPageCommand(envelope, options) {
   const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const method = envelope.method;
   const params = envelope.params;
-  params.__expectedScopes = expectedScopes;
+  if (method === "evaluate" || (method === "cdpCommand" && params.method === "Runtime.evaluate")) {
+    params.__expectedScopes = expectedScopes;
+  }
   if (method === "fileUploadCommit") params.__expectedScopes = expectedScopes;
   if (method === "fileUploadCommit") params.__expectedBindings = expectedBindings;
   if (method === "setCursorState" || method === "setFaviconBadge") params.__expectedScopes = expectedScopes;
@@ -565,7 +572,9 @@ async function executeScopedPageCommand(envelope, options) {
   const expectedTabBinding = Number.isInteger(params.tabId)
     ? expectedBindings.find((entry) => entry.tabId === params.tabId)
     : undefined;
-  if (expectedTabBinding) params.__expectedDocumentId = expectedTabBinding.documentId;
+  if (expectedTabBinding && ["fileUploadCommit", "setCursorState", "setFaviconBadge"].includes(method)) {
+    params.__expectedDocumentId = expectedTabBinding.documentId;
+  }
   const pageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
   if (method === "browserBatch") {
     if (!Array.isArray(params.actions) || params.actions.length !== 1) {
@@ -578,13 +587,27 @@ async function executeScopedPageCommand(envelope, options) {
     }
     const tabId = action?.params?.tabId;
     if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
-    await pageGuard(action.params);
-    const batchResult = await executeCommand(method, params, { ...options, pageGuard });
-    await pageGuard(action.params);
+    const actionPageGuard = (override = action.params, result) => pageGuard(override, result);
+    const runBatch = async () => {
+      await actionPageGuard();
+      const batchResult = await executeCommand(method, params, { ...options, pageGuard: actionPageGuard });
+      await actionPageGuard();
+      return batchResult;
+    };
+    if (!NAVIGATION_BARRIER_BATCH_ACTIONS.has(action?.type)) return runBatch();
+    const batchResult = await withScopedNavigationBarrier(
+      tabId, actionPageGuard, runBatch, options.signal
+    );
+    await actionPageGuard();
     return batchResult;
   }
   if (method === "cdpCommand" && !ALLOWED_RAW_PAGE_CDP_METHODS.has(params.method)) {
     throw new Error(`CDP method ${String(params.method)} is not allowed; use a dedicated high-level browser tool`);
+  }
+  if (method === "subscribeCdpEvents"
+    && Array.isArray(params.methods)
+    && params.methods.some((entry) => typeof entry === "string" && entry.startsWith("Fetch."))) {
+    throw new Error("Fetch-domain CDP subscriptions are not allowed because navigation requests require exclusive barrier ownership");
   }
   if (method === "cdpCommand" && params.method === "Page.navigate") {
     assertAuthorizedDestination(params.commandParams?.url, expectedScopes);
@@ -595,12 +618,17 @@ async function executeScopedPageCommand(envelope, options) {
   }
   let result;
   try {
-    const run = () => executeCommand(method, params, { ...options, pageGuard });
+    const persistentMutation = NAVIGATION_BARRIER_PERSISTENT_COMMANDS.has(method);
+    const run = async () => {
+      const value = await executeCommand(method, params, { ...options, pageGuard });
+      if (persistentMutation) await pageGuard(params, value);
+      return value;
+    };
     const barrierTabId = Number.isInteger(params.tabId) ? params.tabId : null;
     result = barrierTabId !== null
       && NAVIGATION_BARRIER_COMMANDS.has(method)
       && !(method === "cdpCommand" && params.method === "Page.navigate")
-      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, options.signal)
+      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, options.signal, { persistentMutation })
       : await run();
   } catch (error) {
     if (method !== "click" || error?.authorizedPageEffect !== true) throw error;
@@ -2099,18 +2127,21 @@ async function withDebugger(tabId, callback) {
   return withDebuggerTarget({ tabId }, callback);
 }
 
-async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal) {
+async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal, { persistentMutation = false } = {}) {
+  let barrier;
   return withDebuggerTarget({ tabId }, async (target) => {
     throwIfAborted(signal);
     if (navigationBarriers.has(tabId) || cdpEnabledDomains.get(tabId)?.has("Fetch")) {
       throw new Error("A scoped navigation barrier cannot prove exclusive Fetch ownership");
     }
-    const barrier = { pausedRequestIds: [], target };
+    barrier = { pausedRequestIds: [], releaseIndex: 0, state: "opening", target };
+    const persistentSnapshot = persistentMutation ? snapshotPersistentDebuggerState(tabId) : null;
     navigationBarriers.set(tabId, barrier);
     try {
       await chrome.debugger.sendCommand(target, "Fetch.enable", {
         patterns: [{ requestStage: "Request", resourceType: "Document", urlPattern: "*" }]
       });
+      barrier.state = "active";
       throwIfAborted(signal);
       await pageGuard();
       scopedDebuggerTargets.set(tabId, target);
@@ -2119,17 +2150,79 @@ async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal) 
       } finally {
         scopedDebuggerTargets.delete(tabId);
       }
+    } catch (error) {
+      if (persistentSnapshot) await restorePersistentDebuggerState(tabId, target, persistentSnapshot);
+      throw error;
     } finally {
-      navigationBarriers.delete(tabId);
-      for (const requestId of barrier.pausedRequestIds) {
-        await chrome.debugger.sendCommand(target, "Fetch.continueRequest", { requestId }).catch(() => {});
-      }
+      barrier.state = "closing";
+      await drainNavigationBarrier(barrier);
       await chrome.debugger.sendCommand(target, "Fetch.disable", {}).catch(() => {});
+      barrier.state = "disabled";
+      // Fetch events already queued by Chrome can be delivered while disable is
+      // in flight. Keep ownership registered and drain those as well.
+      await drainNavigationBarrier(barrier);
+      if (persistentSnapshot && barrier.pausedRequestIds.length > 0) {
+        await restorePersistentDebuggerState(tabId, target, persistentSnapshot);
+      }
     }
+  }, async () => {
+    if (navigationBarriers.get(tabId) === barrier) navigationBarriers.delete(tabId);
   });
 }
 
-async function withDebuggerTarget(debugTarget, callback) {
+async function drainNavigationBarrier(barrier) {
+  while (barrier.releaseIndex < barrier.pausedRequestIds.length) {
+    const requestId = barrier.pausedRequestIds[barrier.releaseIndex++];
+    try {
+      await chrome.debugger.sendCommand(barrier.target, "Fetch.continueRequest", { requestId });
+    } catch {
+      await chrome.debugger.sendCommand(barrier.target, "Fetch.failRequest", {
+        errorReason: "Aborted", requestId
+      }).catch(() => {});
+    }
+  }
+}
+
+function snapshotPersistentDebuggerState(tabId) {
+  return {
+    consoleAttached: consoleLogAttached.has(tabId),
+    domains: new Set(cdpEnabledDomains.get(tabId) ?? []),
+    eventAttached: cdpEventAttached.has(tabId),
+    networkCapture: networkCaptureAttached.has(tabId),
+    networkState: networkRequestStates.get(tabId),
+    networkTracker: networkTrackerAttached.has(tabId),
+    subscriptions: cdpSubscriptions.has(tabId) ? new Set(cdpSubscriptions.get(tabId)) : null
+  };
+}
+
+async function restorePersistentDebuggerState(tabId, target, snapshot) {
+  const currentDomains = new Set(cdpEnabledDomains.get(tabId) ?? []);
+  for (const domain of currentDomains) {
+    if (domain === "Fetch" || snapshot.domains.has(domain)) continue;
+    await chrome.debugger.sendCommand(target, `${domain}.disable`, {}).catch(() => {});
+  }
+  setMembership(consoleLogAttached, tabId, snapshot.consoleAttached);
+  setMembership(cdpEventAttached, tabId, snapshot.eventAttached);
+  setMembership(networkCaptureAttached, tabId, snapshot.networkCapture);
+  setMembership(networkTrackerAttached, tabId, snapshot.networkTracker);
+  if (snapshot.subscriptions === null) cdpSubscriptions.delete(tabId);
+  else cdpSubscriptions.set(tabId, new Set(snapshot.subscriptions));
+  if (snapshot.networkState === undefined) networkRequestStates.delete(tabId);
+  else networkRequestStates.set(tabId, snapshot.networkState);
+  if (snapshot.domains.size === 0) cdpEnabledDomains.delete(tabId);
+  else cdpEnabledDomains.set(tabId, new Set(snapshot.domains));
+  if (!snapshot.consoleAttached) {
+    consoleLogBuffers.delete(tabId);
+    consoleLogBufferChars.delete(tabId);
+  }
+}
+
+function setMembership(set, value, present) {
+  if (present) set.add(value);
+  else set.delete(value);
+}
+
+async function withDebuggerTarget(debugTarget, callback, afterCleanup) {
   const key = debuggerKey(debugTarget);
   return withDebuggerLock(key, async () => {
     // Persistent attachment state can change while this operation waits for the lock.
@@ -2142,7 +2235,11 @@ async function withDebuggerTarget(debugTarget, callback) {
       }
       return await callback(debugTarget, { reused });
     } finally {
-      if (attached) await chrome.debugger.detach(debugTarget).catch(() => {});
+      const shouldDetach = Number.isInteger(debugTarget.tabId)
+        ? (attached || reused) && !isPersistentDebuggerAttached(debugTarget.tabId)
+        : attached;
+      if (shouldDetach) await chrome.debugger.detach(debugTarget).catch(() => {});
+      await afterCleanup?.();
     }
   });
 }
@@ -2456,6 +2553,9 @@ async function subscribeCdpEvents(params, pageGuard) {
   const methods = Array.isArray(params.methods) ? params.methods : [];
   if (methods.length === 0 || methods.length > MAX_CDP_METHODS || !methods.every(isValidCdpMethod)) {
     throw new Error("methods must be a non-empty array of CDP method strings in 'Domain.method' format");
+  }
+  if (methods.some((method) => method.startsWith("Fetch."))) {
+    throw new Error("Fetch-domain CDP subscriptions are not allowed because navigation requests require exclusive barrier ownership");
   }
   let subscribed = cdpSubscriptions.get(tabId);
   const previous = new Set(subscribed ?? []);
@@ -3758,9 +3858,8 @@ async function releaseNetworkWaitTracker(tabId) {
 }
 
 async function ensureNetworkCaptureDebugger(tabId, signal) {
-  const target = { tabId };
   await refreshTabPageProvenance(tabId);
-  return withDebuggerLock(debuggerKey(target), async () => {
+  return withPersistentDebuggerMutation(tabId, async (target, scoped) => {
     throwIfAborted(signal);
     const hadNetworkCapture = networkCaptureAttached.has(tabId);
     if (hadNetworkCapture && cdpEnabledDomains.get(tabId)?.has("Network") === true) {
@@ -3773,7 +3872,7 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
     const hadNetworkTracker = networkTrackerAttached.has(tabId);
     let attachedHere = false;
     try {
-      if (!reused) {
+      if (!scoped && !reused) {
         throwIfAborted(signal);
         await chrome.debugger.attach(target, DEBUGGER_VERSION);
         attachedHere = true;
@@ -4013,11 +4112,10 @@ function networkIdleSnapshot(tabId) {
 }
 
 async function ensureConsoleLogDebugger(tabId) {
-  const target = { tabId };
   await refreshTabPageProvenance(tabId);
-  return withDebuggerLock(debuggerKey(target), async () => {
+  return withPersistentDebuggerMutation(tabId, async (target, scoped) => {
     const alreadyAttached = consoleLogAttached.has(tabId);
-    if (!isPersistentDebuggerAttached(tabId)) {
+    if (!scoped && !isPersistentDebuggerAttached(tabId)) {
       await chrome.debugger.attach(target, DEBUGGER_VERSION);
     }
     await enableCdpDomains(target, ["Console", "Log", "Runtime"]);
@@ -4109,9 +4207,8 @@ function isValidCdpMethod(method) {
 }
 
 async function ensureCdpEventDebugger(tabId, methods) {
-  const target = { tabId };
-  await withDebuggerLock(debuggerKey(target), async () => {
-    if (!isPersistentDebuggerAttached(tabId)) {
+  await withPersistentDebuggerMutation(tabId, async (target, scoped) => {
+    if (!scoped && !isPersistentDebuggerAttached(tabId)) {
       await chrome.debugger.attach(target, DEBUGGER_VERSION);
     }
     cdpEventAttached.add(tabId);
@@ -4138,6 +4235,10 @@ async function enableCdpDomains(target, domains) {
 async function detachCdpEventDebuggerIfIdle(tabId) {
   if (cdpSubscriptions.has(tabId) || !cdpEventAttached.has(tabId)) return;
   const target = { tabId };
+  if (scopedDebuggerTargets.has(tabId)) {
+    cdpEventAttached.delete(tabId);
+    return;
+  }
   await withDebuggerLock(debuggerKey(target), async () => {
     if (cdpSubscriptions.has(tabId) || !cdpEventAttached.has(tabId)) return;
     cdpEventAttached.delete(tabId);
@@ -4146,6 +4247,13 @@ async function detachCdpEventDebuggerIfIdle(tabId) {
       await chrome.debugger.detach(target).catch(() => {});
     }
   });
+}
+
+async function withPersistentDebuggerMutation(tabId, operation) {
+  const scopedTarget = scopedDebuggerTargets.get(tabId);
+  if (scopedTarget) return operation(scopedTarget, true);
+  const target = { tabId };
+  return withDebuggerLock(debuggerKey(target), () => operation(target, false));
 }
 
 function limitString(value, name, maxLength) {
