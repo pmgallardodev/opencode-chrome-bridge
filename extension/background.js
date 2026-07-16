@@ -467,11 +467,24 @@ async function executeCommand(method, params, options = {}) {
     const recording = await loadWorkflowRecording();
     if (!recording) return { recording: false };
     if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    if (recording.pendingStep) throw new Error("Workflow recording is fail-closed because its durable journal has a pending browser effect; cancel the recording");
     const plan = await prepareWorkflowRecordingStep(recording, method, params);
-    throwIfAborted(options.signal);
-    const result = await executeCommandCore(method, params, options);
+    const journaled = await journalWorkflowRecordingStep(recording, plan);
+    let result;
     try {
-      await appendWorkflowRecordingStep(recording, plan);
+      throwIfAborted(options.signal);
+      result = await executeCommandCore(method, params, options);
+    } catch (error) {
+      try {
+        await clearJournaledWorkflowStep(journaled);
+      } catch (clearError) {
+        workflowRecordingFault = clearError?.message ?? String(clearError);
+        sendEvent({ category: "workflow", type: "recordingFailed", error: workflowRecordingFault });
+      }
+      throw error;
+    }
+    try {
+      await commitJournaledWorkflowStep(journaled);
     } catch (error) {
       workflowRecordingFault = error?.message ?? String(error);
       sendEvent({ category: "workflow", type: "recordingFailed", error: workflowRecordingFault });
@@ -534,7 +547,7 @@ async function executeCommandCore(method, params, options = {}) {
       throwIfAborted(options.signal);
       return { ok: true };
     case "screenshot":
-      return captureScreenshot(params, options.pageGuard);
+      return captureScreenshot(params, options.signal, options.pageGuard);
     case "screenshotRegion":
       return captureScreenshotRegion(params, options.pageGuard);
     case "getConsoleLogs":
@@ -677,7 +690,7 @@ function startWorkflowRecording(params) {
     const recording = {
       schemaVersion: WORKFLOW_SCHEMA_VERSION,
       name, shortcut, requiredCapabilities: [], requiredOrigins: [], steps: [],
-      startedAt: new Date().toISOString()
+      pendingStep: null, revision: 0, startedAt: new Date().toISOString()
     };
     await saveWorkflowRecording(recording);
     workflowRecordingFault = null;
@@ -690,6 +703,7 @@ async function stopWorkflowRecording() {
     const recording = await loadWorkflowRecording();
     if (!recording) throw new Error("No workflow recording is active");
     if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    if (recording.pendingStep) throw new Error("Workflow recording is fail-closed because its durable journal has a pending browser effect; cancel the recording");
     if (recording.steps.length === 0) throw new Error("A workflow must contain at least one recorded step");
     const collection = await loadWorkflowCollection();
     if (collection.workflows.some((entry) => entry.shortcut === recording.shortcut)) {
@@ -702,7 +716,7 @@ async function stopWorkflowRecording() {
       shortcut: recording.shortcut, requiredCapabilities: recording.requiredCapabilities,
       requiredOrigins: recording.requiredOrigins, steps: recording.steps,
       createdAt: recording.startedAt, updatedAt: now
-    }, { hydrateOrigins: true });
+    });
     await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
     await clearWorkflowRecording();
     workflowRecordingFault = null;
@@ -741,8 +755,7 @@ async function prepareWorkflowRecordingStep(recording, method, params) {
   return { expectedOrigins, recordedMethod, recordedParams, step };
 }
 
-async function appendWorkflowRecordingStep(recording, plan) {
-  recording.steps.push(plan.step);
+function workflowRecordingMetadata(recording, plan) {
   const capabilities = new Set(recording.requiredCapabilities);
   const origins = new Set(recording.requiredOrigins);
   for (const capability of WORKFLOW_STEP_METHODS[plan.recordedMethod].capability) {
@@ -750,9 +763,35 @@ async function appendWorkflowRecordingStep(recording, plan) {
   }
   for (const scope of plan.expectedOrigins) origins.add(workflowOrigin(scope));
   if (plan.recordedMethod === "navigate") origins.add(workflowOrigin(plan.recordedParams.url));
-  recording.requiredCapabilities = [...capabilities].sort();
-  recording.requiredOrigins = [...origins].sort();
-  await saveWorkflowRecording(recording);
+  return { requiredCapabilities: [...capabilities].sort(), requiredOrigins: [...origins].sort() };
+}
+
+async function journalWorkflowRecordingStep(recording, plan) {
+  const metadata = workflowRecordingMetadata(recording, plan);
+  const journaled = {
+    ...recording,
+    pendingStep: { ...metadata, step: plan.step },
+    revision: recording.revision + 1
+  };
+  await saveWorkflowRecording(journaled);
+  return journaled;
+}
+
+async function commitJournaledWorkflowStep(recording) {
+  const pending = recording.pendingStep;
+  if (!pending) throw new Error("Workflow recording journal is missing its pending step");
+  await saveWorkflowRecording({
+    ...recording,
+    pendingStep: null,
+    requiredCapabilities: pending.requiredCapabilities,
+    requiredOrigins: pending.requiredOrigins,
+    revision: recording.revision + 1,
+    steps: [...recording.steps, pending.step]
+  });
+}
+
+async function clearJournaledWorkflowStep(recording) {
+  await saveWorkflowRecording({ ...recording, pendingStep: null, revision: recording.revision + 1 });
 }
 
 function queueWorkflowMutation(operation) {
@@ -771,7 +810,7 @@ async function loadWorkflowRecording() {
   const raw = stored?.[WORKFLOW_RECORDING_STORAGE_KEY];
   if (raw == null) return null;
   if (!isRecord(raw) || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Active workflow recording schema is invalid or unsupported");
-  const allowed = ["schemaVersion", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "startedAt"];
+  const allowed = ["schemaVersion", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "pendingStep", "revision", "startedAt"];
   const extra = Object.keys(raw).filter((field) => !allowed.includes(field));
   if (extra.length > 0) throw new Error(`Active workflow recording contains unsupported fields: ${extra.join(", ")}`);
   const name = requireBoundedWorkflowString(raw.name, MAX_WORKFLOW_NAME_CHARS, "name");
@@ -785,8 +824,33 @@ async function loadWorkflowRecording() {
   }
   if (!Array.isArray(raw.requiredOrigins) || raw.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording origins are invalid");
   const requiredOrigins = [...new Set(raw.requiredOrigins.map(workflowOrigin))].sort();
+  if (!Number.isSafeInteger(raw.revision) || raw.revision < 0) throw new Error("Active workflow recording revision is invalid");
+  let pendingStep = null;
+  if (raw.pendingStep != null) {
+    if (!isRecord(raw.pendingStep)
+      || Object.keys(raw.pendingStep).some((field) => !["step", "requiredCapabilities", "requiredOrigins"].includes(field))) {
+      throw new Error("Active workflow recording pending journal schema is invalid");
+    }
+    const step = await validateWorkflowStep(raw.pendingStep.step);
+    const pendingCapabilities = [...new Set([...derivedCapabilities, ...WORKFLOW_STEP_METHODS[step.method].capability])].sort();
+    if (!Array.isArray(raw.pendingStep.requiredCapabilities)
+      || JSON.stringify([...new Set(raw.pendingStep.requiredCapabilities)].sort()) !== JSON.stringify(pendingCapabilities)) {
+      throw new Error("Active workflow recording pending journal capabilities are invalid");
+    }
+    if (!Array.isArray(raw.pendingStep.requiredOrigins) || raw.pendingStep.requiredOrigins.length > MAX_WORKFLOW_STEPS) {
+      throw new Error("Active workflow recording pending journal origins are invalid");
+    }
+    pendingStep = {
+      requiredCapabilities: pendingCapabilities,
+      requiredOrigins: [...new Set(raw.pendingStep.requiredOrigins.map(workflowOrigin))].sort(),
+      step
+    };
+  }
   const startedAt = requireWorkflowTimestamp(raw.startedAt, "startedAt");
-  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, name, shortcut, requiredCapabilities: derivedCapabilities, requiredOrigins, steps, startedAt };
+  return {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION, name, shortcut, pendingStep,
+    requiredCapabilities: derivedCapabilities, requiredOrigins, revision: raw.revision, steps, startedAt
+  };
 }
 
 async function saveWorkflowRecording(recording) {
@@ -838,7 +902,7 @@ async function importWorkflow(params) {
   return queueWorkflowMutation(async () => {
     if (!isRecord(params) || !isRecord(params.workflow)) throw new Error("workflowImport requires a workflow object");
     const collection = await loadWorkflowCollection();
-    const workflow = await validateWorkflowSchema(params.workflow, { hydrateOrigins: true });
+    const workflow = await validateWorkflowSchema(params.workflow);
     if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
     if (collection.workflows.some((entry) => entry.id === workflow.id || entry.name === workflow.name || entry.shortcut === workflow.shortcut)) {
       throw new Error("Imported workflow id, name, and shortcut must be unique");
@@ -866,7 +930,7 @@ async function runWorkflow(params, options = {}) {
   const totalTimeoutMs = strictBatchInteger(params.totalTimeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_TOTAL_TIMEOUT_MS, DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS, "totalTimeoutMs");
   const collection = await loadWorkflowCollection();
   throwIfAborted(options.signal);
-  const workflow = resolveWorkflow(collection, params);
+  const workflow = await validateWorkflowSchema(resolveWorkflow(collection, params), { hydrateOrigins: true });
   const missingCapabilities = workflow.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
   if (missingCapabilities.length > 0) throw new Error(`Workflow capability preflight failed: ${missingCapabilities.join(", ")}`);
   if (!Array.isArray(params.expectedOrigins)) throw new Error("Workflow origin preflight requires expectedOrigins");
@@ -916,7 +980,20 @@ async function runWorkflow(params, options = {}) {
       if (step.method === "navigate" && !workflowScopeAuthorized(canonicalPermissionScope(step.params.url), authorizedScopes)) {
         throw new Error(`Workflow navigation destination was not included in origin preflight: ${step.params.url}`);
       }
-      const value = await executeWorkflowStep(step, Math.min(step.timeoutMs, remainingMs), options.signal);
+      const stepScopes = hasTab && expected
+        ? [...new Set([...authorizedScopes, expected.pageScope])]
+        : authorizedScopes;
+      const value = await executeWorkflowStep(
+        step,
+        Math.min(step.timeoutMs, remainingMs),
+        options.signal,
+        (stepSignal) => executeScopedPageCommand({
+          expectedBindings: expected ? [expected] : [],
+          expectedScopes: stepScopes,
+          method: step.method,
+          params: cloneWorkflowValue(step.params)
+        }, { signal: stepSignal, workflowInternal: true })
+      );
       const after = hasTab ? await currentPageBinding(step.params.tabId, value?.url) : null;
       if (step.method === "navigate") {
         if (!workflowScopeAuthorized(after.pageScope, authorizedScopes)) {
@@ -961,7 +1038,7 @@ async function resolveWorkflowRuntimeOrigins(steps) {
   return [...new Set(origins)].sort();
 }
 
-function executeWorkflowStep(step, timeoutMs, parentSignal) {
+function executeWorkflowStep(step, timeoutMs, parentSignal, operation) {
   const controller = new AbortController();
   const onParentAbort = () => controller.abort(parentSignal.reason);
   parentSignal?.addEventListener("abort", onParentAbort, { once: true });
@@ -971,7 +1048,7 @@ function executeWorkflowStep(step, timeoutMs, parentSignal) {
     controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
   });
   const timer = setTimeout(() => controller.abort(new Error(`Workflow step ${step.method} timed out after ${timeoutMs}ms`)), timeoutMs);
-  const execution = Promise.resolve().then(() => executeCommand(step.method, cloneWorkflowValue(step.params), { signal: controller.signal, workflowInternal: true }));
+  const execution = Promise.resolve().then(() => operation(controller.signal));
   return Promise.race([execution, abortPromise]).catch(async (error) => {
     if (controller.signal.aborted) await execution.catch(() => {});
     throw error;
@@ -1000,7 +1077,7 @@ async function loadWorkflowCollection() {
   }
   const workflows = await Promise.all(raw.workflows.map(async (entry) => {
     const migratedEntry = migrateWorkflow(entry);
-    return validateWorkflowSchema(migratedEntry, { hydrateOrigins: true });
+    return validateWorkflowSchema(migratedEntry);
   }));
   assertUniqueWorkflows(workflows);
   const collection = { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows };
@@ -1073,6 +1150,9 @@ async function validateWorkflowStep(value) {
   }
   const extra = Object.keys(value).filter((field) => !["method", "params", "timeoutMs"].includes(field));
   if (extra.length > 0 || !isRecord(value.params) || containsSensitiveWorkflowField(value.params)) throw new Error("Workflow step contains unsupported or sensitive fields");
+  if (value.method === "waitFor" && ["text", "url"].includes(value.params?.condition?.type)) {
+    throw new Error(`Sensitive waitFor ${value.params.condition.type} conditions are not allowed in workflows`);
+  }
   const timeoutMs = strictBatchInteger(value.timeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_ACTION_TIMEOUT_MS, DEFAULT_WORKFLOW_STEP_TIMEOUT_MS, "workflow step timeoutMs");
   let params;
   if (value.method === "screenshot") {
@@ -1141,7 +1221,10 @@ async function executeScopedPageCommand(envelope, options) {
     throw new Error("scoped page command is invalid or not allowed");
   }
   const method = envelope.method;
-  const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes, method === "workflowRun" ? 100 : 25);
+  const expectedScopes = validateExpectedPageScopes(
+    envelope.expectedScopes,
+    options.workflowInternal === true ? 101 : method === "workflowRun" ? 100 : 25
+  );
   const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const params = envelope.params;
   if (method === "workflowRun") {
@@ -1363,13 +1446,13 @@ function requireTabId(params) {
 
 async function activateTab(tabId, signal) {
   throwIfAborted(signal);
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await abortableChromeOperation(chrome.tabs.get(tabId), signal);
   throwIfAborted(signal);
   if (tab.windowId !== undefined) {
-    await chrome.windows.update(tab.windowId, { focused: true });
+    await abortableChromeOperation(chrome.windows.update(tab.windowId, { focused: true }), signal);
     throwIfAborted(signal);
   }
-  const activated = await chrome.tabs.update(tabId, { active: true });
+  const activated = await abortableChromeOperation(chrome.tabs.update(tabId, { active: true }), signal);
   throwIfAborted(signal);
   return tabInfo(activated);
 }
@@ -1398,32 +1481,43 @@ async function tabStillExists(tabId) {
   }
 }
 
-async function captureScreenshot(params, pageGuard) {
+async function captureScreenshot(params, signal, pageGuard) {
+  throwIfAborted(signal);
   const tabId = params.tabId == null ? null : requireTabId(params);
   let windowId = params.windowId;
   let targetTab = null;
   if (tabId !== null) {
-    targetTab = params.__alreadyActive === true ? await chrome.tabs.get(tabId) : await activateTab(tabId);
+    targetTab = params.__alreadyActive === true
+      ? await abortableChromeOperation(chrome.tabs.get(tabId), signal)
+      : await activateTab(tabId, signal);
+    throwIfAborted(signal);
     windowId = targetTab.windowId;
   }
   if (!Number.isInteger(windowId)) {
-    const current = await chrome.windows.getCurrent();
+    const current = await abortableChromeOperation(chrome.windows.getCurrent(), signal);
+    throwIfAborted(signal);
     windowId = current.id;
   }
   const format = params.format === "jpeg" ? "jpeg" : "png";
   const quality = format === "jpeg" ? clampInteger(params.quality, 1, 100, 80, "quality") : undefined;
   const captureOptions = quality === undefined ? { format } : { format, quality };
   if (targetTab === null) {
-    const active = await chrome.tabs.query({ active: true, windowId });
+    const active = await abortableChromeOperation(chrome.tabs.query({ active: true, windowId }), signal);
+    throwIfAborted(signal);
     if (active.length !== 1) throw new Error("Screenshot active tab cannot be resolved deterministically");
     targetTab = active[0];
   }
   await pageGuard?.();
-  const beforeBinding = await currentPageBinding(targetTab.id, targetTab.url);
+  throwIfAborted(signal);
+  const beforeBinding = await abortableChromeOperation(currentPageBinding(targetTab.id, targetTab.url), signal);
+  throwIfAborted(signal);
   const activationGeneration = windowActivationGenerations.get(windowId) ?? 0;
-  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, captureOptions);
-  const activeAfter = await chrome.tabs.query({ active: true, windowId });
-  const afterBinding = await currentPageBinding(targetTab.id);
+  const dataUrl = await abortableChromeOperation(chrome.tabs.captureVisibleTab(windowId, captureOptions), signal);
+  throwIfAborted(signal);
+  const activeAfter = await abortableChromeOperation(chrome.tabs.query({ active: true, windowId }), signal);
+  throwIfAborted(signal);
+  const afterBinding = await abortableChromeOperation(currentPageBinding(targetTab.id), signal);
+  throwIfAborted(signal);
   if (activeAfter.length !== 1
     || activeAfter[0].id !== targetTab.id
     || (windowActivationGenerations.get(windowId) ?? 0) !== activationGeneration
@@ -4123,7 +4217,7 @@ async function readPage(params, signal, pageGuard) {
       tabId,
       __alreadyActive: true,
       windowId: activatedTab.windowId
-    }, pageGuard);
+    }, signal, pageGuard);
     throwIfAborted(signal);
   }
   return {
@@ -4458,6 +4552,20 @@ function throwIfAborted(signal) {
   if (signal.reason instanceof Error) throw signal.reason;
   if (typeof signal.reason?.message === "string") throw new Error(signal.reason.message);
   throw new Error("Chrome command was cancelled");
+}
+
+function abortableChromeOperation(operation, signal) {
+  if (!signal) return operation;
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      try { throwIfAborted(signal); } catch (error) { reject(error); }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(operation).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
 
 function abortableSleep(ms, signal) {

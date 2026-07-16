@@ -1815,6 +1815,24 @@ test("readPage cancellation stops browser work before screenshot capture", async
   assert.equal(captures, 0);
 });
 
+test("readPage cancellation aborts a stalled screenshot capture", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => new Promise(() => {})
+  });
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const result = harness.execute("readPage", { includeScreenshot: true, tabId: 7 }, { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("stalled capture cancelled")), 25);
+  await assert.rejects(result, /stalled capture cancelled/iu);
+  assert.ok(Date.now() - startedAt < 150);
+});
+
 test("tabContext and readPage fail closed on malformed isolated-world results", async () => {
   const malformedContext = createBackgroundHarness({
     scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { visibleText: 42 } }]
@@ -3995,13 +4013,54 @@ test("workflow persisted/imported schemas migrate v0 narrowly and otherwise fail
     requiredCapabilities: ["browser.navigation", "browser.tabs"], requiredOrigins: [],
     steps: [{ method: "navigate", params: { tabId: 7, url: "https://outside.example/private" } }]
   } });
-  assert.equal(JSON.stringify(derivedOrigin.requiredOrigins), JSON.stringify(["https://example.com", "https://outside.example"]));
+  assert.equal(JSON.stringify(derivedOrigin.requiredOrigins), JSON.stringify(["https://outside.example"]));
   const rewritten = await harness.execute("workflowImport", { workflow: {
     ...migrated, id: "unknown-cap", name: "Unknown capability", shortcut: "unknown-cap",
     requiredCapabilities: ["browser.not-installed"], requiredOrigins: ["https://untrusted.example"]
   } });
   assert.equal(JSON.stringify(rewritten.requiredCapabilities), JSON.stringify(["browser.tabs"]));
-  assert.equal(JSON.stringify(rewritten.requiredOrigins), JSON.stringify(["https://example.com"]));
+  assert.equal(JSON.stringify(rewritten.requiredOrigins), JSON.stringify(["https://untrusted.example"]));
+
+  for (const [id, condition] of [
+    ["sensitive-text", { type: "text", value: "one-time-token", match: "contains" }],
+    ["sensitive-url", { type: "url", value: "https://example.com/?token=one-time-token", match: "exact" }]
+  ]) {
+    await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+      ...migrated, id, name: id, shortcut: id,
+      steps: [{ method: "waitFor", params: { tabId: 7, condition } }]
+    } }), /sensitive|not allowed|waitFor/iu);
+  }
+  assert.equal(JSON.stringify(stored).includes("one-time-token"), false);
+});
+
+test("workflow structural operations do not require live tabs but run preflight does", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 1, id: "stale", name: "Stale", shortcut: "stale",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 404 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async () => { tabReads += 1; throw new Error("No tab with id: 404"); }
+  });
+  assert.equal((await harness.execute("workflowList", {}))[0].id, "stale");
+  assert.equal((await harness.execute("workflowGet", { id: "stale" })).id, "stale");
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "imported", name: "Imported", shortcut: "imported",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 405 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  await harness.execute("workflowDelete", { id: "imported" });
+  assert.equal(tabReads, 0);
+  await assert.rejects(
+    () => harness.execute("workflowRun", { id: "stale", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }),
+    /No tab with id|resolve tab|preflight/iu
+  );
+  assert.ok(tabReads > 0);
 });
 
 test("origin-scoped commands record once with their approved origin", async () => {
@@ -4092,6 +4151,44 @@ test("scoped workflow playback rejects a document change before its first page e
   assert.equal(harness.calls.executeScript, 0);
 });
 
+test("workflow page mutations acquire the scoped navigation barrier before debugger effects", async () => {
+  let stored = {};
+  let navigated = false;
+  let inputEffects = 0;
+  let harness;
+  harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({
+      active: true, id: tabId, windowId: 1,
+      url: navigated ? "https://attacker.example/takeover" : "https://example.com/app"
+    }),
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }],
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Fetch.enable") {
+        navigated = true;
+        await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://attacker.example/takeover" });
+      }
+      if (method === "Input.dispatchMouseEvent") inputEffects += 1;
+      return {};
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "barrier-race", name: "Barrier race", shortcut: "barrier-race",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/"], method: "workflowRun",
+    params: { id: "barrier-race", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.equal(inputEffects, 0);
+});
+
 test("workflow redirect outside its preauthorized union stops before later steps", async () => {
   let stored = {};
   const harness = createBackgroundHarness({
@@ -4153,6 +4250,31 @@ test("workflow cancellation and timeout settle before any later effect", async (
   assert.ok(Date.now() - startedAt >= 75, "timed-out command must settle before workflow returns");
 });
 
+test("workflow screenshot capture obeys both per-step and total abort deadlines", async () => {
+  for (const [id, stepTimeout, totalTimeout] of [["step-capture", 50, 5000], ["total-capture", 1000, 50]]) {
+    let stored = {};
+    const harness = createBackgroundHarness({
+      storageLocalGet: async () => structuredClone(stored),
+      storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+      tabsCaptureVisibleTab: async () => new Promise(() => {})
+    });
+    await harness.execute("workflowImport", { workflow: {
+      schemaVersion: 1, id, name: id, shortcut: id,
+      requiredCapabilities: ["browser.screenshot", "browser.tabs", "browser.windows"], requiredOrigins: ["https://example.com"],
+      steps: [{ method: "screenshot", params: { tabId: 7 }, timeoutMs: stepTimeout }],
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+    } });
+    const startedAt = Date.now();
+    const result = await Promise.race([
+      harness.execute("workflowRun", { id, expectedOrigins: ["https://example.com"], totalTimeoutMs: totalTimeout }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("workflow capture did not settle")), 300))
+    ]);
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedAt, 0);
+    assert.ok(Date.now() - startedAt < 300);
+  }
+});
+
 test("workflow recording rejects sensitive waits and a full recorder before browser effects", async () => {
   let stored = {};
   let tabReads = 0;
@@ -4187,26 +4309,38 @@ test("workflow recording survives a service-worker restart and cancel clears it"
   await assert.rejects(() => third.execute("workflowStopRecording", {}), /No workflow recording/iu);
 });
 
-test("workflow append persistence failure does not make a completed browser action retryable", async () => {
+test("workflow append journal remains fail closed across a service-worker restart", async () => {
   let stored = {};
   let writes = 0;
   let tabReads = 0;
-  const harness = createBackgroundHarness({
-    storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => {
-      writes += 1;
-      if (writes > 1) throw new Error("disk unavailable");
-      stored = { ...stored, ...structuredClone(value) };
-    },
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => {
+    writes += 1;
+    if (writes === 3) throw new Error("disk unavailable");
+    stored = { ...stored, ...structuredClone(value) };
+  };
+  const first = createBackgroundHarness({
+    storageLocalGet,
+    storageLocalSet,
     tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/app", windowId: 1 }; }
   });
-  await harness.execute("workflowStartRecording", { name: "Persistence", shortcut: "persistence" });
-  const result = await harness.execute("getTab", { tabId: 7 });
+  await first.execute("workflowStartRecording", { name: "Persistence", shortcut: "persistence" });
+  const result = await first.execute("getTab", { tabId: 7 });
   assert.equal(result.id, 7);
   assert.equal(tabReads, 1);
-  assert.ok(harness.calls.nativeMessages.some((message) => message.event?.type === "recordingFailed"));
-  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /recording is fail-closed|disk unavailable/iu);
+  assert.ok(first.calls.nativeMessages.some((message) => message.event?.type === "recordingFailed"));
+  assert.ok(stored.opencodeWorkflowRecording.pendingStep);
+
+  const restarted = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet,
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  await assert.rejects(() => restarted.execute("getTab", { tabId: 7 }), /recording is fail-closed|pending|journal/iu);
+  await assert.rejects(() => restarted.execute("workflowStopRecording", {}), /recording is fail-closed|pending|journal/iu);
   assert.equal(tabReads, 1);
+  await restarted.execute("workflowCancelRecording", {});
+  await assert.rejects(() => restarted.execute("workflowStopRecording", {}), /No workflow recording/iu);
 });
 
 test("malformed durable workflow recording fails before browser effects", async () => {
