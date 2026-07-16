@@ -86,8 +86,8 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
-test("release metadata is synchronized for v1.2.0", async () => {
-  const expectedVersion = "1.2.0";
+test("release metadata is synchronized for v1.3.0", async () => {
+  const expectedVersion = "1.3.0";
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
   const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
@@ -101,16 +101,31 @@ test("release metadata is synchronized for v1.2.0", async () => {
   assert.equal(packageLock.version, expectedVersion);
   assert.equal(packageLock.packages[""].version, expectedVersion);
   assert.equal(manifest.version, expectedVersion);
-  assert.match(popupHtml, /<span id="version">v1\.2\.0<\/span>/u);
-  assert.match(popupJs, /"v1\.2\.0"/u);
-  assert.match(readme, /Version-v1\.2\.0-/u);
-  assert.match(readme, /alt="Version v1\.2\.0"/u);
-  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.2\.0"/u);
-  assert.match(nativeHost, /HOST_VERSION = "1\.2\.0"/u);
+  assert.match(popupHtml, /<span id="version">v1\.3\.0<\/span>/u);
+  assert.match(popupJs, /"v1\.3\.0"/u);
+  assert.match(readme, /Version-v1\.3\.0-/u);
+  assert.match(readme, /alt="Version v1\.3\.0"/u);
+  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.3\.0"/u);
+  assert.match(nativeHost, /HOST_VERSION = "1\.3\.0"/u);
   assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.17.20");
+});
+
+test("README documents v1.3 session control, privacy, assets, notifications, and recovery limits", async () => {
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  for (const tool of ["chrome_resume_session", "chrome_upload_files", "chrome_network_requests", "chrome_page_assets", "chrome_notify"]) {
+    assert.ok(readme.includes(`\`${tool}\``), `README is missing ${tool}`);
+  }
+  assert.match(readme, /scheme:\/\/host:effective-port\/path/iu);
+  assert.match(readme, /request bodies.*never|never.*request bodies/iu);
+  assert.match(readme, /10 MiB/iu);
+  assert.match(readme, /120 characters/iu);
+  assert.match(readme, /1,?000 characters/iu);
+  assert.match(readme, /npm run install:native/u);
+  assert.match(readme, /npm run install:opencode/u);
+  assert.match(readme, /chrome:\/\/extensions/u);
 });
 
 test("README documents the exact Browser Intelligence public tools and safeguards", async () => {

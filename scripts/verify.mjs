@@ -26,6 +26,7 @@ const expectedPermissions = [
   "downloads.ui",
   "history",
   "nativeMessaging",
+  "notifications",
   "scripting",
   "storage",
   "tabGroups",
@@ -33,8 +34,9 @@ const expectedPermissions = [
   "webNavigation"
 ];
 
-await checkJson("package.json");
+const packageJson = await checkJson("package.json");
 const manifest = await checkJson("extension/manifest.json");
+const packageLock = await checkJson("package-lock.json");
 await access(path.join(repoRoot, "extension", "background.js"));
 await access(path.join(repoRoot, "extension", "popup.html"));
 await access(path.join(repoRoot, "extension", "content-scripts", "opencode.js"));
@@ -46,6 +48,19 @@ await access(path.join(repoRoot, "src", "opencode-plugin.js"));
 
 assertExactStringSet(manifest.permissions, expectedPermissions, "extension permissions");
 assertExactStringSet(manifest.host_permissions, ["<all_urls>"], "extension host permissions");
+for (const [name, version] of [
+  ["package.json", packageJson.version],
+  ["package-lock.json", packageLock.version],
+  ["package-lock root", packageLock.packages?.[""]?.version],
+  ["extension manifest", manifest.version]
+]) {
+  if (version !== "1.3.0") throw new Error(`${name} release version must be 1.3.0`);
+}
+const popupHtml = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
+const popupJs = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
+if (!popupHtml.includes('id="version">v1.3.0</span>') || !popupJs.includes('"v1.3.0"')) {
+  throw new Error("popup release metadata must be v1.3.0");
+}
 
 const csp = manifest.content_security_policy?.extension_pages;
 if (typeof csp !== "string" || !/connect-src\s+'none'/u.test(csp) || /127\.0\.0\.1|localhost|ws:/u.test(csp)) {

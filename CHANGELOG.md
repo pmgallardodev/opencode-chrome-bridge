@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.3.0 — 2026-07-16
+
+### Added
+
+- **Resumable session control.** Managed per-window tab groups, child-tab adoption, and
+  `chrome_resume_session` preserve explicit handoff/deliverable work across restarts.
+- **Origin-scoped approvals.** Page tools bind grants to canonical scheme, effective
+  port, and path prefixes; session grants stay isolated and batches preflight origins.
+- **Safe workspace uploads.** `chrome_upload_files` stages bounded file chunks and
+  commits only after every real workspace file and live input ref is verified.
+- **Private network summaries.** `chrome_network_requests` exposes bounded lifecycle
+  metadata while omitting bodies/headers and redacting credential-bearing URLs.
+- **Page asset bundles.** `chrome_page_assets` deduplicates DOM/CDP resources and can
+  atomically publish content plus a URL/MIME/hash/size manifest below the workspace.
+- **Branded notifications.** `chrome_notify` uses the sole new `notifications`
+  permission with strict 120-character title and 1,000-character message limits.
+- **Repair diagnostics.** The popup distinguishes missing hosts, protocol mismatch,
+  capabilities, and disabled permissions with exact local repair commands and links.
+
+### Security
+
+- Asset content is capped at 10 MiB decoded, validates binary base64, uses
+  collision-safe filenames, and rejects realpath/symlink escapes before atomic publish.
+- Browser origin authorization is recomputed after navigation and redirect; stale page
+  provenance, partial uploads, and recovery failures all fail closed.
+
 ## v1.2.0 — 2026-07-15
 
 ### Added

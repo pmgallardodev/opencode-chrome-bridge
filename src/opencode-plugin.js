@@ -11,6 +11,7 @@ import {
 } from "./bridge-client.js";
 import {
   materializeContextText,
+  materializePageAssetBundle,
   materializeReadPageArtifacts
 } from "./workspace-artifacts.js";
 
@@ -30,6 +31,7 @@ const TAB_SCOPED_TOOLS = new Set([
   "chrome_double_click", "chrome_drag", "chrome_evaluate", "chrome_fill_element",
   "chrome_find", "chrome_forward", "chrome_get_console_logs", "chrome_get_tab",
   "chrome_hover", "chrome_keypress", "chrome_move", "chrome_network_requests",
+  "chrome_page_assets",
   "chrome_page_text", "chrome_read_page", "chrome_reload", "chrome_reset_viewport",
   "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
   "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
@@ -109,6 +111,8 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_keypress: capabilities("browser.cdp", "browser.tabs"),
   chrome_move: capabilities("browser.cdp", "browser.tabs"),
   chrome_network_requests: capabilities("browser.cdp", "browser.network", "browser.tabs"),
+  chrome_page_assets: capabilities("browser.assets", "browser.cdp", "browser.tabs"),
+  chrome_notify: capabilities("browser.notifications"),
   chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
   chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
@@ -1004,6 +1008,49 @@ export default async function OpenCodeChromeBridgePlugin() {
           }), null, 2);
         }
       }),
+      chrome_page_assets: tool({
+        description: "Inventory page assets from the DOM and Chrome DevTools Protocol. Optionally fetch bounded resource content and write one atomic collision-safe bundle with a URL manifest, MIME types, SHA-256 hashes, sizes, truncation, and errors inside the OpenCode workspace.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          includeContent: schema.boolean().optional().describe("Fetch resource content through CDP. Automatically enabled when outputDirectory is set."),
+          outputDirectory: schema.string().min(1).max(500).optional().describe("Project-relative directory where a collision-safe page-assets bundle is written."),
+          maxTotalBytes: schema.number().int().min(1).max(10 * 1024 * 1024).optional().describe("Total decoded resource byte cap; defaults to 5 MiB and cannot exceed 10 MiB.")
+        },
+        async execute(args, context) {
+          const includeContent = args.includeContent === true || typeof args.outputDirectory === "string";
+          const inventory = await bridgeCommand("pageAssets", {
+            tabId: args.tabId,
+            includeContent,
+            maxTotalBytes: args.maxTotalBytes ?? 5 * 1024 * 1024
+          }, { signal: context.abort });
+          if (typeof args.outputDirectory !== "string") return JSON.stringify(inventory, null, 2);
+          const bundle = await materializePageAssetBundle({
+            assets: inventory.assets,
+            outputDirectory: args.outputDirectory,
+            projectDirectory: context.directory,
+            totalByteLimit: args.maxTotalBytes ?? 5 * 1024 * 1024
+          });
+          return JSON.stringify({
+            ...inventory,
+            assets: bundle.assets,
+            bundle: {
+              path: bundle.path,
+              relativePath: bundle.relativePath,
+              totalBytes: bundle.totalBytes
+            }
+          }, null, 2);
+        }
+      }),
+      chrome_notify: tool({
+        description: "Show a bounded branded OpenCode desktop notification through Chrome.",
+        args: {
+          title: schema.string().min(1).max(120).describe("Notification title, up to 120 characters."),
+          message: schema.string().min(1).max(1000).describe("Notification message, up to 1000 characters.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("notify", args), null, 2);
+        }
+      }),
       chrome_release_debuggers: tool({
         description: "Release persistent Chrome debugger attachments and buffered state created by console logging, network capture, or CDP event subscriptions.",
         args: {
@@ -1159,6 +1206,8 @@ const APPROVAL_METADATA = {
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
   chrome_network_requests: (args) => ({ action: "Read bounded page network request summaries", tabId: args.tabId, clear: args.clear }),
+  chrome_page_assets: (args) => ({ action: "Inventory or bundle page assets", tabId: args.tabId, outputDirectory: args.outputDirectory }),
+  chrome_notify: (args) => ({ action: "Show a Chrome notification", title: previewText(args.title) }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })

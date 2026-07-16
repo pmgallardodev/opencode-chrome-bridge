@@ -20,6 +20,7 @@ test("extension manifest exposes required browser permissions and blocks extensi
     "downloads.ui",
     "history",
     "nativeMessaging",
+    "notifications",
     "scripting",
     "storage",
     "tabGroups",
@@ -29,7 +30,7 @@ test("extension manifest exposes required browser permissions and blocks extensi
   for (const permission of expectedPermissions) {
     assert.ok(manifest.permissions.includes(permission), `missing permission ${permission}`);
   }
-  for (const permission of ["favicon", "notifications", "readingList", "sessions", "topSites"]) {
+  for (const permission of ["favicon", "readingList", "sessions", "topSites"]) {
     assert.ok(!manifest.permissions.includes(permission), `unused permission ${permission} must be removed`);
   }
 
@@ -80,6 +81,20 @@ test("popup action opens OpenCode installation documentation", async () => {
   assert.match(popupScript, /https:\/\/github\.com\/pmgallardodev/u);
   assert.match(popupScript, /chrome\.tabs\.create/u);
   assert.match(popupScript, /getManifest\(\)\.version/u);
+});
+
+test("popup exposes actionable repair states without rendering bridge secrets", async () => {
+  const popup = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
+  const popupScript = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
+  for (const code of ["EXTENSION_DISCONNECTED", "HOST_HANDSHAKE_MISSING", "PROTOCOL_INCOMPATIBLE", "MISSING_CAPABILITIES", "DISABLED_PERMISSIONS"]) {
+    assert.match(popupScript, new RegExp(code, "u"), `popup is missing ${code}`);
+  }
+  assert.match(popup, /repairCommand/u);
+  assert.match(popup, /repairLink/u);
+  assert.match(popupScript, /npm run install:native/u);
+  assert.match(popupScript, /chrome:\/\/extensions/u);
+  assert.match(popupScript, /chrome\.permissions\.contains/u);
+  assert.doesNotMatch(`${popup}\n${popupScript}`, /state\.json|bearer token|OPENCODE_SERVER_PASSWORD/iu);
 });
 
 test("background supports full CDP commands plus browser history and bookmarks", async () => {
@@ -439,10 +454,11 @@ test("managed resumable sessions expose one capability-gated resume tool", async
   assert.match(await readFile(path.join(repoRoot, "extension", "background.js"), "utf8"), /onCreatedNavigationTarget/u);
 });
 
-test("managed sessions add only webNavigation to the verified permission set", async () => {
+test("managed sessions and v1.3 add only webNavigation and notifications to the verified permission set", async () => {
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
   assert.ok(manifest.permissions.includes("webNavigation"));
-  for (const permission of ["notifications", "sessions", "unlimitedStorage"]) {
+  assert.ok(manifest.permissions.includes("notifications"));
+  for (const permission of ["sessions", "unlimitedStorage"]) {
     assert.equal(manifest.permissions.includes(permission), false, `${permission} must not be added`);
   }
   const verify = await readFile(path.join(repoRoot, "scripts", "verify.mjs"), "utf8");
@@ -620,6 +636,23 @@ test("OpenCode plugin exposes strict bounded network summaries with an explicit 
   })) {
     assert.equal(network.args[name].safeParse(value).success, false, `invalid ${name} accepted`);
   }
+});
+
+test("OpenCode plugin exposes page assets and bounded branded notifications", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  assert.ok(plugin.tool.chrome_page_assets);
+  assert.ok(plugin.tool.chrome_notify);
+  assert.deepEqual([...TOOL_CAPABILITY_REQUIREMENTS.chrome_page_assets], [
+    "bridge.handshake", "browser.assets", "browser.cdp", "browser.tabs"
+  ]);
+  assert.deepEqual([...TOOL_CAPABILITY_REQUIREMENTS.chrome_notify], [
+    "bridge.handshake", "browser.notifications"
+  ]);
+  assert.equal(plugin.tool.chrome_page_assets.args.tabId.safeParse(7).success, true);
+  assert.equal(plugin.tool.chrome_page_assets.args.outputDirectory.safeParse("artifacts/assets").success, true);
+  assert.equal(plugin.tool.chrome_page_assets.args.maxTotalBytes.safeParse(10 * 1024 * 1024 + 1).success, false);
+  assert.equal(plugin.tool.chrome_notify.args.title.safeParse("x".repeat(121)).success, false);
+  assert.equal(plugin.tool.chrome_notify.args.message.safeParse("x".repeat(1001)).success, false);
 });
 
 test("wait condition schemas are strict discriminated unions for every condition type", async () => {

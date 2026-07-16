@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import {
@@ -7,7 +7,10 @@ import {
   mkdir,
   open,
   realpath,
-  unlink
+  rename,
+  rm,
+  unlink,
+  writeFile
 } from "node:fs/promises";
 
 const MAX_OUTPUT_DIRECTORY_CHARS = 500;
@@ -16,6 +19,153 @@ const MAX_IMAGE_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const MAX_ATOMIC_NAME_ATTEMPTS = 10;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png"]);
 const ARTIFACT_IDENTITY = Symbol("workspaceArtifactIdentity");
+const MAX_PAGE_ASSET_BYTES = 10 * 1024 * 1024;
+const MAX_PAGE_ASSETS = 2_000;
+
+export async function materializePageAssetBundle({
+  assets,
+  outputDirectory,
+  projectDirectory,
+  totalByteLimit = MAX_PAGE_ASSET_BYTES
+}) {
+  if (!Array.isArray(assets) || assets.length > MAX_PAGE_ASSETS) {
+    throw new Error(`page assets must be an array with at most ${MAX_PAGE_ASSETS} entries`);
+  }
+  if (!Number.isInteger(totalByteLimit) || totalByteLimit < 1 || totalByteLimit > MAX_PAGE_ASSET_BYTES) {
+    throw new Error(`page asset total byte limit must be between 1 and ${MAX_PAGE_ASSET_BYTES}`);
+  }
+  const decoded = [];
+  let totalBytes = 0;
+  for (let index = 0; index < assets.length; index += 1) {
+    const asset = normalizePageAsset(assets[index], index);
+    totalBytes += asset.data?.length ?? 0;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > totalByteLimit) {
+      throw new Error(`page assets exceed the ${totalByteLimit} total byte limit`);
+    }
+    decoded.push(asset);
+  }
+
+  const directory = await resolveWorkspaceDirectory(projectDirectory, outputDirectory);
+  await assertWorkspaceDirectoryIdentity(directory);
+  const suffix = `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}`;
+  const stagingPath = path.join(directory.projectRoot, `.opencode-page-assets-${suffix}.tmp`);
+  const finalPath = path.join(directory.resolvedDirectory, `page-assets-${suffix}`);
+  await mkdir(stagingPath, { mode: 0o700 });
+  try {
+    const manifestAssets = [];
+    for (const asset of decoded) {
+      const entry = {
+        url: asset.url,
+        kind: asset.kind,
+        mimeType: asset.mimeType,
+        truncated: asset.truncated,
+        error: asset.error
+      };
+      if (asset.data) {
+        const filename = pageAssetFilename(asset, manifestAssets.length);
+        await writeFile(path.join(stagingPath, filename), asset.data, { flag: "wx", mode: 0o600 });
+        Object.assign(entry, {
+          filename,
+          sha256: createHash("sha256").update(asset.data).digest("hex"),
+          size: asset.data.length
+        });
+      } else {
+        Object.assign(entry, { filename: null, sha256: null, size: 0 });
+      }
+      manifestAssets.push(entry);
+    }
+    const manifest = {
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+      totalBytes,
+      truncated: manifestAssets.some((asset) => asset.truncated === true),
+      assets: manifestAssets
+    };
+    await writeFile(path.join(stagingPath, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600
+    });
+    await assertWorkspaceDirectoryIdentity(directory);
+    await rename(stagingPath, finalPath);
+    await assertWorkspaceDirectoryIdentity(directory);
+    const finalRealPath = await realpath(finalPath);
+    assertPathWithin(directory.projectRoot, finalRealPath);
+    if (!samePath(path.dirname(finalRealPath), directory.resolvedDirectory)) {
+      throw new Error("page asset bundle escaped its verified output directory");
+    }
+    return {
+      ...manifest,
+      path: finalPath,
+      relativePath: path.relative(directory.projectRoot, finalPath)
+    };
+  } catch (error) {
+    await rm(stagingPath, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function normalizePageAsset(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`page asset ${index} must be an object`);
+  }
+  let parsed;
+  try { parsed = new URL(value.url); } catch { throw new Error(`page asset ${index} has an invalid URL`); }
+  if (!["http:", "https:", "data:", "blob:"].includes(parsed.protocol)) {
+    throw new Error(`page asset ${index} has an unsupported URL scheme`);
+  }
+  const mimeType = typeof value.mimeType === "string" && value.mimeType.length <= 255
+    ? value.mimeType
+    : "application/octet-stream";
+  let data = null;
+  if (value.content != null) {
+    if (typeof value.content !== "string") throw new Error(`page asset ${index} content must be a string`);
+    if (value.base64Encoded === true) {
+      if (value.content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value.content)) {
+        throw new Error(`page asset ${index} contains invalid base64`);
+      }
+      data = Buffer.from(value.content, "base64");
+      if (data.toString("base64") !== value.content) throw new Error(`page asset ${index} contains invalid base64`);
+    } else {
+      data = Buffer.from(value.content, "utf8");
+    }
+  }
+  return {
+    url: parsed.href,
+    kind: typeof value.kind === "string" ? value.kind.slice(0, 50) : "other",
+    mimeType,
+    base64Encoded: value.base64Encoded === true,
+    data,
+    error: typeof value.error === "string" ? value.error.slice(0, 500) : null,
+    truncated: value.truncated === true
+  };
+}
+
+function pageAssetFilename(asset, index) {
+  const parsed = new URL(asset.url);
+  const rawBase = path.posix.basename(parsed.pathname) || `asset-${index + 1}`;
+  const cleaned = rawBase.normalize("NFKD").replace(/[^A-Za-z0-9._-]+/gu, "-")
+    .replace(/^\.+/u, "").slice(0, 80) || `asset-${index + 1}`;
+  const extension = path.extname(cleaned).slice(0, 12);
+  const stem = path.basename(cleaned, extension).slice(0, 64) || `asset-${index + 1}`;
+  const fallbackExtension = pageAssetExtension(asset.mimeType);
+  const digest = createHash("sha256").update(asset.url).digest("hex").slice(0, 12);
+  return `${String(index + 1).padStart(4, "0")}-${stem}-${digest}${extension || fallbackExtension}`;
+}
+
+function pageAssetExtension(mimeType) {
+  const normalized = mimeType.split(";", 1)[0].trim().toLowerCase();
+  return ({
+    "text/css": ".css",
+    "text/html": ".html",
+    "text/javascript": ".js",
+    "application/javascript": ".js",
+    "application/json": ".json",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/svg+xml": ".svg",
+    "image/webp": ".webp"
+  })[normalized] ?? ".bin";
+}
 
 export async function writeWorkspaceTextArtifact({
   outputDirectory,

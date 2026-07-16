@@ -1499,7 +1499,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   const result = await harness.execute("handshake", {});
 
   assert.equal(result.extensionId, "test-extension");
-  assert.equal(result.extensionVersion, "1.2.0");
+  assert.equal(result.extensionVersion, "1.3.0");
   assert.equal(result.hostName, "com.opencode.chrome_bridge");
   assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
   assert.ok(result.capabilities.includes("bridge.handshake"));
@@ -3684,6 +3684,48 @@ test("file upload cancellation after isolated preparation never reaches the DOM 
   assert.equal(actions.filter((action) => action === "commit").length, 0);
 });
 
+test("page assets merge DOM and CDP inventories, dedupe URLs, and return bounded content", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async () => [{ result: [
+      { url: "https://example.com/app.js", kind: "script", mimeType: "text/javascript" },
+      { url: "https://example.com/image.png", kind: "image", mimeType: "image/png" }
+    ] }],
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Page.getResourceTree") return { frameTree: {
+        frame: { id: "main", url: "https://example.com/" },
+        resources: [
+          { url: "https://example.com/app.js", type: "Script", mimeType: "text/javascript" },
+          { url: "https://example.com/style.css", type: "Stylesheet", mimeType: "text/css" }
+        ]
+      } };
+      if (method === "Page.getResourceContent") {
+        return { content: params.url.endsWith("style.css") ? "body{}" : "console.log(1)", base64Encoded: false };
+      }
+      return {};
+    }
+  });
+  const result = await harness.execute("pageAssets", { tabId: 7, includeContent: true, maxTotalBytes: 1000 });
+  assert.deepEqual(Array.from(result.assets, (asset) => asset.url), [
+    "https://example.com/app.js",
+    "https://example.com/image.png",
+    "https://example.com/style.css"
+  ]);
+  assert.equal(result.assets[0].content, "console.log(1)");
+  assert.equal(result.assets[1].error, "Content is unavailable through CDP");
+  assert.equal(result.assets[2].content, "body{}");
+  assert.ok(result.totalBytes <= 1000);
+});
+
+test("notifications enforce title and message bounds and use packaged branded icons", async () => {
+  const harness = createBackgroundHarness();
+  const result = await harness.execute("notify", { title: "Build complete", message: "Ready for review" });
+  assert.equal(result.notified, true);
+  assert.equal(harness.calls.notifications.length, 1);
+  assert.equal(harness.calls.notifications[0].options.iconUrl, "images/icon128.png");
+  await assert.rejects(() => harness.execute("notify", { title: "x".repeat(121), message: "ok" }), /title.*120/iu);
+  await assert.rejects(() => harness.execute("notify", { title: "ok", message: "x".repeat(1001) }), /message.*1000/iu);
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
@@ -3693,6 +3735,7 @@ function createBackgroundHarness({
   downloadsSearch = async () => [],
   downloadsShowDefaultFolder = async () => {},
   nativePostMessage = null,
+  notificationsCreate = async () => "notification-id",
   scriptingExecuteScript = null,
   storageLocalGet = async () => ({}),
   storageManagedGet = null,
@@ -3713,7 +3756,7 @@ function createBackgroundHarness({
   windowsUpdate = async (windowId) => ({ id: windowId }),
   webNavigationGetFrame = async ({ tabId }) => ({ documentId: `document-${tabId}`, frameId: 0 })
 } = {}) {
-  const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], notifications: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
@@ -3774,9 +3817,15 @@ function createBackgroundHarness({
       showDefaultFolder: downloadsShowDefaultFolder
     },
     history: { search: async () => [] },
+    notifications: {
+      create: async (id, options) => {
+        calls.notifications.push({ id, options });
+        return notificationsCreate(id, options);
+      }
+    },
     runtime: {
       connectNative: () => nativePort,
-      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.2.0" }),
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.3.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,

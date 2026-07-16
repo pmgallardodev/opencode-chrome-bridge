@@ -3,6 +3,7 @@ const BRIDGE_PROTOCOL_VERSION = "1.0.0";
 const BRIDGE_CAPABILITIES = Object.freeze([
   "bridge.handshake",
   "browser.accessibility",
+  "browser.assets",
   "browser.batch",
   "browser.bookmarks",
   "browser.cdp",
@@ -14,6 +15,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.history",
   "browser.navigation",
   "browser.network",
+  "browser.notifications",
   "browser.page-context",
   "browser.screenshots",
   "browser.tab-groups",
@@ -71,6 +73,10 @@ const MAX_UPLOAD_CHUNK_BYTES = 256 * 1024;
 const MAX_UPLOAD_CHUNKS = 256;
 const MAX_UPLOAD_NAME_CHARS = 255;
 const MAX_UPLOAD_MIME_CHARS = 255;
+const MAX_PAGE_ASSETS = 2_000;
+const MAX_PAGE_ASSET_TOTAL_BYTES = 10 * 1024 * 1024;
+const MAX_NOTIFICATION_TITLE_CHARS = 120;
+const MAX_NOTIFICATION_MESSAGE_CHARS = 1_000;
 const UPLOAD_TRANSFER_TTL_MS = 2 * 60 * 1000;
 const SENSITIVE_QUERY_KEYS = new Set([
   "access", "accesstoken", "apikey", "assertion", "auth", "authorization", "authorizationcode",
@@ -109,6 +115,7 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "closeTab", "domContent", "doubleClick", "evaluate", "fillElement", "findElements",
   "fileUploadCommit", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
+  "pageAssets",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
   "waitFor", "type"
@@ -119,6 +126,7 @@ const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
 const NAVIGATION_BARRIER_COMMANDS = new Set([
   "cdpCommand", "click", "clickElement", "doubleClick", "evaluate", "fillElement", "hover",
   "getConsoleLogs", "keypress", "moveSequence", "networkRequests", "screenshotRegion", "scroll",
+  "pageAssets",
   "setViewport", "resetViewport", "subscribeCdpEvents", "type", "unsubscribeCdpEvents"
 ]);
 const NAVIGATION_BARRIER_PERSISTENT_COMMANDS = new Set([
@@ -450,6 +458,10 @@ async function executeCommand(method, params, options = {}) {
       return getConsoleLogs(params, options.pageGuard);
     case "networkRequests":
       return getNetworkRequests(params, options.signal, options.pageGuard);
+    case "pageAssets":
+      return getPageAssets(params, options.signal, options.pageGuard);
+    case "notify":
+      return createNotification(params);
     case "fileUploadBegin":
       return beginFileUpload(params, options.signal);
     case "fileUploadChunk":
@@ -2908,6 +2920,187 @@ async function getNetworkRequests(params, signal, pageGuard) {
     requests,
     tabId
   };
+}
+
+async function getPageAssets(params, signal, pageGuard) {
+  const tabId = requireTabId(params);
+  const includeContent = params.includeContent === true;
+  const unsupported = Object.keys(params).filter((key) => ![
+    "tabId", "includeContent", "maxTotalBytes", "__expectedScopes", "__expectedDocumentId"
+  ].includes(key));
+  if (unsupported.length > 0) throw new Error(`pageAssets contains unsupported fields: ${unsupported.join(", ")}`);
+  const maxTotalBytes = params.maxTotalBytes ?? 5 * 1024 * 1024;
+  if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > MAX_PAGE_ASSET_TOTAL_BYTES) {
+    throw new Error(`pageAssets maxTotalBytes must be between 1 and ${MAX_PAGE_ASSET_TOTAL_BYTES}`);
+  }
+  throwIfAborted(signal);
+  await pageGuard?.();
+  const domResults = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    func: collectDomPageAssets
+  });
+  throwIfAborted(signal);
+  await pageGuard?.();
+  const domAssets = Array.isArray(domResults?.[0]?.result) ? domResults[0].result : [];
+
+  const cdpAssets = await withPersistentDebuggerMutation(tabId, async (target, scoped) => {
+    let attachedHere = false;
+    try {
+      if (!scoped && !isPersistentDebuggerAttached(tabId)) {
+        await chrome.debugger.attach(target, DEBUGGER_VERSION);
+        attachedHere = true;
+      }
+      throwIfAborted(signal);
+      const tree = await chrome.debugger.sendCommand(target, "Page.getResourceTree", {});
+      throwIfAborted(signal);
+      return flattenCdpResourceTree(tree?.frameTree);
+    } finally {
+      if (attachedHere) await chrome.debugger.detach(target).catch(() => {});
+    }
+  });
+  await pageGuard?.();
+
+  const assetsByUrl = new Map();
+  for (const candidate of [...domAssets, ...cdpAssets]) {
+    const asset = normalizePageAssetInventoryEntry(candidate);
+    if (!asset) continue;
+    const existing = assetsByUrl.get(asset.url);
+    if (existing) {
+      if (typeof asset.frameId === "string") existing.frameId = asset.frameId;
+      if (!existing.mimeType && asset.mimeType) existing.mimeType = asset.mimeType;
+      continue;
+    }
+    if (assetsByUrl.size >= MAX_PAGE_ASSETS) continue;
+    assetsByUrl.set(asset.url, asset);
+  }
+  const assets = [...assetsByUrl.values()];
+  let totalBytes = 0;
+  if (includeContent) {
+    await withPersistentDebuggerMutation(tabId, async (target, scoped) => {
+      let attachedHere = false;
+      try {
+        if (!scoped && !isPersistentDebuggerAttached(tabId)) {
+          await chrome.debugger.attach(target, DEBUGGER_VERSION);
+          attachedHere = true;
+        }
+        for (const asset of assets) {
+          throwIfAborted(signal);
+          await pageGuard?.();
+          if (typeof asset.frameId !== "string") {
+            asset.error = "Content is unavailable through CDP";
+            continue;
+          }
+          try {
+            const response = await chrome.debugger.sendCommand(target, "Page.getResourceContent", {
+              frameId: asset.frameId,
+              url: asset.url
+            });
+            if (typeof response?.content !== "string") throw new Error("CDP returned invalid resource content");
+            const bytes = response.base64Encoded === true
+              ? pageAssetDecodedBase64Bytes(response.content)
+              : new TextEncoder().encode(response.content).byteLength;
+            if (totalBytes + bytes > maxTotalBytes) {
+              asset.truncated = true;
+              asset.error = "Content omitted by total byte limit";
+              continue;
+            }
+            totalBytes += bytes;
+            asset.content = response.content;
+            asset.base64Encoded = response.base64Encoded === true;
+          } catch (error) {
+            asset.error = truncateString(error?.message ?? String(error), 500);
+          }
+        }
+      } finally {
+        if (attachedHere) await chrome.debugger.detach(target).catch(() => {});
+      }
+    });
+  }
+  for (const asset of assets) delete asset.frameId;
+  return {
+    assets,
+    count: assets.length,
+    includeContent,
+    maxTotalBytes,
+    totalBytes,
+    truncated: assetsByUrl.size >= MAX_PAGE_ASSETS || assets.some((asset) => asset.truncated === true)
+  };
+}
+
+function collectDomPageAssets() {
+  const found = [];
+  const add = (url, kind, mimeType = "") => {
+    if (typeof url !== "string" || url.length === 0) return;
+    try { found.push({ url: new URL(url, document.baseURI).href, kind, mimeType }); } catch {}
+  };
+  for (const node of document.querySelectorAll("script[src],link[href],img[src],source[src],video[src],audio[src],iframe[src],object[data]")) {
+    const tag = node.tagName.toLowerCase();
+    const url = node.src || node.href || node.data;
+    const kind = tag === "link" ? (node.rel || "link") : tag;
+    add(url, kind, node.type || "");
+  }
+  for (const entry of performance.getEntriesByType("resource")) add(entry.name, entry.initiatorType || "resource");
+  return found.slice(0, 2000);
+}
+
+function flattenCdpResourceTree(frameTree, output = []) {
+  if (!frameTree || typeof frameTree !== "object") return output;
+  const frameId = typeof frameTree.frame?.id === "string" ? frameTree.frame.id : null;
+  for (const resource of Array.isArray(frameTree.resources) ? frameTree.resources : []) {
+    output.push({
+      url: resource?.url,
+      kind: resource?.type,
+      mimeType: resource?.mimeType,
+      frameId
+    });
+  }
+  for (const child of Array.isArray(frameTree.childFrames) ? frameTree.childFrames : []) {
+    flattenCdpResourceTree(child, output);
+  }
+  return output;
+}
+
+function normalizePageAssetInventoryEntry(value) {
+  if (!value || typeof value !== "object" || typeof value.url !== "string" || value.url.length > 8192) return null;
+  let parsed;
+  try { parsed = new URL(value.url); } catch { return null; }
+  if (!["http:", "https:", "data:", "blob:"].includes(parsed.protocol)) return null;
+  return {
+    url: parsed.href,
+    kind: typeof value.kind === "string" ? truncateString(value.kind, 50) : "other",
+    mimeType: typeof value.mimeType === "string" ? truncateString(value.mimeType, 255) : "",
+    frameId: typeof value.frameId === "string" ? value.frameId : undefined,
+    truncated: false
+  };
+}
+
+function pageAssetDecodedBase64Bytes(value) {
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)) {
+    throw new Error("CDP returned invalid base64 resource content");
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+async function createNotification(params) {
+  if (!isRecord(params)) throw new Error("notify params must be an object");
+  const unsupported = Object.keys(params).filter((key) => !["title", "message"].includes(key));
+  if (unsupported.length > 0) throw new Error(`notify contains unsupported fields: ${unsupported.join(", ")}`);
+  if (typeof params.title !== "string" || params.title.length < 1 || params.title.length > MAX_NOTIFICATION_TITLE_CHARS) {
+    throw new Error(`notification title must be between 1 and ${MAX_NOTIFICATION_TITLE_CHARS} characters`);
+  }
+  if (typeof params.message !== "string" || params.message.length < 1 || params.message.length > MAX_NOTIFICATION_MESSAGE_CHARS) {
+    throw new Error(`notification message must be between 1 and ${MAX_NOTIFICATION_MESSAGE_CHARS} characters`);
+  }
+  const id = `opencode-${Date.now().toString(36)}-${crypto.randomUUID()}`;
+  await chrome.notifications.create(id, {
+    type: "basic",
+    iconUrl: "images/icon128.png",
+    title: params.title,
+    message: params.message
+  });
+  return { id, notified: true };
 }
 
 function assertNetworkRequestFields(params) {

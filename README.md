@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.2.0-0f766e?style=flat-square" alt="Version v1.2.0" />
+  <img src="https://img.shields.io/badge/Version-v1.3.0-0f766e?style=flat-square" alt="Version v1.3.0" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -382,19 +382,56 @@ Element references survive page mutations but are invalidated by navigation — 
 | --- | --- |
 | `chrome_events` | Poll buffered browser events (tabs, windows, downloads, CDP) since a sequence number |
 | `chrome_get_console_logs` | Read accumulated console messages, network log entries, and uncaught exceptions for a tab |
+| `chrome_network_requests` | Read bounded lifecycle summaries with credential-bearing URL fields redacted |
 | `chrome_release_debuggers` | Release persistent debugger attachments created for logging or CDP subscriptions |
+
+Network summaries never capture request bodies, response bodies, cookies, or
+authorization headers. URL user-info and fragments are removed, and sensitive query
+values (including prefixed AWS and Google credential/signature keys) are replaced with
+`[redacted]`. Capture uses a bounded 1,000-request / 2,000,000-character buffer and can
+be released with `chrome_release_debuggers`.
 
 ### Session lifecycle and visual state
 
 | Tool | Description |
 | --- | --- |
 | `chrome_claim_tab` | Claim an existing tab for a browser-control session |
+| `chrome_resume_session` | Resume handoff/deliverable tabs after a restart and repair their managed groups |
 | `chrome_finalize_tabs` | Finalize a session, closing unkept agent tabs and preserving handoff or deliverable tabs |
 | `chrome_end_turn` | Release active tab leases and debugger attachments for a turn |
 | `chrome_cursor_state` | Update the visible browser-control cursor state |
 | `chrome_favicon_badge` | Set or clear the browser-control favicon badge |
 
 While the cursor state is `active`, the controlled page shows a pulsing viewport border and a **Stop OpenCode** button. Pressing it emits a `stopRequested` bridge event (visible through `chrome_events`) so the driving agent can halt the turn.
+
+Session tabs are grouped per Chrome window and newly opened child tabs are adopted only
+from a live leased parent. `chrome_resume_session` fails closed on malformed or internal
+tabs and keeps handoff state intact when recovery must be retried.
+
+### Origin permissions, uploads, assets, and notifications
+
+| Tool | Description |
+| --- | --- |
+| `chrome_upload_files` | Upload up to 20 workspace files (50 MiB total) to a live file-input ref with staged all-or-nothing commit |
+| `chrome_page_assets` | Inventory deduplicated DOM/CDP resources and optionally save an atomic workspace bundle |
+| `chrome_notify` | Show a branded Chrome notification with a title up to 120 characters and message up to 1,000 characters |
+
+Page tools request canonical `scheme://host:effective-port/path` scopes. Grants preserve
+scheme, effective port, and configured path boundaries; navigation and redirects are
+recomputed, session grants are isolated by OpenCode session, and batch preflight denies
+the whole action list before side effects when any origin is refused.
+
+`chrome_upload_files` resolves and opens every file below the real workspace before
+staging bytes. Directories, symlink escapes, identity swaps, stale refs, and partial
+commits fail closed. `chrome_page_assets` combines DOM and CDP inventories, deduplicates
+URLs, and can materialize resource content under a project-relative `outputDirectory`.
+Its bundle contains collision-safe filenames plus a `manifest.json` with original URLs,
+MIME types, SHA-256 hashes, byte sizes, truncation flags, and per-resource errors. Binary
+CDP resources are decoded from base64; total decoded content is capped at 10 MiB. Bundle
+publication is atomic and realpath/symlink containment checks reject workspace escapes.
+
+The `notifications` permission is used only by `chrome_notify`; notification text is
+bounded and the packaged OpenCode icon is used. No bridge credential is displayed.
 
 ### Navigation policy
 
@@ -502,7 +539,7 @@ That state file contains a bearer token generated from 256 random bits. The toke
 
 Treat that token as a full local browser-control capability. Any local process that can read the state file can call the bridge until the native-host process exits, including tools that inspect tabs, history, bookmarks, downloads, and CDP state.
 
-The extension requests only the browser permissions used by its implemented tools: `alarms`, `bookmarks`, `debugger`, `downloads`, `downloads.ui`, `history`, `nativeMessaging`, `scripting`, `storage`, `tabGroups`, and `tabs`. It also requests `<all_urls>` host access so it can inject the local cursor overlay into controlled pages. The extension-page CSP blocks network connections; only the Node plugin talks to the authenticated local HTTP bridge, while the extension communicates with the native host through Chrome native messaging.
+The extension requests only the browser permissions used by its implemented tools: `alarms`, `bookmarks`, `debugger`, `downloads`, `downloads.ui`, `history`, `nativeMessaging`, `notifications`, `scripting`, `storage`, `tabGroups`, `tabs`, and `webNavigation`. It also requests `<all_urls>` host access so it can inject the local cursor overlay into controlled pages. The extension-page CSP blocks network connections; only the Node plugin talks to the authenticated local HTTP bridge, while the extension communicates with the native host through Chrome native messaging.
 
 `chrome_cdp` is intentionally powerful. It is equivalent to enabling full CDP access for OpenCode — it can inspect and control sensitive Chrome internals in the connected profile. Keep this extension loaded only in Chrome profiles where OpenCode is allowed to inspect browser state.
 
@@ -731,6 +768,20 @@ chrome://extensions/?id=miccjajdhchpcdpmmiahheilooppepnl
 ```
 
 Click the reload button on the extension card.
+
+### Popup reports an old protocol, missing capabilities, or disabled permissions
+
+Update every component together, then reinstall both local pieces:
+
+```bash
+npm ci
+npm run install:native
+npm run install:opencode
+```
+
+Open `chrome://extensions/?id=miccjajdhchpcdpmmiahheilooppepnl`, enable the extension
+and its required permissions, and click reload. The popup shows only bounded diagnostic
+text and these repair commands; it never renders local bridge secrets.
 
 ## OpenCode Chrome Bridge vs MCP Playwright
 

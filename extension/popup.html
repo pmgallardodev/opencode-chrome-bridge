@@ -159,6 +159,26 @@
         min-height: 16px;
         overflow-wrap: anywhere;
       }
+
+      .repair {
+        background: rgba(255, 255, 255, 0.04);
+        border-radius: 6px;
+        margin-top: 10px;
+        padding: 9px;
+      }
+
+      .repair[hidden] {
+        display: none;
+      }
+
+      .repair code {
+        color: var(--text);
+        display: block;
+        font-size: 11px;
+        margin-bottom: 7px;
+        overflow-wrap: anywhere;
+        user-select: all;
+      }
     </style>
   </head>
   <body>
@@ -187,7 +207,11 @@
           <button id="learnMore" class="link" type="button">Learn more</button>
         </p>
         <span id="statusDetail">Native host com.opencode.chrome_bridge</span>
-        <div class="version">Version <span id="version">v1.2.0</span></div>
+        <div id="repair" class="repair" hidden>
+          <code id="repairCommand"></code>
+          <button id="repairLink" class="link" type="button">Open repair page</button>
+        </div>
+        <div class="version">Version <span id="version">v1.3.0</span></div>
         <div class="copyright">Copyright 2026 <button id="copyrightLink" class="link" type="button">pmgallardodev</button></div>
       </section>
     </main>

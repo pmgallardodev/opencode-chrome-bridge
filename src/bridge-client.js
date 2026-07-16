@@ -12,7 +12,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 const MAX_REQUEST_TIMEOUT_MS = 126000;
 const MAX_CAPABILITY_HEADER_CHARS = 10_000;
 const NATIVE_HOST_NAME = "com.opencode.chrome_bridge";
-export const BRIDGE_CLIENT_VERSION = "1.2.0";
+export const BRIDGE_CLIENT_VERSION = "1.3.0";
 export const BRIDGE_PROTOCOL_MIN = "1.0.0";
 export const BRIDGE_PROTOCOL_MAX = "1.0.0";
 const DEFAULT_REQUIRED_CAPABILITIES = Object.freeze(["bridge.handshake"]);
@@ -24,6 +24,7 @@ const ORIGIN_SCOPED_BRIDGE_METHODS = new Set([
   "closeTab", "domContent", "doubleClick", "evaluate", "fileUploadCommit", "fillElement",
   "findElements", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
+  "pageAssets",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "type", "unsubscribeCdpEvents", "waitFor"
 ]);
