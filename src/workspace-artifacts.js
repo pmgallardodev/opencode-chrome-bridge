@@ -185,7 +185,13 @@ async function writeRetainedBundleFile({
   await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
   const filePath = path.join(stagingPath, filename);
   const handle = await open(filePath, exclusiveNoFollowWriteFlags(), 0o600);
-  const record = { filename, handle, identity: null };
+  const record = {
+    expectedHash: createHash("sha256").update(data).digest("hex"),
+    expectedSize: data.length,
+    filename,
+    handle,
+    identity: null
+  };
   retainedFiles.push(record);
   await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
   const handleInfo = await handle.stat();
@@ -246,6 +252,7 @@ async function validatePublishedBundle(finalPath, stagingIdentity, directory, re
       || identityOf(fileInfo) !== record.identity || identityOf(retainedInfo) !== record.identity) {
       throw new Error("published page asset file identity does not match staging");
     }
+    await validateRetainedBundleContent(record, retainedInfo);
   }
   await assertWorkspaceDirectoryIdentity(directory);
   const verifiedRealPath = await realpath(finalPath);
@@ -256,6 +263,26 @@ async function validatePublishedBundle(finalPath, stagingIdentity, directory, re
   if (!finalInfo.isDirectory() || finalInfo.isSymbolicLink()
     || identityOf(finalInfo) !== stagingIdentity) {
     throw new Error("published page asset bundle changed during verification");
+  }
+}
+
+async function validateRetainedBundleContent(record, retainedInfo) {
+  if (retainedInfo.size !== record.expectedSize) {
+    throw new Error("published page asset content size does not match staging");
+  }
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, record.expectedSize)));
+  let position = 0;
+  while (position < record.expectedSize) {
+    const length = Math.min(buffer.length, record.expectedSize - position);
+    // An explicit position keeps the retained handle's write offset unchanged.
+    const { bytesRead } = await record.handle.read(buffer, 0, length, position);
+    if (bytesRead < 1) throw new Error("published page asset content was truncated during verification");
+    digest.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  if (digest.digest("hex") !== record.expectedHash) {
+    throw new Error("published page asset content hash does not match staging");
   }
 }
 
@@ -751,7 +778,7 @@ async function rollbackWorkspaceArtifact(artifact) {
 
 function exclusiveNoFollowWriteFlags() {
   const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
-  return fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow;
+  return fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | noFollow;
 }
 
 function directoryNoFollowFlags() {

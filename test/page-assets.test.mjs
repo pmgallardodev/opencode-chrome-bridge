@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -202,4 +202,50 @@ test("page asset bundles cap retained content files and describe every omitted r
   assert.equal(manifest.assets.filter((asset) => /omitted/iu.test(asset.error ?? "")).length, 3);
   assert.equal(manifest.truncated, true);
   assert.equal((await readdir(bundle.path)).length, 128);
+});
+
+test("page asset publication rejects same-length content tampering through the retained handle", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-tamper-hash-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-tamper-hash-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  const leaked = path.join(outside, "leaked.js");
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [{ url: "https://example.com/private.js", content: "ORIGINAL" }],
+    afterBundleFilesWritten: async ({ stagingPath }) => {
+      const filename = (await readdir(stagingPath)).find((entry) => entry !== "manifest.json");
+      const assetPath = path.join(stagingPath, filename);
+      await link(assetPath, leaked);
+      await writeFile(assetPath, "TAMPERED");
+    }
+  }), /content|hash|integrity|size/iu);
+  assert.equal((await readFile(leaked)).length, 0);
+  assert.deepEqual(await readdir(path.join(projectDirectory, "assets")), []);
+});
+
+test("page asset publication rejects truncated content through the retained handle", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-tamper-size-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-tamper-size-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  const leaked = path.join(outside, "leaked.js");
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [{ url: "https://example.com/private.js", content: "ORIGINAL" }],
+    afterBundleFilesWritten: async ({ stagingPath }) => {
+      const filename = (await readdir(stagingPath)).find((entry) => entry !== "manifest.json");
+      const assetPath = path.join(stagingPath, filename);
+      await link(assetPath, leaked);
+      await truncate(assetPath, 2);
+    }
+  }), /content|hash|integrity|size/iu);
+  assert.equal((await readFile(leaked)).length, 0);
+  assert.deepEqual(await readdir(path.join(projectDirectory, "assets")), []);
 });
