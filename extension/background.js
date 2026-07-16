@@ -26,7 +26,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
 const RECONNECT_ALARM = "opencode-chrome-bridge-reconnect";
 const DEBUGGER_VERSION = "1.3";
 const OVERLAY_SOURCE = "opencode-bridge";
-const CONSOLE_LOG_METHODS = ["Console.messageAdded", "Log.entryAdded", "Runtime.exceptionThrown"];
+const CONSOLE_LOG_METHODS = ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"];
 const CONSOLE_LOG_BUFFER_MAX = 500;
 const CONSOLE_LOG_BUFFER_MAX_CHARS = 2_000_000;
 const MAX_CONSOLE_LOG_TEXT_CHARS = 20_000;
@@ -114,9 +114,7 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "waitFor", "type"
 ]);
 const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
-  "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
-  "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
-  "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
+  "Page.getLayoutMetrics", "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
 ]);
 const NAVIGATION_BARRIER_COMMANDS = new Set([
   "cdpCommand", "click", "clickElement", "doubleClick", "evaluate", "fillElement", "hover",
@@ -162,6 +160,7 @@ const navigationBarriers = new Map();
 const scopedDebuggerTargets = new Map();
 const tabPageProvenance = new Map();
 const executionContextScopes = new Map();
+const tabMainFrameEpochs = new Map();
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
@@ -2286,6 +2285,8 @@ async function releaseDebuggers(params = {}) {
       networkRequestStates.delete(tabId);
       cdpSubscriptions.delete(tabId);
       cdpEnabledDomains.delete(tabId);
+      tabMainFrameEpochs.delete(tabId);
+      executionContextScopes.delete(tabId);
       consoleLogBuffers.delete(tabId);
       consoleLogBufferChars.delete(tabId);
       if (attached) await chrome.debugger.detach(target).catch(() => {});
@@ -2395,8 +2396,13 @@ function registerBrowserEventListeners() {
     const generation = (navigationSequences.get(details.tabId) ?? 0) + 1;
     navigationSequences.set(details.tabId, generation);
     const pageScope = safeCanonicalPermissionScope(details.url);
-    if (pageScope) tabPageProvenance.set(details.tabId, { navigationGeneration: generation, pageScope });
+    if (pageScope) tabPageProvenance.set(details.tabId, {
+      documentId: typeof details.documentId === "string" ? details.documentId : `generation:${generation}`,
+      navigationGeneration: generation,
+      pageScope
+    });
     executionContextScopes.delete(details.tabId);
+    tabMainFrameEpochs.delete(details.tabId);
   });
   chrome.webNavigation.onCreatedNavigationTarget.addListener((details) =>
     adoptCreatedNavigationTarget(details).catch(reportLeasePersistenceError)
@@ -2408,6 +2414,7 @@ function registerBrowserEventListeners() {
       navigationSequences.set(tabId, navigationGeneration);
       updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration);
       executionContextScopes.delete(tabId);
+      tabMainFrameEpochs.delete(tabId);
       consoleLogBuffers.delete(tabId);
       consoleLogBufferChars.delete(tabId);
       networkRequestStates.delete(tabId);
@@ -2423,6 +2430,7 @@ function registerBrowserEventListeners() {
     navigationSequences.delete(tabId);
     tabPageProvenance.delete(tabId);
     executionContextScopes.delete(tabId);
+    tabMainFrameEpochs.delete(tabId);
     const persistence = removeClosedTabLease(tabId);
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
@@ -2458,6 +2466,7 @@ function registerBrowserEventListeners() {
       if (barrier && typeof params.requestId === "string") barrier.pausedRequestIds.push(params.requestId);
       return;
     }
+    recordMainFrameEpoch(tabId, method, params);
     recordExecutionContextScope(tabId, method, params);
     if (networkTrackerAttached.has(tabId)) trackNetworkEvent(tabId, method, params);
     const subscribed = cdpSubscriptions.get(tabId);
@@ -2486,6 +2495,7 @@ function registerBrowserEventListeners() {
       networkRequestStates.delete(tabId);
       cdpEnabledDomains.delete(tabId);
       executionContextScopes.delete(tabId);
+      tabMainFrameEpochs.delete(tabId);
       sendEvent({ category: "cdp", type: "cdpDetached", tabId, reason });
     }
   });
@@ -2493,7 +2503,14 @@ function registerBrowserEventListeners() {
 
 async function refreshTabPageProvenance(tabId) {
   const tab = await chrome.tabs.get(tabId);
-  updateTabPageProvenanceFromTab(tabId, tab, navigationSequences.get(tabId) ?? 0);
+  const current = await currentPageBinding(tabId, tab.url);
+  tabPageProvenance.set(tabId, {
+    documentId: current.documentId,
+    navigationGeneration: current.navigationGeneration,
+    pageScope: current.pageScope
+  });
+  const epoch = tabMainFrameEpochs.get(tabId);
+  if (epoch && epoch.documentId !== current.documentId) tabMainFrameEpochs.delete(tabId);
 }
 
 function updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration) {
@@ -2502,7 +2519,11 @@ function updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration) {
     tabPageProvenance.delete(tabId);
     return;
   }
-  tabPageProvenance.set(tabId, { navigationGeneration, pageScope });
+  tabPageProvenance.set(tabId, {
+    documentId: `generation:${navigationGeneration}`,
+    navigationGeneration,
+    pageScope
+  });
 }
 
 function safeCanonicalPermissionScope(value) {
@@ -2510,6 +2531,10 @@ function safeCanonicalPermissionScope(value) {
 }
 
 function recordExecutionContextScope(tabId, method, params) {
+  if (method === "Runtime.executionContextsCleared") {
+    executionContextScopes.delete(tabId);
+    return;
+  }
   if (method === "Runtime.executionContextDestroyed" && Number.isInteger(params?.executionContextId)) {
     executionContextScopes.get(tabId)?.delete(params.executionContextId);
     return;
@@ -2517,31 +2542,69 @@ function recordExecutionContextScope(tabId, method, params) {
   if (method !== "Runtime.executionContextCreated") return;
   const context = params?.context;
   const pageScope = safeCanonicalPermissionScope(context?.origin);
-  if (!Number.isInteger(context?.id) || !pageScope) return;
+  const current = tabPageProvenance.get(tabId);
+  const epoch = tabMainFrameEpochs.get(tabId);
+  if (!Number.isInteger(context?.id)
+    || !pageScope
+    || !current
+    || !epoch
+    || context?.auxData?.isDefault !== true
+    || context?.auxData?.frameId !== epoch.frameId
+    || epoch.documentId !== current.documentId
+    || epoch.navigationGeneration !== current.navigationGeneration
+    || pageScope !== current.pageScope) return;
   let contexts = executionContextScopes.get(tabId);
   if (!contexts) {
     contexts = new Map();
     executionContextScopes.set(tabId, contexts);
   }
-  contexts.set(context.id, pageScope);
+  contexts.set(context.id, { ...epoch, pageScope, tabId });
 }
 
 function cdpEventPageProvenance(tabId, method, params) {
-  let pageScope = null;
-  if (Number.isInteger(params?.executionContextId)) {
-    pageScope = executionContextScopes.get(tabId)?.get(params.executionContextId) ?? null;
-  }
-  if (!pageScope && method === "Runtime.executionContextCreated") {
-    pageScope = safeCanonicalPermissionScope(params?.context?.origin);
-  }
-  if (!pageScope) {
-    pageScope = safeCanonicalPermissionScope(
-      params?.message?.url ?? params?.entry?.url ?? params?.exceptionDetails?.url
-    );
-  }
+  const contextId = Number.isInteger(params?.executionContextId)
+    ? params.executionContextId
+    : Number.isInteger(params?.exceptionDetails?.executionContextId)
+      ? params.exceptionDetails.executionContextId
+      : method === "Runtime.executionContextCreated" && Number.isInteger(params?.context?.id)
+        ? params.context.id
+        : null;
+  let provenance = contextId === null ? null : executionContextScopes.get(tabId)?.get(contextId) ?? null;
+  const epoch = tabMainFrameEpochs.get(tabId);
+  if (!provenance && epoch
+    && typeof params?.frameId === "string"
+    && typeof params?.loaderId === "string"
+    && params.frameId === epoch.frameId
+    && params.loaderId === epoch.loaderId) provenance = epoch;
   const current = tabPageProvenance.get(tabId);
-  if (!pageScope || !current || pageScope !== current.pageScope) return null;
-  return { navigationGeneration: current.navigationGeneration, pageScope };
+  if (!provenance
+    || !current
+    || provenance.documentId !== current.documentId
+    || provenance.navigationGeneration !== current.navigationGeneration
+    || provenance.pageScope !== current.pageScope) return null;
+  return {
+    documentId: provenance.documentId,
+    frameId: provenance.frameId,
+    loaderId: provenance.loaderId,
+    navigationGeneration: provenance.navigationGeneration,
+    pageScope: provenance.pageScope
+  };
+}
+
+function recordMainFrameEpoch(tabId, method, params) {
+  if (method !== "Page.frameNavigated") return;
+  const frame = params?.frame;
+  if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return;
+  const current = tabPageProvenance.get(tabId);
+  const pageScope = safeCanonicalPermissionScope(frame.url);
+  if (!current || !pageScope || pageScope !== current.pageScope) return;
+  tabMainFrameEpochs.set(tabId, {
+    documentId: current.documentId,
+    frameId: frame.id,
+    loaderId: frame.loaderId,
+    navigationGeneration: current.navigationGeneration,
+    pageScope
+  });
 }
 
 const CDP_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/u;
@@ -4118,7 +4181,8 @@ async function ensureConsoleLogDebugger(tabId) {
     if (!scoped && !isPersistentDebuggerAttached(tabId)) {
       await chrome.debugger.attach(target, DEBUGGER_VERSION);
     }
-    await enableCdpDomains(target, ["Console", "Log", "Runtime"]);
+    await enableCdpDomains(target, ["Page", "Runtime"]);
+    await seedMainFrameEpoch(tabId, target);
     consoleLogAttached.add(tabId);
     return { tabId, attached: true, alreadyAttached };
   });
@@ -4144,6 +4208,14 @@ function appendConsoleLog(tabId, method, params, provenance) {
 
 function normalizeConsoleLog(method, params) {
   const entry = { source: method, timestamp: Date.now() };
+  if (method === "Runtime.consoleAPICalled") {
+    entry.level = typeof params?.type === "string" ? params.type.toLowerCase() : "log";
+    entry.text = truncateString((Array.isArray(params?.args) ? params.args : [])
+      .map(formatRuntimeConsoleArgument)
+      .filter((value) => value.length > 0)
+      .join(" "), MAX_CONSOLE_LOG_TEXT_CHARS);
+    return entry;
+  }
   if (method === "Console.messageAdded") {
     const message = params?.message ?? {};
     entry.level = typeof message.level === "string" ? message.level.toLowerCase() : "info";
@@ -4180,6 +4252,16 @@ function normalizeConsoleLog(method, params) {
   return entry;
 }
 
+function formatRuntimeConsoleArgument(argument) {
+  if (!argument || typeof argument !== "object") return "";
+  if (["string", "number", "boolean", "bigint"].includes(argument.type) && argument.value != null) {
+    return String(argument.value);
+  }
+  if (typeof argument.unserializableValue === "string") return argument.unserializableValue;
+  if (typeof argument.description === "string") return argument.description;
+  return argument.type === "undefined" ? "undefined" : "";
+}
+
 function truncateString(value, maxChars) {
   return typeof value === "string" ? value.slice(0, maxChars) : "";
 }
@@ -4212,7 +4294,25 @@ async function ensureCdpEventDebugger(tabId, methods) {
       await chrome.debugger.attach(target, DEBUGGER_VERSION);
     }
     cdpEventAttached.add(tabId);
-    await enableCdpDomains(target, [...new Set(methods.map((method) => method.split(".")[0]))]);
+    await enableCdpDomains(target, [...new Set(["Page", ...methods.map((method) => method.split(".")[0])])]);
+    await seedMainFrameEpoch(tabId, target);
+  });
+}
+
+async function seedMainFrameEpoch(tabId, target) {
+  const current = tabPageProvenance.get(tabId);
+  if (!current) return;
+  let frame;
+  try { frame = (await chrome.debugger.sendCommand(target, "Page.getFrameTree", {}))?.frameTree?.frame; } catch { return; }
+  if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return;
+  const pageScope = safeCanonicalPermissionScope(frame.url);
+  if (!pageScope || pageScope !== current.pageScope) return;
+  tabMainFrameEpochs.set(tabId, {
+    documentId: current.documentId,
+    frameId: frame.id,
+    loaderId: frame.loaderId,
+    navigationGeneration: current.navigationGeneration,
+    pageScope
   });
 }
 

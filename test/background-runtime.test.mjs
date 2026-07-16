@@ -11,6 +11,24 @@ const backgroundSource = await readFile(path.join(repoRoot, "extension", "backgr
 const pageBinding = (tabId = 7, scope = "https://example.com:443/", documentId = `document-${tabId}`) => ({
   documentId, navigationGeneration: 0, pageScope: scope, tabId
 });
+let runtimeContextSequence = 1_000;
+
+async function emitCurrentRuntimeConsole(harness, text, { level = "log", url = "https://example.com/" } = {}) {
+  const contextId = runtimeContextSequence++;
+  const frameId = `main-frame-${contextId}`;
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: frameId, loaderId: `loader-${contextId}`, url }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: {
+      auxData: { frameId, isDefault: true, type: "default" },
+      id: contextId, origin: new URL(url).origin, uniqueId: `context-${contextId}`
+    }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: text }], executionContextId: contextId, type: level
+  });
+}
 
 test("scoped page commands fail before a read when the tab navigated after approval", async () => {
   const harness = createBackgroundHarness({
@@ -37,6 +55,18 @@ test("scoped CDP blocks cross-target Target methods and unauthorized Page.naviga
     method: "cdpCommand",
     params: { tabId: 7, method: "Page.navigate", commandParams: { url: "https://evil.example/" } }
   }), /destination.*not authorized|scope/iu);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+});
+
+test("scoped raw CDP rejects DOM and DOMSnapshot traversal before debugger dispatch", async () => {
+  const harness = createBackgroundHarness();
+  for (const method of ["DOM.getDocument", "DOM.querySelector", "DOM.getOuterHTML", "DOMSnapshot.captureSnapshot"]) {
+    await assert.rejects(() => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+      method: "cdpCommand", params: { commandParams: {}, method, tabId: 7 }
+    }), /CDP method.*not allowed|dedicated/iu, method);
+  }
+  assert.equal(harness.calls.debuggerAttach.length, 0);
   assert.equal(harness.calls.debuggerCommands.length, 0);
 });
 
@@ -228,7 +258,7 @@ test("Fetch-domain subscriptions fail before debugger ownership or enable side e
 
 test("scoped persistent debugger acquisition rolls back when navigation starts during domain enable", async () => {
   for (const [method, params, enabledDomain] of [
-    ["getConsoleLogs", { autoAttach: true, tabId: 7 }, "Console"],
+    ["getConsoleLogs", { autoAttach: true, tabId: 7 }, "Page"],
     ["networkRequests", { autoAttach: true, tabId: 7 }, "Network"],
     ["subscribeCdpEvents", { methods: ["Console.messageAdded"], tabId: 7 }, "Console"]
   ]) {
@@ -277,7 +307,7 @@ test("scoped unsubscription rolls back ownership when navigation starts before m
     method: "unsubscribeCdpEvents", params: { tabId: 7, methods: ["Console.messageAdded"] }
   }), /document changed|not authorized/iu);
   assert.deepEqual(harness.persistentDebuggerState(7), {
-    console: false, domains: ["Console"], events: true, network: false, subscriptions: ["Console.messageAdded"]
+    console: false, domains: ["Console", "Page"], events: true, network: false, subscriptions: ["Console.messageAdded"]
   });
   assert.equal(harness.calls.debuggerDetach.length, 0);
 });
@@ -497,6 +527,59 @@ test("top-level B to A navigation cannot expose old or late B console entries", 
   );
   const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(result.logs.length, 0);
+});
+
+test("A1 to B to A3 drops URL-only late console data and accepts only the current exact document context", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.execute("subscribeCdpEvents", {
+    tabId: 7, methods: ["Console.messageAdded", "Runtime.consoleAPICalled"]
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-main", loaderId: "loader-a1", url: "https://example.com/" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: {
+      auxData: { frameId: "frame-main", isDefault: true, type: "default" },
+      id: 101, origin: "https://example.com", uniqueId: "context-a1"
+    }
+  });
+
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-b", frameId: 0, tabId: 7, url: "https://b.example/"
+  });
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-a3", frameId: 0, tabId: 7, url: "https://example.com/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-main", loaderId: "loader-a3", url: "https://example.com/" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: {
+      auxData: { frameId: "frame-main", isDefault: true, type: "default" },
+      id: 303, origin: "https://example.com", uniqueId: "context-a3"
+    }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Console.messageAdded", {
+    message: { level: "error", text: "secret-from-a1", url: "https://example.com/" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "context-secret-from-a1" }], executionContextId: 101, type: "log"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-a3" }], executionContextId: 303, type: "log"
+  });
+
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a3");
+  const forwarded = harness.calls.nativeMessages
+    .filter((message) => message.type === "event" && message.event?.category === "cdp")
+    .map((message) => message.event);
+  assert.equal(JSON.stringify(forwarded).includes("secret-from-a1"), false);
+  assert.equal(JSON.stringify(forwarded).includes("context-secret-from-a1"), false);
+  const current = forwarded.find((event) => JSON.stringify(event.params ?? "").includes("current-a3"));
+  assert.equal(current.documentId, "document-a3");
+  assert.ok(current.navigationGeneration >= 2);
 });
 
 test("top-level B to A navigation cannot expose old or late B network entries", async () => {
@@ -1712,11 +1795,7 @@ test("network-idle waits reset on activity and preserve console debugger consume
   assert.ok(Number.isFinite(result.trackingSince), "network waits must disclose when request observation began");
   assert.equal(harness.calls.debuggerDetach.length, 0, "network wait cleanup must preserve the console debugger");
 
-  await harness.events.debuggerOnEvent.emit(
-    { tabId: 7 },
-    "Console.messageAdded",
-    { message: { level: "info", text: "still collecting", url: "https://example.com/" } }
-  );
+  await emitCurrentRuntimeConsole(harness, "still collecting", { level: "info" });
   const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(logs.logs[0].text, "still collecting");
 });
@@ -1997,9 +2076,7 @@ test("network capture cancellation during enable preserves prior debugger consum
   });
   assert.equal(harness.networkTrackerState(7), null, "cancelled enable must not leave late capture active");
 
-  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Console.messageAdded", {
-    message: { level: "info", text: "console survived", url: "https://example.com/" }
-  });
+  await emitCurrentRuntimeConsole(harness, "console survived", { level: "info" });
   const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(logs.attached, true);
   assert.equal(logs.logs[0].text, "console survived");
@@ -2656,11 +2733,7 @@ test("unsubscribing CDP events preserves persistent console collection", async (
   await harness.execute("getConsoleLogs", { tabId: 7 });
   await harness.execute("subscribeCdpEvents", { tabId: 7, methods: ["Network.responseReceived"] });
   await harness.execute("unsubscribeCdpEvents", { tabId: 7 });
-  await harness.events.debuggerOnEvent.emit(
-    { tabId: 7 },
-    "Console.messageAdded",
-    { message: { level: "error", text: "still captured", url: "https://example.com/" } }
-  );
+  await emitCurrentRuntimeConsole(harness, "still captured", { level: "error" });
 
   const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(result.attached, true);
@@ -2673,11 +2746,7 @@ test("console logs and forwarded CDP events are bounded before buffering or nati
   const oversizedText = "x".repeat(600_000);
 
   await harness.execute("getConsoleLogs", { tabId: 7 });
-  await harness.events.debuggerOnEvent.emit(
-    { tabId: 7 },
-    "Console.messageAdded",
-    { message: { level: "error", text: oversizedText, url: "https://example.com/" } }
-  );
+  await emitCurrentRuntimeConsole(harness, oversizedText, { level: "error" });
 
   const result = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
   assert.equal(result.logs[0].text.length, 20_000);
@@ -2888,12 +2957,12 @@ test("setting window state returns the populated tab count", async () => {
 });
 
 test("failed CDP domain enables are retried on the next console request", async () => {
-  let consoleEnableAttempts = 0;
+  let runtimeEnableAttempts = 0;
   const harness = createBackgroundHarness({
     debuggerSendCommand: async (_target, method) => {
-      if (method === "Console.enable") {
-        consoleEnableAttempts += 1;
-        if (consoleEnableAttempts === 1) throw new Error("target was temporarily unavailable");
+      if (method === "Runtime.enable") {
+        runtimeEnableAttempts += 1;
+        if (runtimeEnableAttempts === 1) throw new Error("target was temporarily unavailable");
       }
       return {};
     }
@@ -2902,7 +2971,7 @@ test("failed CDP domain enables are retried on the next console request", async 
   await harness.execute("getConsoleLogs", { tabId: 7 });
   await harness.execute("getConsoleLogs", { tabId: 7 });
 
-  assert.equal(consoleEnableAttempts, 2);
+  assert.equal(runtimeEnableAttempts, 2);
 });
 
 test("a native disconnect while replying does not create an unhandled command rejection", async () => {

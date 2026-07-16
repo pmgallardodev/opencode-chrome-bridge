@@ -774,7 +774,9 @@ test("background implements getConsoleLogs with a per-tab buffer and persistent 
   assert.match(background, /consoleLogAttached/u, "missing consoleLogAttached set");
   assert.match(background, /CONSOLE_LOG_METHODS/u, "missing CONSOLE_LOG_METHODS constant");
   assert.match(background, /enableCdpDomains/u, "ensureConsoleLogDebugger must enable CDP domains");
-  assert.match(background, /"Console", "Log", "Runtime"/u, "ensureConsoleLogDebugger must enable Console, Log, and Runtime domains");
+  assert.match(background, /"Page", "Runtime"/u, "console capture must enable Page and Runtime for exact document provenance");
+  assert.match(background, /Runtime\.consoleAPICalled/u, "console capture must use identity-bearing Runtime events");
+  assert.match(background, /documentId[\s\S]{0,300}loaderId/u, "console provenance must bind document and loader identity");
   assert.match(background, /appendConsoleLog/u, "missing appendConsoleLog helper");
   assert.match(background, /normalizeConsoleLog/u, "missing normalizeConsoleLog helper");
 });

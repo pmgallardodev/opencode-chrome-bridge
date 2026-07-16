@@ -53,9 +53,7 @@ const BATCH_RETURNED_URL_ACTIONS = new Set([
   "activateTab", "back", "forward", "getTab", "navigate", "reload", "tabContext", "waitFor"
 ]);
 const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
-  "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOM.getDocument",
-  "DOM.getOuterHTML", "DOM.querySelector", "DOM.querySelectorAll", "Page.getLayoutMetrics",
-  "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
+  "Page.getLayoutMetrics", "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
 ]);
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({

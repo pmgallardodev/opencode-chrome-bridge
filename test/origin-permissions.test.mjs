@@ -214,6 +214,8 @@ test("raw CDP rejects browser-wide Target methods before dispatch", async () => 
 test("raw CDP allowlist rejects global storage, cookie, and browser domains", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   for (const method of [
+    "DOM.getDocument", "DOM.querySelector", "DOM.querySelectorAll", "DOM.getOuterHTML",
+    "DOM.describeNode", "DOM.getAttributes", "DOM.getBoxModel", "DOMSnapshot.captureSnapshot",
     "Storage.getCookies", "Storage.clearDataForOrigin", "Network.getAllCookies",
     "Network.setCookie", "Browser.getVersion", "Security.enable", "SystemInfo.getInfo",
     "Fetch.enable", "Fetch.disable"
