@@ -109,7 +109,7 @@ if (extensionId !== expectedExtensionId) {
   throw new Error(`Expected extension id ${expectedExtensionId}, got ${extensionId}`);
 }
 
-const opencodeConfig = parseJsonc(await readFile(opencodeConfigPath(), "utf8"));
+const opencodeConfig = parseJsonc(await readInstalledFile(opencodeConfigPath(), "OpenCode config", "npm run install:opencode"));
 if (!Array.isArray(opencodeConfig.plugin) || !opencodeConfig.plugin.includes(repoRoot)) {
   throw new Error(`OpenCode config must include plugin path ${repoRoot}`);
 }
@@ -128,7 +128,7 @@ if (requiresRegistry) {
   }
 }
 
-const nativeManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+const nativeManifest = JSON.parse(await readInstalledFile(manifestPath, "native messaging host manifest", "npm run install:native"));
 const expectedOrigin = `chrome-extension://${expectedExtensionId}/`;
 if (nativeManifest.name !== NATIVE_HOST_NAME) {
   throw new Error(`Native host manifest name must be ${NATIVE_HOST_NAME}`);
@@ -137,7 +137,7 @@ if (!samePath(nativeManifest.path, expectedLauncherPath)) {
   throw new Error("Native host manifest path does not point at the generated OpenCode launcher");
 }
 assertExactStringSet(nativeManifest.allowed_origins, [expectedOrigin], "native host allowed origins");
-const runtimeMetadata = JSON.parse(await readFile(runtimeMetadataPath, "utf8"));
+const runtimeMetadata = JSON.parse(await readInstalledFile(runtimeMetadataPath, "native host runtime metadata", "npm run install:native"));
 if (typeof runtimeMetadata.nodePath !== "string" || !path.isAbsolute(runtimeMetadata.nodePath)) {
   throw new Error("Native host runtime metadata must contain an absolute Node executable path");
 }
@@ -179,6 +179,17 @@ function extensionIdFromKey(keyBase64) {
 
 function opencodeConfigPath() {
   return path.join(os.homedir(), ".config", "opencode", "opencode.jsonc");
+}
+
+async function readInstalledFile(filePath, label, repairCommand) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`${label} was not found at ${filePath}. Run ${repairCommand} from this checkout, then retry npm run verify.`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 function samePath(left, right) {
