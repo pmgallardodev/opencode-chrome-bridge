@@ -28,6 +28,8 @@ test("WebMCP bridge calls forward cancellation and bounded timeout without bypas
   const source = await readFile(new URL("../src/opencode-plugin.js", import.meta.url), "utf8");
   assert.match(source, /webMcpList[\s\S]{0,400}signal:\s*context\.abort/u);
   assert.match(source, /webMcpInvoke[\s\S]{0,500}signal:\s*context\.abort[\s\S]{0,200}timeoutMs/u);
+  assert.match(source, /WEBMCP_TRANSPORT_TIMEOUT_MS\s*=\s*35_000/u);
+  assert.equal((source.match(/timeoutMs:\s*WEBMCP_TRANSPORT_TIMEOUT_MS/gu) ?? []).length, 2);
   assert.doesNotMatch(source, /chrome_webmcp_(?:list|invoke)[\s\S]{0,500}skipPermissions/gu);
 });
 
@@ -39,8 +41,9 @@ test("WebMCP dispatch is exact-document targeted and guarded by the scoped navig
 
 test("WebMCP uses only documented discovery and abortable invocation methods", async () => {
   const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
-  assert.match(source, /const getTools = context\.getTools/u);
-  assert.match(source, /reflectApply\(executeTool,[\s\S]{0,160}descriptor,[\s\S]{0,80}inputJson,[\s\S]{0,80}\{ signal:/u);
+  assert.match(source, /reflectApply\(officialGetTools, context/u);
+  assert.match(source, /reflectApply\(officialExecuteTool,[\s\S]{0,160}descriptor,[\s\S]{0,80}inputJson,[\s\S]{0,80}\{ signal/u);
+  assert.doesNotMatch(source, /const (?:getTools|executeTool) = context\.(?:getTools|executeTool)/u);
   assert.doesNotMatch(source, /\.listTools\(|\.invokeTool\(|\.callTool\(|context\.tools/u);
 });
 

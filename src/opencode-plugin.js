@@ -23,6 +23,7 @@ const PAGE_ORIGIN_PERMISSION = "browser.origin";
 const SCHEDULE_UNATTENDED_PERMISSION = "browser.schedule-unattended";
 const MAX_ORIGIN_GRANT_SESSIONS = 100;
 const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
+const WEBMCP_TRANSPORT_TIMEOUT_MS = 35_000;
 const pageOriginSessionGrants = new Map();
 
 const DESTINATION_SCOPED_TOOLS = new Set(["chrome_open", "chrome_open_window"]);
@@ -1206,7 +1207,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         async execute(args, context) {
           return JSON.stringify(await bridgeCommand("webMcpList", args, {
             signal: context.abort,
-            timeoutMs: Math.min(35_000, args.timeoutMs + 5_000)
+            timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS
           }), null, 2);
         }
       }),
@@ -1224,7 +1225,7 @@ export default async function OpenCodeChromeBridgePlugin() {
             tabId: args.tabId,
             timeoutMs: args.timeoutMs,
             toolName: args.toolName
-          }, { signal: context.abort, timeoutMs: Math.min(35_000, args.timeoutMs + 5_000) }), null, 2);
+          }, { signal: context.abort, timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS }), null, 2);
         }
       }),
       chrome_click_element: tool({

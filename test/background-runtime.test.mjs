@@ -4945,10 +4945,13 @@ test("scheduled execution fails closed and sanitizes bounded history and notific
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
 });
 
-function webMcpMainWorld({ cleanRealmAvailable = true, documentContext, navigatorContext, onRun, pageSetup } = {}) {
+function webMcpMainWorld({ bootstrapPoison = null, cleanRealmAvailable = true, documentContext, navigatorContext, onRun, pageSetup, trustPageSetupContext = false } = {}) {
   let framesCreated = 0;
   let framesRemoved = 0;
   const listeners = new WeakMap();
+  const officialContexts = new WeakMap();
+  const officialMethods = new WeakSet();
+  const frameStates = new WeakMap();
   class CleanEvent {
     constructor(type) { this.type = type; }
   }
@@ -4966,35 +4969,126 @@ function webMcpMainWorld({ cleanRealmAvailable = true, documentContext, navigato
       return true;
     }
   }
+  class CleanElement {
+    remove() {
+      const state = frameStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      if (!state.removed) { state.removed = true; framesRemoved += 1; }
+    }
+  }
+  class CleanModelContext {}
+  Object.defineProperties(CleanModelContext.prototype, {
+    getTools: { configurable: true, writable: true, value: function getTools() {
+      const implementation = officialContexts.get(this);
+      if (!implementation) throw new TypeError("Illegal invocation");
+      if (typeof implementation.getTools !== "function") {
+        const error = new Error("Discovery unsupported");
+        error.code = "WEBMCP_DISCOVERY_UNSUPPORTED";
+        throw error;
+      }
+      return implementation.getTools.call(this);
+    } },
+    executeTool: { configurable: true, writable: true, value: function executeTool(descriptor, inputJson, options) {
+      const implementation = officialContexts.get(this);
+      if (!implementation) throw new TypeError("Illegal invocation");
+      if (typeof implementation.executeTool !== "function") {
+        const error = new Error("Invocation unsupported");
+        error.code = "WEBMCP_INVOCATION_UNSUPPORTED";
+        throw error;
+      }
+      return implementation.executeTool.call(this, descriptor, inputJson, options);
+    } }
+  });
+  officialMethods.add(CleanModelContext.prototype.getTools);
+  officialMethods.add(CleanModelContext.prototype.executeTool);
   const cleanContext = vm.createContext({
+    __officialMethods: officialMethods,
     AbortController,
     clearTimeout,
+    document: {},
+    Element: CleanElement,
     Event: CleanEvent,
     EventTarget: CleanEventTarget,
     setTimeout
   });
+  vm.runInContext(`
+    const nativeToString = Function.prototype.toString;
+    Function.prototype.toString = function toString() {
+      if (__officialMethods.has(this)) {
+        return this.name === "getTools"
+          ? "function getTools() { [native code] }"
+          : "function executeTool() { [native code] }";
+      }
+      return Reflect.apply(nativeToString, this, []);
+    };
+  `, cleanContext);
   const cleanRealm = vm.runInContext("globalThis", cleanContext);
-  const documentMock = documentContext === undefined ? {} : { modelContext: documentContext };
-  documentMock.createElement = (tagName) => {
+  const makeOfficialContext = (implementation) => {
+    if (!implementation || typeof implementation !== "object") return implementation;
+    const context = Object.create(CleanModelContext.prototype);
+    officialContexts.set(context, implementation);
+    return context;
+  };
+  const officialDocumentContext = makeOfficialContext(documentContext);
+  const officialNavigatorContext = makeOfficialContext(navigatorContext);
+  class PageFrame extends CleanElement {}
+  Object.defineProperty(PageFrame.prototype, "contentWindow", {
+    configurable: true,
+    get() { return frameStates.get(this)?.contentWindow ?? null; }
+  });
+  class PageDocument {
+    createElement(tagName) {
     assert.equal(tagName, "iframe");
     framesCreated += 1;
-    let removed = false;
-    return {
-      contentWindow: cleanRealmAvailable ? cleanRealm : null,
-      hidden: false,
-      remove() { if (!removed) { removed = true; framesRemoved += 1; } },
-      setAttribute() {}
+    const frame = new PageFrame();
+    frame.hidden = false;
+    frame.setAttribute = () => {};
+    frameStates.set(frame, { contentWindow: cleanRealmAvailable ? cleanRealm : null, removed: false });
+    if (bootstrapPoison === "contentWindow") {
+      const value = frame.contentWindow;
+      Object.defineProperty(frame, "contentWindow", { configurable: true, get: () => value });
+    }
+    if (bootstrapPoison === "remove") {
+      const nativeRemove = frame.remove;
+      frame.remove = function replacedRemove() { return nativeRemove.call(this); };
+    }
+    return frame;
+    }
+  }
+  class PageNode {
+    appendChild(frame) { return frame; }
+  }
+  const documentMock = new PageDocument();
+  if (documentContext !== undefined) documentMock.modelContext = officialDocumentContext;
+  const nativeCreateElement = documentMock.createElement;
+  if (bootstrapPoison === "createElement") {
+    documentMock.createElement = function replacedCreateElement(...args) { return nativeCreateElement.apply(this, args); };
+  }
+  documentMock.documentElement = new PageNode();
+  const nativeAppendChild = documentMock.documentElement.appendChild;
+  if (["appendChild", "retain", "mutationObserver"].includes(bootstrapPoison)) {
+    documentMock.documentElement.appendChild = function replacedAppendChild(frame) {
+      if (bootstrapPoison === "retain") globalThis.__retainedWebMcpFrame = frame;
+      if (bootstrapPoison === "mutationObserver") {
+        Promise.resolve().then(() => {
+          globalThis.__retainedWebMcpFrame = frame;
+          frame.contentWindow.Object = { create() { throw new Error("retained frame tamper"); } };
+        });
+      }
+      return nativeAppendChild.call(this, frame);
     };
-  };
-  documentMock.documentElement = { appendChild(frame) { return frame; } };
+  }
   const page = vm.createContext({
     AbortController,
     clearTimeout,
     document: documentMock,
-    navigator: navigatorContext === undefined ? {} : { modelContext: navigatorContext },
+    navigator: navigatorContext === undefined ? {} : { modelContext: officialNavigatorContext },
     setTimeout
   });
   if (typeof pageSetup === "string") vm.runInContext(pageSetup, page);
+  if (trustPageSetupContext && page.document?.modelContext) {
+    page.document.modelContext = makeOfficialContext(page.document.modelContext);
+  }
   const execute = async (details) => {
     assert.equal(details.world, "MAIN");
     assert.equal(Array.isArray(details.files), false);
@@ -5003,6 +5097,9 @@ function webMcpMainWorld({ cleanRealmAvailable = true, documentContext, navigato
     return [{ result: await injected(...(details.args ?? [])) }];
   };
   execute.page = page;
+  execute.setOfficialDocumentContext = (context) => {
+    page.document.modelContext = makeOfficialContext(context);
+  };
   Object.defineProperties(execute, {
     framesCreated: { get: () => framesCreated },
     framesRemoved: { get: () => framesRemoved }
@@ -5382,7 +5479,7 @@ test("WebMCP output and metadata reject accessors and non-plain objects without 
 });
 
 test("WebMCP captures intrinsics before page callbacks monkeypatch globals", async () => {
-  const mainWorld = webMcpMainWorld({ pageSetup: `
+  const mainWorld = webMcpMainWorld({ trustPageSetupContext: true, pageSetup: `
     const pageSafeJsonParse = JSON.parse;
     document.modelContext = {
       async getTools() {
@@ -5418,7 +5515,7 @@ test("WebMCP discovery hard deadline returns structurally and releases the scope
   assert.notEqual(outcome, "still-pending");
   assert.equal(outcome.error?.code, "WEBMCP_DISCOVERY_TIMEOUT");
 
-  mainWorld.page.document.modelContext = { getTools: async () => [] };
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
   const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
   assert.equal(followup.supported, true);
 });
@@ -5439,7 +5536,7 @@ test("WebMCP noncooperative execution returns bounded incompatibility and releas
   assert.equal(outcome.ok, false);
   assert.equal(outcome.error.code, "WEBMCP_EXECUTION_UNSETTLED");
 
-  mainWorld.page.document.modelContext = { getTools: async () => [] };
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
   const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
   assert.equal(followup.supported, true);
 });
@@ -5457,7 +5554,7 @@ test("WebMCP enforces output limits by incremental UTF-8 bytes", async () => {
 });
 
 test("WebMCP abort channel is not exposed on globals and survives getTools tampering", async () => {
-  const mainWorld = webMcpMainWorld({ pageSetup: `
+  const mainWorld = webMcpMainWorld({ trustPageSetupContext: true, pageSetup: `
     globalThis.testExposedKeys = [];
     globalThis.testLateEffects = 0;
     document.modelContext = {
@@ -5519,6 +5616,94 @@ test("WebMCP fails unsupported before callbacks when a clean realm is unavailabl
   assert.equal(result.supported, false);
   assert.equal(result.error.code, "WEBMCP_UNSUPPORTED");
   assert.equal(callbacks, 0);
+});
+
+test("WebMCP discovery and execution share one end-to-end deadline", async () => {
+  const startedAt = Date.now();
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      return [{ name: "budget", description: "Budget" }];
+    },
+    executeTool: async (_descriptor, _inputJson, { signal }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ tooLate: true }), 35);
+      signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+    })
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "budget"
+  }));
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_TIMEOUT");
+  assert.ok(elapsed < 80, `one 50ms budget must not become sequential phase budgets (${elapsed}ms)`);
+});
+
+test("WebMCP rejects monkeypatched noncooperative methods before any delayed side effect", async () => {
+  const mainWorld = webMcpMainWorld({ pageSetup: `
+    globalThis.hostileCallbacks = 0;
+    globalThis.hostileEffects = 0;
+    document.modelContext = {
+      async getTools() {
+        globalThis.hostileCallbacks += 1;
+        return [{ name: "hostile", description: "Hostile" }];
+      },
+      async executeTool() {
+        globalThis.hostileCallbacks += 1;
+        return new Promise((resolve) => setTimeout(() => {
+          globalThis.hostileEffects += 1;
+          resolve({ late: true });
+        }, 80));
+      }
+    };
+  ` });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "hostile"
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_UNSUPPORTED");
+  assert.equal(mainWorld.page.hostileCallbacks, 0);
+  assert.equal(mainWorld.page.hostileEffects, 0);
+});
+
+test("WebMCP does not mistake Proxy or bound callables for native modelContext methods", async () => {
+  for (const wrapper of ["proxy", "bound"]) {
+    const mainWorld = webMcpMainWorld({ pageSetup: `
+      globalThis.spoofCallbacks = 0;
+      const implementation = function getTools() {
+        globalThis.spoofCallbacks += 1;
+        return [{ name: "spoof", description: "Spoof" }];
+      };
+      const callable = ${wrapper === "proxy" ? "new Proxy(implementation, {})" : "implementation.bind(null)"};
+      const prototype = Object.create(null);
+      Object.defineProperty(prototype, "getTools", { configurable: true, writable: true, value: callable });
+      document.modelContext = Object.create(prototype);
+    ` });
+    const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+    assert.equal(result.supported, false, wrapper);
+    assert.equal(result.error.code, "WEBMCP_UNSUPPORTED", wrapper);
+    assert.equal(mainWorld.page.spoofCallbacks, 0, wrapper);
+  }
+});
+
+test("WebMCP fails closed before callbacks when clean-realm DOM bootstrap hooks are replaced", async () => {
+  for (const bootstrapPoison of ["createElement", "appendChild", "contentWindow", "remove", "retain", "mutationObserver"]) {
+    let callbacks = 0;
+    const mainWorld = webMcpMainWorld({
+      bootstrapPoison,
+      documentContext: { getTools: async () => { callbacks += 1; return []; } }
+    });
+    const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+    assert.equal(result.supported, false, bootstrapPoison);
+    assert.equal(result.error.code, "WEBMCP_UNSUPPORTED", bootstrapPoison);
+    assert.equal(callbacks, 0, bootstrapPoison);
+    assert.equal(mainWorld.framesCreated, mainWorld.framesRemoved, bootstrapPoison);
+  }
 });
 
 function createBackgroundHarness({
