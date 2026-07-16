@@ -4535,7 +4535,9 @@ test("schedule recurrence uses local calendar boundaries without monthly, annual
   };
   const daily = { kind: "daily", hour: 2, minute: 30 };
   const dstRun = harness.nextScheduleRun(daily, new Date(2026, 2, 28, 3, 0).getTime());
-  assert.deepEqual(parts(dstRun), [2026, 3, 29, 3, 30]);
+  const localTwoThirty = new Date(2026, 2, 29, 2, 30);
+  const expectedDstHour = localTwoThirty.getHours();
+  assert.deepEqual(parts(dstRun), [2026, 3, 29, expectedDstHour, 30]);
   assert.deepEqual(parts(harness.nextScheduleRun(daily, dstRun)), [2026, 3, 30, 2, 30]);
 
   const monthly = { kind: "monthly", day: 31, hour: 10, minute: 0 };
