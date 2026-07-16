@@ -1314,8 +1314,13 @@ async function createSchedule(params) {
     const enabled = params.enabled !== false;
     const proposedApproval = validateScheduleApproval(params.approval);
     if (proposedApproval.scheduleId === null) throw new Error("Dedicated schedule approval must bind the new schedule id");
+    const collection = await loadScheduleMutationCollection();
+    const nextCreateGeneration = collection.createGeneration + 1;
+    if (proposedApproval.approvalGeneration !== nextCreateGeneration) {
+      throw new Error("Schedule creation approval was already consumed or is stale");
+    }
     const approval = await requireExactScheduleApproval(proposedApproval, {
-      approvalGeneration: 1, enabled, notify, recurrence, requiredOrigins,
+      approvalGeneration: nextCreateGeneration, enabled, notify, recurrence, requiredOrigins,
       scheduleId: proposedApproval.scheduleId, workflow
     });
     const now = new Date().toISOString();
@@ -1338,12 +1343,13 @@ async function createSchedule(params) {
       updatedAt: now
     });
     schedule.nextRunAt = nextScheduleRunAt(schedule.recurrence, Date.now());
-    const collection = await loadScheduleCollection();
     if (collection.schedules.length >= MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
     if (collection.schedules.some((entry) => entry.id === schedule.id)) {
       throw new Error("Schedule creation ids are single-use and must not replace an existing schedule");
     }
-    await transitionScheduleAlarm(collection, { operation: "upsert", scheduleId: schedule.id, nextSchedule: schedule });
+    await transitionScheduleAlarm({ ...collection, createGeneration: nextCreateGeneration }, {
+      operation: "upsert", scheduleId: schedule.id, nextSchedule: schedule
+    });
     return schedule;
   });
 }
@@ -1361,7 +1367,7 @@ async function scheduleHistory(params) {
 async function updateSchedule(params) {
   return queueScheduleMutation(async () => {
     assertScheduleFields(params, ["approval", "enabled", "id", "name", "notify", "recurrence", "requiredOrigins"], "schedule update");
-    const collection = await loadScheduleCollection();
+    const collection = await loadScheduleMutationCollection();
     const existing = resolveSchedule(collection, { id: params.id });
     const workflow = await scheduledWorkflowSnapshot(existing.workflowId);
     const requiredOrigins = params.requiredOrigins == null ? existing.requiredOrigins : normalizeScheduleOrigins(params.requiredOrigins);
@@ -1392,7 +1398,7 @@ async function updateSchedule(params) {
 
 async function deleteSchedule(params) {
   return queueScheduleMutation(async () => {
-    const collection = await loadScheduleCollection();
+    const collection = await loadScheduleMutationCollection();
     const schedule = resolveSchedule(collection, params);
     await transitionScheduleAlarm(collection, { operation: "delete", scheduleId: schedule.id, nextSchedule: null });
     return { deleted: true, id: schedule.id };
@@ -1412,7 +1418,7 @@ function runScheduleNow(params, options = {}) {
 function executeSchedule(id, { scheduledTime, signal, trigger }) {
   return queueScheduleMutation(async () => {
     throwIfAborted(signal);
-    const collection = await loadScheduleCollection();
+    const collection = await loadScheduleMutationCollection();
     const schedule = resolveSchedule(collection, { id });
     const occurrence = trigger === "alarm"
       ? (Number.isFinite(scheduledTime) ? Math.trunc(scheduledTime) : schedule.nextRunAt)
@@ -1545,7 +1551,7 @@ async function previewScheduleApproval(params) {
   if (!isRecord(params)) throw new Error("Schedule approval preview params must be an object");
   if (params.id != null) {
     assertScheduleFields(params, ["enabled", "id", "name", "notify", "recurrence", "requiredOrigins"], "schedule approval preview");
-    const existing = resolveSchedule(await loadScheduleCollection(), { id: params.id });
+    const existing = resolveSchedule(await loadScheduleMutationCollection(), { id: params.id });
     const workflow = await scheduledWorkflowSnapshot(existing.workflowId);
     const requiredOrigins = params.requiredOrigins == null ? existing.requiredOrigins : normalizeScheduleOrigins(params.requiredOrigins);
     assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
@@ -1560,11 +1566,12 @@ async function previewScheduleApproval(params) {
     });
   }
   assertScheduleFields(params, ["enabled", "name", "notify", "recurrence", "requiredOrigins", "workflowId"], "schedule approval preview");
+  const collection = await loadScheduleMutationCollection();
   const workflow = await scheduledWorkflowSnapshot(params.workflowId);
   const requiredOrigins = normalizeScheduleOrigins(params.requiredOrigins);
   assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
   return buildScheduleApproval({
-    approvalGeneration: 1,
+    approvalGeneration: collection.createGeneration + 1,
     enabled: params.enabled !== false,
     notify: validateScheduleNotify(params.notify ?? "none"),
     recurrence: validateScheduleRecurrence(params.recurrence),
@@ -1666,6 +1673,7 @@ function canonicalScheduleValue(value) {
 async function replaceSchedule(collection, schedule) {
   await saveScheduleCollection({
     alarmJournal: collection.alarmJournal,
+    createGeneration: collection.createGeneration,
     schemaVersion: SCHEDULE_SCHEMA_VERSION,
     schedules: collection.schedules.map((entry) => entry.id === schedule.id ? schedule : entry)
   });
@@ -1680,6 +1688,7 @@ async function transitionScheduleAlarm(collection, transition) {
   });
   const pending = {
     alarmJournal: [...collection.alarmJournal, journalEntry],
+    createGeneration: collection.createGeneration,
     schemaVersion: SCHEDULE_SCHEMA_VERSION,
     schedules: collection.schedules
   };
@@ -1692,6 +1701,7 @@ async function transitionScheduleAlarm(collection, transition) {
       : [...collection.schedules, journalEntry.nextSchedule];
   await saveScheduleCollection({
     alarmJournal: pending.alarmJournal.filter((entry) => entry.id !== journalEntry.id),
+    createGeneration: pending.createGeneration,
     schemaVersion: SCHEDULE_SCHEMA_VERSION,
     schedules
   });
@@ -1721,6 +1731,7 @@ async function restoreScheduleAlarms() {
             : [...collection.schedules, journalEntry.nextSchedule];
         collection = {
           alarmJournal: collection.alarmJournal.filter((entry) => entry.id !== journalEntry.id),
+          createGeneration: collection.createGeneration,
           schemaVersion: SCHEDULE_SCHEMA_VERSION,
           schedules
         };
@@ -1784,19 +1795,30 @@ async function loadScheduleCollection() {
   try { stored = await chrome.storage.local.get(SCHEDULE_STORAGE_KEY); }
   catch (error) { throw new Error(`Could not read schedule storage: ${error?.message ?? String(error)}`); }
   const raw = stored?.[SCHEDULE_STORAGE_KEY];
-  if (raw == null) return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: [], alarmJournal: [] };
+  if (raw == null) return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: [], alarmJournal: [], createGeneration: 0 };
   if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_SCHEDULE_STORAGE_BYTES) throw new Error("Schedule storage payload is too large");
   if (!isRecord(raw)
-    || Object.keys(raw).some((field) => !["alarmJournal", "schemaVersion", "schedules"].includes(field))
+    || JSON.stringify(Object.keys(raw).sort()) !== JSON.stringify(["alarmJournal", "createGeneration", "schedules", "schemaVersion"])
     || raw.schemaVersion !== SCHEDULE_SCHEMA_VERSION
     || !Array.isArray(raw.schedules)
     || raw.schedules.length > MAX_SCHEDULES
     || !Array.isArray(raw.alarmJournal)
-    || raw.alarmJournal.length > MAX_SCHEDULES) throw new Error("Persisted schedule collection schema is invalid");
+    || raw.alarmJournal.length > MAX_SCHEDULES
+    || !Number.isSafeInteger(raw.createGeneration)
+    || raw.createGeneration < 0
+    || raw.createGeneration >= 1_000_000) throw new Error("Persisted schedule collection schema is invalid");
   const schedules = raw.schedules.map(validateSchedule);
   const alarmJournal = raw.alarmJournal.map(validateScheduleAlarmJournalEntry);
   if (new Set(schedules.map((entry) => entry.id)).size !== schedules.length) throw new Error("Schedule ids must be unique");
-  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules, alarmJournal };
+  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules, alarmJournal, createGeneration: raw.createGeneration };
+}
+
+async function loadScheduleMutationCollection() {
+  const collection = await loadScheduleCollection();
+  if (collection.alarmJournal.length > 0) {
+    throw new Error("A pending schedule alarm transition must be reconciled before another mutation");
+  }
+  return collection;
 }
 
 async function saveScheduleCollection(collection) {
@@ -1805,9 +1827,13 @@ async function saveScheduleCollection(collection) {
   }
   const validated = {
     alarmJournal: (collection.alarmJournal ?? []).map(validateScheduleAlarmJournalEntry),
+    createGeneration: collection.createGeneration,
     schemaVersion: SCHEDULE_SCHEMA_VERSION,
     schedules: collection.schedules.map(validateSchedule)
   };
+  if (!Number.isSafeInteger(validated.createGeneration)
+    || validated.createGeneration < 0
+    || validated.createGeneration >= 1_000_000) throw new Error("Schedule create generation is invalid");
   if (validated.schedules.length > MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
   if (validated.alarmJournal.length > MAX_SCHEDULES) throw new Error("Schedule alarm journal is full");
   const serialized = JSON.stringify(validated);

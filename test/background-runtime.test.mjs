@@ -4630,12 +4630,18 @@ test("schedule creation approval is single-use and cannot overwrite history", as
   const alarmCreates = harness.calls.alarmsCreate.length;
   await assert.rejects(
     () => harness.execute("scheduleCreate", { ...draft, name: "Overwrite", approval }),
-    /single-use|must not replace/iu
+    /single-use|must not replace|already consumed|stale/iu
   );
   assert.equal(state.local.opencodeSchedules.schedules[0].id, schedule.id);
   assert.equal(state.local.opencodeSchedules.schedules[0].name, schedule.name);
   assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 1);
   assert.equal(harness.calls.alarmsCreate.length, alarmCreates);
+
+  await harness.execute("scheduleDelete", { id: schedule.id });
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /already consumed|stale/iu
+  );
 });
 
 test("approved schedule create and manual run-now completes successfully", async () => {
@@ -4742,10 +4748,19 @@ test("failed alarm creation leaves a durable create journal that restart commits
   await assert.rejects(() => harness.execute("scheduleCreate", { ...draft, approval }), /alarm create failed/u);
   assert.equal(state.local.opencodeSchedules.schedules.length, 0);
   assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /pending schedule alarm transition/iu
+  );
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
   failCreate = false;
   await harness.events.runtimeOnStartup.emit();
   assert.equal(state.local.opencodeSchedules.schedules.length, 1);
   assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /already consumed|stale/iu
+  );
 });
 
 test("failed alarm clear keeps the prior enabled schedule until restart commits disable", async () => {
@@ -4765,6 +4780,10 @@ test("failed alarm clear keeps the prior enabled schedule until restart commits 
   assert.equal(state.local.opencodeSchedules.schedules[0].enabled, true);
   assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
   failClear = false;
+  await assert.rejects(
+    () => harness.execute("scheduleUpdate", { ...update, approval }),
+    /pending schedule alarm transition/iu
+  );
   await harness.events.runtimeOnStartup.emit();
   assert.equal(state.local.opencodeSchedules.schedules[0].enabled, false);
   assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
