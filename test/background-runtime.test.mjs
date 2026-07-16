@@ -912,6 +912,49 @@ test("tab claims fail closed when session storage cannot be read", async () => {
   );
 });
 
+test("claimTab accepts a freshly created tab whose navigation has not committed yet", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: false, id: tabId, index: 0, pendingUrl: "http://127.0.0.1:8907/opencode-installed-smoke",
+      title: "", url: "", windowId: 1
+    })
+  });
+
+  const claimed = await harness.execute("claimTab", {
+    tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "agent"
+  });
+  assert.equal(claimed.tabId, 7);
+  assert.equal(claimed.claimed, true);
+});
+
+test("claimTab rejects a committed internal tab even while it navigates to a web URL", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: false, id: tabId, index: 0, pendingUrl: "https://example.com/",
+      title: "", url: "chrome://settings/", windowId: 1
+    })
+  });
+
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" }),
+    /cannot be claimed because its URL is unsupported or invalid/u
+  );
+});
+
+test("claimTab rejects an uncommitted tab whose pending navigation is internal", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({
+      active: false, id: tabId, index: 0, pendingUrl: "chrome://settings/",
+      title: "", url: "", windowId: 1
+    })
+  });
+
+  await assert.rejects(
+    harness.execute("claimTab", { tabId: 7, sessionId: "session-a", turnId: "turn-a", origin: "user" }),
+    /cannot be claimed because its URL is unsupported or invalid/u
+  );
+});
+
 test("tab claims fail closed when persisted lease data is malformed", async () => {
   const harness = createBackgroundHarness({
     storageGet: async () => ({
