@@ -77,3 +77,19 @@ test("release scanner accepts a safe tree and explicit fixture/documentation pla
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("release scanner fails closed on oversized tracked text files", async () => {
+  const trackedPath = "logs/oversized-audit.log";
+  const root = await fixture({
+    [trackedPath]: `github_token = "ghp_${"a".repeat(36)}"\n${"x".repeat((2 * 1024 * 1024) + 64)}`
+  });
+  try {
+    const issues = await scanTrackedFiles({ root, trackedPaths: [trackedPath] });
+    assert.ok(
+      issues.some((issue) => issue.path === trackedPath && issue.reason === "oversized tracked text file"),
+      "scanner must reject oversized tracked text instead of skipping it"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

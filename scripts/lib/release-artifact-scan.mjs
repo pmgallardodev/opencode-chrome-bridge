@@ -58,10 +58,16 @@ export function scanTrackedEntries(entries, { contentAllowlist = DEFAULT_SECRET_
     }
     const normalizedPath = normalizePath(trackedPath);
     if (pathReason || allowlisted.has(normalizedPath) || !isTextContent(entry?.content)) continue;
+    if (
+      (Buffer.isBuffer(entry.content) && entry.content.length > TEXT_BYTES_LIMIT)
+      || (typeof entry.content === "string" && Buffer.byteLength(entry.content) > TEXT_BYTES_LIMIT)
+    ) {
+      issues.push({ kind: "secret", path: trackedPath, reason: "oversized tracked text file" });
+      continue;
+    }
     const text = Buffer.isBuffer(entry.content)
-      ? entry.content.subarray(0, TEXT_BYTES_LIMIT + 1).toString("utf8")
+      ? entry.content.toString("utf8")
       : String(entry.content);
-    if (Buffer.byteLength(text) > TEXT_BYTES_LIMIT) continue;
     for (const reason of secretReasons(text)) issues.push({ kind: "secret", path: trackedPath, reason });
   }
   return issues;

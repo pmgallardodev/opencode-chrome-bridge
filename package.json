@@ -16,6 +16,7 @@
     "install:opencode": "node scripts/install-opencode-plugin.mjs",
     "setup:windows": "node scripts/setup-windows.mjs",
     "print:extension-id": "node scripts/print-extension-id.mjs",
+    "scan:release": "node scripts/scan-release.mjs",
     "test": "node --test",
     "verify": "node scripts/verify.mjs",
     "smoke:native": "node scripts/smoke-native-host.mjs",

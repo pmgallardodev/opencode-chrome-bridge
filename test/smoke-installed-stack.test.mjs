@@ -25,9 +25,11 @@ test("installed-stack smoke owns and cleans one dedicated workflow and schedule 
     throw new Error(`unexpected ${method}`);
   };
   const status = async () => ({
+    client: { version: "1.4.0" },
     compatible: true,
     connected: true,
     extension: { extensionVersion: "1.4.0" },
+    host: { version: "1.4.0" },
     ok: true
   });
   const server = {
@@ -53,9 +55,45 @@ test("installed-stack smoke rejects stale or incompatible extension before creat
   await assert.rejects(() => runInstalledStackSmoke({
     command: async () => { commands += 1; },
     createFixtureServer: async () => { throw new Error("fixture must not start"); },
-    status: async () => ({ compatible: true, connected: true, extension: { extensionVersion: "1.3.0" }, ok: true })
+    status: async () => ({
+      client: { version: "1.4.0" },
+      compatible: true,
+      connected: true,
+      extension: { extensionVersion: "1.3.0" },
+      host: { version: "1.4.0" },
+      ok: true
+    })
   }), /extension.*1\.4\.0/iu);
   assert.equal(commands, 0);
+});
+
+test("installed-stack smoke rejects stale native host or client versions before creating a tab", async () => {
+  for (const status of [
+    {
+      client: { version: "1.4.0" },
+      compatible: true,
+      connected: true,
+      extension: { extensionVersion: "1.4.0" },
+      host: { version: "1.3.0" },
+      ok: true
+    },
+    {
+      client: { version: "1.3.0" },
+      compatible: true,
+      connected: true,
+      extension: { extensionVersion: "1.4.0" },
+      host: { version: "1.4.0" },
+      ok: true
+    }
+  ]) {
+    let commands = 0;
+    await assert.rejects(() => runInstalledStackSmoke({
+      command: async () => { commands += 1; },
+      createFixtureServer: async () => { throw new Error("fixture must not start"); },
+      status: async () => status
+    }), /requires .*1\.4\.0/iu);
+    assert.equal(commands, 0);
+  }
 });
 
 test("installed-stack smoke safely finalizes its dedicated session after a partial failure", async () => {
@@ -73,7 +111,12 @@ test("installed-stack smoke safely finalizes its dedicated session after a parti
       close: async () => { methods.push("fixtureClose"); }
     }),
     status: async () => ({
-      compatible: true, connected: true, extension: { extensionVersion: "1.4.0" }, ok: true
+      client: { version: "1.4.0" },
+      compatible: true,
+      connected: true,
+      extension: { extensionVersion: "1.4.0" },
+      host: { version: "1.4.0" },
+      ok: true
     })
   }), /tab not found/iu);
   assert.deepEqual(methods, ["createTab", "getTab", "finalizeTabs", "fixtureClose"]);

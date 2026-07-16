@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import http from "node:http";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { bridgeCommand, bridgeStatus } from "../src/bridge-client.js";
 
-const EXPECTED_EXTENSION_VERSION = "1.4.0";
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const { version: EXPECTED_RELEASE_VERSION } = JSON.parse(
+  await readFile(path.join(repoRoot, "package.json"), "utf8")
+);
 const REQUIRED_CAPABILITIES = Object.freeze([
   "bridge.handshake",
   "browser.schedules",
@@ -163,8 +167,14 @@ export function assertInstalledStatus(status) {
   if (status?.ok !== true || status?.connected !== true || status?.compatible !== true) {
     throw new Error("Installed smoke requires a connected and compatible real bridge status");
   }
-  if (status.extension?.extensionVersion !== EXPECTED_EXTENSION_VERSION) {
-    throw new Error(`Installed smoke requires extension ${EXPECTED_EXTENSION_VERSION}; reload chrome://extensions before retrying`);
+  if (status.extension?.extensionVersion !== EXPECTED_RELEASE_VERSION) {
+    throw new Error(`Installed smoke requires extension ${EXPECTED_RELEASE_VERSION}; reload chrome://extensions before retrying`);
+  }
+  if (status.host?.version !== EXPECTED_RELEASE_VERSION) {
+    throw new Error(`Installed smoke requires native host ${EXPECTED_RELEASE_VERSION}; reinstall the current native host before retrying`);
+  }
+  if (status.client?.version !== EXPECTED_RELEASE_VERSION) {
+    throw new Error(`Installed smoke requires OpenCode client ${EXPECTED_RELEASE_VERSION}; restart OpenCode from this checkout before retrying`);
   }
 }
 
