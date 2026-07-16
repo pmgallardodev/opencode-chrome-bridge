@@ -1508,6 +1508,21 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   assert.equal(JSON.stringify(result.capabilities), JSON.stringify(ALL_TOOL_REQUIRED_CAPABILITIES));
 });
 
+test("popup status compares actual extension capabilities with host client requirements", () => {
+  const harness = createBackgroundHarness();
+  const status = harness.popupStatus({
+    name: "com.opencode.chrome_bridge",
+    version: "1.3.0",
+    protocolMin: "1.0.0",
+    protocolMax: "1.0.0",
+    requiredCapabilities: ["browser.tabs", "browser.future", "bridge.handshake"]
+  });
+  assert.equal(status.compatible, false);
+  assert.deepEqual(Array.from(status.missingCapabilities), ["browser.future"]);
+  assert.equal(status.diagnostics[0].code, "MISSING_CAPABILITIES");
+  assert.ok(Array.from(status.extension.capabilities).includes("browser.tabs"));
+});
+
 test("finalizeTabs releases the lease of an agent tab that already closed in a race", async () => {
   let tabGone = false;
   const harness = createBackgroundHarness({
@@ -3716,6 +3731,61 @@ test("page assets merge DOM and CDP inventories, dedupe URLs, and return bounded
   assert.ok(result.totalBytes <= 1000);
 });
 
+test("page assets redact signed URLs and skip cross-origin CDP content", async () => {
+  const contentRequests = [];
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async () => [{ result: { assets: [], sawOverflow: false } }],
+    debuggerSendCommand: async (_target, method, params) => {
+      if (method === "Page.getResourceTree") return { frameTree: {
+        frame: { id: "main", url: "https://example.com/" },
+        resources: [{
+          url: "https://user:password@example.com/app.js?X-Amz-Credential=AKIA-SECRET&X-Amz-Signature=raw-signature&token=raw-token#private",
+          type: "Script", mimeType: "text/javascript"
+        }],
+        childFrames: [{
+          frame: { id: "third-party", url: "https://cdn.example.net/frame" },
+          resources: [{ url: "https://cdn.example.net/third.js?api_key=third-secret", type: "Script", mimeType: "text/javascript" }]
+        }]
+      } };
+      if (method === "Page.getResourceContent") {
+        contentRequests.push(params.url);
+        return { content: "console.log('safe')", base64Encoded: false };
+      }
+      return {};
+    }
+  });
+  const result = await harness.execute("pageAssets", { tabId: 7, includeContent: true, maxTotalBytes: 1000 });
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /user|password|AKIA-SECRET|raw-signature|raw-token|third-secret|#private/u);
+  assert.match(result.assets[0].url, /X-Amz-Credential=%5BREDACTED%5D/iu);
+  assert.match(result.assets[1].error, /cross-origin.*not fetched/iu);
+  assert.equal(contentRequests.length, 1);
+  assert.match(contentRequests[0], /^https:\/\/user:password@example\.com/u);
+});
+
+test("page asset inventory reports overflow only after the exact 2000-entry boundary", async () => {
+  const makeAssets = (count) => Array.from({ length: Math.min(count, 2000) }, (_, index) => ({
+    url: `https://example.com/${index}.js`, kind: "script", mimeType: "text/javascript"
+  }));
+  for (const [count, expectedTruncated] of [[2000, false], [2001, true]]) {
+    const harness = createBackgroundHarness({
+      scriptingExecuteScript: async () => [{ result: { assets: makeAssets(count), sawOverflow: count > 2000 } }],
+      debuggerSendCommand: async (_target, method) => method === "Page.getResourceTree"
+        ? { frameTree: { frame: { id: "main", url: "https://example.com/" }, resources: [] } }
+        : {}
+    });
+    const result = await harness.execute("pageAssets", { tabId: 7 });
+    assert.equal(result.count, 2000);
+    assert.equal(result.truncated, expectedTruncated);
+  }
+});
+
+test("page asset collectors use bounded iterative traversal without combined-array accumulation", () => {
+  assert.match(backgroundSource, /function flattenCdpResourceTree[\s\S]*while\s*\(/u);
+  assert.doesNotMatch(backgroundSource, /\[\.\.\.domAssets,\s*\.\.\.cdpAssets\]/u);
+  assert.match(backgroundSource, /MAX_PAGE_ASSET_SCAN_NODES/u);
+});
+
 test("notifications enforce title and message bounds and use packaged branded icons", async () => {
   const harness = createBackgroundHarness();
   const result = await harness.execute("notify", { title: "Build complete", message: "Ready for review" });
@@ -3944,6 +4014,10 @@ function createBackgroundHarness({
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       return response?.connected === true;
+    },
+    popupStatus(host) {
+      context.__testPopupHost = host;
+      return vm.runInContext("popupStatusFromPong(__testPopupHost)", context);
     },
     execute(method, params, options = {}) {
       context.__testMethod = method;

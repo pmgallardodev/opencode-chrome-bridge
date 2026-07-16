@@ -21,11 +21,25 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png"]);
 const ARTIFACT_IDENTITY = Symbol("workspaceArtifactIdentity");
 const MAX_PAGE_ASSET_BYTES = 10 * 1024 * 1024;
 const MAX_PAGE_ASSETS = 2_000;
+const SENSITIVE_PAGE_ASSET_QUERY_KEYS = new Set([
+  "access", "accesstoken", "apikey", "assertion", "auth", "authorization", "authorizationcode",
+  "authtoken", "bearer", "clientsecret", "code", "cookie", "credential", "credentials", "idtoken",
+  "jwt", "key", "nonce", "oauth", "oauthtoken", "pass", "passwd", "password", "refresh",
+  "refreshtoken", "relaystate", "samlrequest", "samlresponse", "secret", "session", "sig",
+  "signature", "ticket", "token"
+]);
+const SENSITIVE_PAGE_ASSET_QUERY_FRAGMENTS = Object.freeze([
+  "access", "assertion", "auth", "bearer", "code", "cookie", "credential", "idtoken", "jwt",
+  "key", "nonce", "oauth", "pass", "refresh", "relaystate", "samlrequest", "samlresponse",
+  "secret", "securitytoken", "session", "sig", "ticket", "token"
+]);
 
 export async function materializePageAssetBundle({
   assets,
+  inventoryTruncated = false,
   outputDirectory,
   projectDirectory,
+  renameBundle = rename,
   totalByteLimit = MAX_PAGE_ASSET_BYTES
 }) {
   if (!Array.isArray(assets) || assets.length > MAX_PAGE_ASSETS) {
@@ -51,6 +65,8 @@ export async function materializePageAssetBundle({
   const stagingPath = path.join(directory.projectRoot, `.opencode-page-assets-${suffix}.tmp`);
   const finalPath = path.join(directory.resolvedDirectory, `page-assets-${suffix}`);
   await mkdir(stagingPath, { mode: 0o700 });
+  let published = false;
+  let stagingIdentity = null;
   try {
     const manifestAssets = [];
     for (const asset of decoded) {
@@ -78,29 +94,65 @@ export async function materializePageAssetBundle({
       schemaVersion: 1,
       createdAt: new Date().toISOString(),
       totalBytes,
-      truncated: manifestAssets.some((asset) => asset.truncated === true),
+      inventoryTruncated: inventoryTruncated === true,
+      truncated: inventoryTruncated === true || manifestAssets.some((asset) => asset.truncated === true),
       assets: manifestAssets
     };
     await writeFile(path.join(stagingPath, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
       flag: "wx",
       mode: 0o600
     });
-    await assertWorkspaceDirectoryIdentity(directory);
-    await rename(stagingPath, finalPath);
-    await assertWorkspaceDirectoryIdentity(directory);
-    const finalRealPath = await realpath(finalPath);
-    assertPathWithin(directory.projectRoot, finalRealPath);
-    if (!samePath(path.dirname(finalRealPath), directory.resolvedDirectory)) {
-      throw new Error("page asset bundle escaped its verified output directory");
+    const stagingInfo = await lstat(stagingPath);
+    if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) {
+      throw new Error("page asset staging bundle identity is invalid");
     }
+    stagingIdentity = identityOf(stagingInfo);
+    await assertWorkspaceDirectoryIdentity(directory);
+    await renameBundle(stagingPath, finalPath);
+    published = true;
+    await validatePublishedBundle(finalPath, stagingIdentity, directory);
     return {
       ...manifest,
       path: finalPath,
       relativePath: path.relative(directory.projectRoot, finalPath)
     };
   } catch (error) {
-    await rm(stagingPath, { recursive: true, force: true }).catch(() => {});
+    if (published && stagingIdentity) {
+      await removeBundleIfIdentityMatches(finalPath, stagingIdentity).catch(() => {});
+    } else {
+      await rm(stagingPath, { recursive: true, force: true }).catch(() => {});
+    }
     throw error;
+  }
+}
+
+async function validatePublishedBundle(finalPath, stagingIdentity, directory) {
+  const publishedInfo = await lstat(finalPath);
+  if (!publishedInfo.isDirectory() || publishedInfo.isSymbolicLink()
+    || identityOf(publishedInfo) !== stagingIdentity) {
+    throw new Error("published page asset bundle identity does not match staging");
+  }
+  await assertWorkspaceDirectoryIdentity(directory);
+  const finalRealPath = await realpath(finalPath);
+  assertPathWithin(directory.projectRoot, finalRealPath);
+  if (!samePath(path.dirname(finalRealPath), directory.resolvedDirectory)) {
+    throw new Error("page asset bundle escaped its verified output directory");
+  }
+  await assertWorkspaceDirectoryIdentity(directory);
+  const finalInfo = await lstat(finalPath);
+  if (!finalInfo.isDirectory() || finalInfo.isSymbolicLink()
+    || identityOf(finalInfo) !== stagingIdentity) {
+    throw new Error("published page asset bundle changed during verification");
+  }
+}
+
+async function removeBundleIfIdentityMatches(candidatePath, expectedIdentity) {
+  try {
+    const info = await lstat(candidatePath);
+    if (!info.isDirectory() || info.isSymbolicLink() || identityOf(info) !== expectedIdentity) return;
+    await rm(candidatePath, { recursive: true, force: false });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -109,6 +161,9 @@ function normalizePageAsset(value, index) {
     throw new Error(`page asset ${index} must be an object`);
   }
   let parsed;
+  if (typeof value.url !== "string" || value.url.length > 8192) {
+    throw new Error(`page asset ${index} has an invalid URL`);
+  }
   try { parsed = new URL(value.url); } catch { throw new Error(`page asset ${index} has an invalid URL`); }
   if (!["http:", "https:", "data:", "blob:"].includes(parsed.protocol)) {
     throw new Error(`page asset ${index} has an unsupported URL scheme`);
@@ -130,7 +185,7 @@ function normalizePageAsset(value, index) {
     }
   }
   return {
-    url: parsed.href,
+    url: redactPageAssetUrl(parsed),
     kind: typeof value.kind === "string" ? value.kind.slice(0, 50) : "other",
     mimeType,
     base64Encoded: value.base64Encoded === true,
@@ -138,6 +193,21 @@ function normalizePageAsset(value, index) {
     error: typeof value.error === "string" ? value.error.slice(0, 500) : null,
     truncated: value.truncated === true
   };
+}
+
+function redactPageAssetUrl(parsed) {
+  if (!["http:", "https:"].includes(parsed.protocol)) return `${parsed.protocol}[REDACTED]`;
+  parsed.username = "";
+  parsed.password = "";
+  parsed.hash = "";
+  for (const key of [...parsed.searchParams.keys()]) {
+    const normalized = key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/gu, "");
+    if (normalized.length > 0 && (SENSITIVE_PAGE_ASSET_QUERY_KEYS.has(normalized)
+      || SENSITIVE_PAGE_ASSET_QUERY_FRAGMENTS.some((fragment) => normalized.includes(fragment)))) {
+      parsed.searchParams.set(key, "[REDACTED]");
+    }
+  }
+  return parsed.href;
 }
 
 function pageAssetFilename(asset, index) {

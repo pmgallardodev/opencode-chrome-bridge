@@ -25,6 +25,10 @@ All notable changes to this project are documented in this file.
 
 - Asset content is capped at 10 MiB decoded, validates binary base64, uses
   collision-safe filenames, and rejects realpath/symlink escapes before atomic publish.
+- Asset URLs redact credentials and signed query values; cross-origin resource content
+  is inventory-only and is never fetched or bundled in this release.
+- Popup health checks compare the full manifest permission/origin grant and the current
+  extension capabilities instead of treating one permission as representative.
 - Browser origin authorization is recomputed after navigation and redirect; stale page
   provenance, partial uploads, and recovery failures all fail closed.
 

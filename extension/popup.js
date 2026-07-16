@@ -42,7 +42,8 @@ async function refresh(attempt = 1) {
 
     const response = await chrome.runtime.sendMessage({ type: "GET_BRIDGE_STATUS" });
     const connected = response?.connected === true;
-    const permissionsEnabled = await requiredPermissionsEnabled();
+    const permissionStatus = await requiredPermissionsStatus();
+    const permissionsEnabled = permissionStatus.enabled;
     const compatible = connected && response?.compatible === true && permissionsEnabled;
     const diagnosticCode = permissionsEnabled
       ? response?.diagnostics?.[0]?.code
@@ -55,9 +56,9 @@ async function refresh(attempt = 1) {
         ? "Ready for OpenCode browser tools"
         : permissionsEnabled
           ? diagnostic ?? (connected ? "Update the extension and native host together" : "Reload the extension or reinstall the native host")
-          : "Chrome reports required extension permissions as disabled"
+          : formatPermissionDiagnostic(permissionStatus)
     );
-    setRepair(diagnosticCode ?? (connected ? "PROTOCOL_INCOMPATIBLE" : "EXTENSION_DISCONNECTED"));
+    setRepair(compatible ? null : diagnosticCode ?? (connected ? "PROTOCOL_INCOMPATIBLE" : "EXTENSION_DISCONNECTED"));
     // The native host announces itself shortly after the service worker
     // connects; re-check briefly before settling on a disconnected verdict.
     if (!connected && attempt < MAX_REFRESH_ATTEMPTS) {
@@ -69,13 +70,46 @@ async function refresh(attempt = 1) {
   }
 }
 
-async function requiredPermissionsEnabled() {
-  if (!globalThis.chrome?.permissions?.contains) return true;
-  try {
-    return await chrome.permissions.contains({ permissions: ["notifications"] });
-  } catch {
-    return false;
+async function requiredPermissionsStatus() {
+  if (!globalThis.chrome?.permissions?.contains || !globalThis.chrome?.permissions?.getAll) {
+    return { enabled: true, missingOrigins: [], missingPermissions: [] };
   }
+  try {
+    const manifest = chrome.runtime.getManifest();
+    const requiredPermissions = [...new Set(Array.isArray(manifest.permissions) ? manifest.permissions : [])].sort();
+    const requiredOrigins = [...new Set(Array.isArray(manifest.host_permissions) ? manifest.host_permissions : [])].sort();
+    const granted = await chrome.permissions.getAll();
+    const grantedPermissions = new Set(Array.isArray(granted?.permissions) ? granted.permissions : []);
+    const grantedOrigins = new Set(Array.isArray(granted?.origins) ? granted.origins : []);
+    const missingPermissions = requiredPermissions.filter((entry) => !grantedPermissions.has(entry));
+    const missingOrigins = requiredOrigins.filter((entry) => !grantedOrigins.has(entry));
+    const containsAll = await chrome.permissions.contains({
+      permissions: requiredPermissions,
+      origins: requiredOrigins
+    });
+    return {
+      enabled: containsAll === true && missingPermissions.length === 0 && missingOrigins.length === 0,
+      missingOrigins,
+      missingPermissions
+    };
+  } catch {
+    return {
+      enabled: false,
+      missingOrigins: [],
+      missingPermissions: ["permission inspection unavailable"]
+    };
+  }
+}
+
+function formatPermissionDiagnostic(status) {
+  const parts = [];
+  if (status.missingPermissions.length > 0) {
+    parts.push(`Missing Chrome permissions: ${status.missingPermissions.join(", ")}.`);
+  }
+  if (status.missingOrigins.length > 0) {
+    parts.push(`Missing host origins: ${status.missingOrigins.join(", ")}.`);
+  }
+  return parts.join(" ") || "Chrome reports required extension grants as disabled.";
 }
 
 function formatDiagnostic(diagnostics) {

@@ -74,6 +74,8 @@ const MAX_UPLOAD_CHUNKS = 256;
 const MAX_UPLOAD_NAME_CHARS = 255;
 const MAX_UPLOAD_MIME_CHARS = 255;
 const MAX_PAGE_ASSETS = 2_000;
+const MAX_PAGE_ASSET_SCAN_NODES = 20_000;
+const MAX_PAGE_ASSET_FRAMES = 2_000;
 const MAX_PAGE_ASSET_TOTAL_BYTES = 10 * 1024 * 1024;
 const MAX_NOTIFICATION_TITLE_CHARS = 120;
 const MAX_NOTIFICATION_MESSAGE_CHARS = 1_000;
@@ -291,10 +293,12 @@ function disconnectedPopupStatus() {
 
 function popupStatusFromPong(host) {
   if (host === null) return disconnectedPopupStatus();
+  const requiredCapabilities = normalizePopupCapabilities(host?.requiredCapabilities);
   const validHost = isVersionString(host.version)
     && isVersionString(host.protocolMin)
     && isVersionString(host.protocolMax)
-    && host.name === HOST_NAME;
+    && host.name === HOST_NAME
+    && requiredCapabilities !== null;
   if (!validHost) {
     return {
       ...disconnectedPopupStatus(),
@@ -308,23 +312,47 @@ function popupStatusFromPong(host) {
   }
   const protocolCompatible = compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMin) >= 0
     && compareVersions(BRIDGE_PROTOCOL_VERSION, host.protocolMax) <= 0;
-  return {
-    compatible: protocolCompatible,
-    connected: true,
-    diagnostics: protocolCompatible ? [] : [{
+  const extension = createExtensionHandshake();
+  const missingCapabilities = requiredCapabilities
+    .filter((capability) => !extension.capabilities.includes(capability))
+    .sort();
+  const diagnostics = [];
+  if (missingCapabilities.length > 0) {
+    diagnostics.push({
+      code: "MISSING_CAPABILITIES",
+      message: `The extension is missing required capabilities: ${missingCapabilities.join(", ")}.`,
+      repair: "Update and reload the extension."
+    });
+  }
+  if (!protocolCompatible) {
+    diagnostics.push({
       code: "PROTOCOL_INCOMPATIBLE",
       message: `Extension protocol ${BRIDGE_PROTOCOL_VERSION} is outside the host range ${host.protocolMin}-${host.protocolMax}.`,
       repair: "Update the extension and native host together."
-    }],
-    extension: createExtensionHandshake(),
+    });
+  }
+  return {
+    compatible: protocolCompatible && missingCapabilities.length === 0,
+    connected: true,
+    diagnostics,
+    extension,
     host: {
       name: host.name,
       protocolMax: host.protocolMax,
       protocolMin: host.protocolMin,
+      requiredCapabilities,
       version: host.version
     },
-    missingCapabilities: []
+    missingCapabilities
   };
+}
+
+function normalizePopupCapabilities(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 200
+    || value.some((entry) => typeof entry !== "string" || !/^[a-z][a-z0-9.-]{0,99}$/u.test(entry))) {
+    return null;
+  }
+  return [...new Set(value)].sort();
 }
 
 function isVersionString(value) {
@@ -2934,7 +2962,11 @@ async function getPageAssets(params, signal, pageGuard) {
     throw new Error(`pageAssets maxTotalBytes must be between 1 and ${MAX_PAGE_ASSET_TOTAL_BYTES}`);
   }
   throwIfAborted(signal);
-  await pageGuard?.();
+  const currentBinding = pageGuard
+    ? await pageGuard()
+    : await currentPageBinding(tabId, (await chrome.tabs.get(tabId)).url);
+  const topLevelOrigin = pageAssetOrigin(currentBinding?.pageScope);
+  if (!topLevelOrigin) throw new Error("pageAssets requires an HTTP or HTTPS top-level page");
   const domResults = await chrome.scripting.executeScript({
     target: { tabId },
     world: "ISOLATED",
@@ -2942,7 +2974,11 @@ async function getPageAssets(params, signal, pageGuard) {
   });
   throwIfAborted(signal);
   await pageGuard?.();
-  const domAssets = Array.isArray(domResults?.[0]?.result) ? domResults[0].result : [];
+  const domPayload = domResults?.[0]?.result;
+  const domAssets = Array.isArray(domPayload)
+    ? domPayload
+    : Array.isArray(domPayload?.assets) ? domPayload.assets : [];
+  let sawOverflow = domPayload?.sawOverflow === true;
 
   const cdpAssets = await withPersistentDebuggerMutation(tabId, async (target, scoped) => {
     let attachedHere = false;
@@ -2961,19 +2997,27 @@ async function getPageAssets(params, signal, pageGuard) {
   });
   await pageGuard?.();
 
+  sawOverflow ||= cdpAssets.sawOverflow === true;
   const assetsByUrl = new Map();
-  for (const candidate of [...domAssets, ...cdpAssets]) {
-    const asset = normalizePageAssetInventoryEntry(candidate);
-    if (!asset) continue;
-    const existing = assetsByUrl.get(asset.url);
-    if (existing) {
-      if (typeof asset.frameId === "string") existing.frameId = asset.frameId;
-      if (!existing.mimeType && asset.mimeType) existing.mimeType = asset.mimeType;
-      continue;
+  const addCandidates = (candidates) => {
+    for (const candidate of candidates) {
+      const asset = normalizePageAssetInventoryEntry(candidate);
+      if (!asset) continue;
+      const existing = assetsByUrl.get(asset.rawUrl);
+      if (existing) {
+        if (typeof asset.frameId === "string") existing.frameId = asset.frameId;
+        if (!existing.mimeType && asset.mimeType) existing.mimeType = asset.mimeType;
+        continue;
+      }
+      if (assetsByUrl.size >= MAX_PAGE_ASSETS) {
+        sawOverflow = true;
+        break;
+      }
+      assetsByUrl.set(asset.rawUrl, asset);
     }
-    if (assetsByUrl.size >= MAX_PAGE_ASSETS) continue;
-    assetsByUrl.set(asset.url, asset);
-  }
+  };
+  addCandidates(domAssets);
+  if (!sawOverflow || assetsByUrl.size < MAX_PAGE_ASSETS) addCandidates(cdpAssets.assets);
   const assets = [...assetsByUrl.values()];
   let totalBytes = 0;
   if (includeContent) {
@@ -2991,10 +3035,14 @@ async function getPageAssets(params, signal, pageGuard) {
             asset.error = "Content is unavailable through CDP";
             continue;
           }
+          if (pageAssetOrigin(asset.rawUrl) !== topLevelOrigin) {
+            asset.error = "Cross-origin content is not fetched";
+            continue;
+          }
           try {
             const response = await chrome.debugger.sendCommand(target, "Page.getResourceContent", {
               frameId: asset.frameId,
-              url: asset.url
+              url: asset.rawUrl
             });
             if (typeof response?.content !== "string") throw new Error("CDP returned invalid resource content");
             const bytes = response.base64Encoded === true
@@ -3017,48 +3065,98 @@ async function getPageAssets(params, signal, pageGuard) {
       }
     });
   }
-  for (const asset of assets) delete asset.frameId;
+  for (const asset of assets) {
+    delete asset.frameId;
+    delete asset.rawUrl;
+  }
   return {
     assets,
     count: assets.length,
     includeContent,
     maxTotalBytes,
     totalBytes,
-    truncated: assetsByUrl.size >= MAX_PAGE_ASSETS || assets.some((asset) => asset.truncated === true)
+    truncated: sawOverflow || assets.some((asset) => asset.truncated === true)
   };
 }
 
 function collectDomPageAssets() {
+  const MAX_ASSETS = 2_000;
+  const MAX_SCAN_NODES = 20_000;
   const found = [];
+  const seen = new Set();
+  let sawOverflow = false;
   const add = (url, kind, mimeType = "") => {
     if (typeof url !== "string" || url.length === 0) return;
-    try { found.push({ url: new URL(url, document.baseURI).href, kind, mimeType }); } catch {}
+    try {
+      const normalized = new URL(url, document.baseURI).href;
+      if (seen.has(normalized)) return;
+      if (found.length >= MAX_ASSETS) {
+        sawOverflow = true;
+        return;
+      }
+      seen.add(normalized);
+      found.push({ url: normalized, kind, mimeType });
+    } catch {}
   };
-  for (const node of document.querySelectorAll("script[src],link[href],img[src],source[src],video[src],audio[src],iframe[src],object[data]")) {
+  const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
+  let node = walker.currentNode;
+  let scanned = 0;
+  while (node && scanned < MAX_SCAN_NODES && !sawOverflow) {
+    scanned += 1;
     const tag = node.tagName.toLowerCase();
-    const url = node.src || node.href || node.data;
-    const kind = tag === "link" ? (node.rel || "link") : tag;
-    add(url, kind, node.type || "");
+    if (["script", "link", "img", "source", "video", "audio", "iframe", "object"].includes(tag)) {
+      const url = node.src || node.href || node.data;
+      const kind = tag === "link" ? (node.rel || "link") : tag;
+      add(url, kind, node.type || "");
+    }
+    node = walker.nextNode();
   }
-  for (const entry of performance.getEntriesByType("resource")) add(entry.name, entry.initiatorType || "resource");
-  return found.slice(0, 2000);
+  if (node) sawOverflow = true;
+  if (!sawOverflow) {
+    const performanceEntries = performance.getEntriesByType("resource");
+    for (let index = 0; index < performanceEntries.length && !sawOverflow; index += 1) {
+      const entry = performanceEntries[index];
+      add(entry.name, entry.initiatorType || "resource");
+    }
+  }
+  return { assets: found, sawOverflow };
 }
 
-function flattenCdpResourceTree(frameTree, output = []) {
-  if (!frameTree || typeof frameTree !== "object") return output;
-  const frameId = typeof frameTree.frame?.id === "string" ? frameTree.frame.id : null;
-  for (const resource of Array.isArray(frameTree.resources) ? frameTree.resources : []) {
-    output.push({
-      url: resource?.url,
-      kind: resource?.type,
-      mimeType: resource?.mimeType,
-      frameId
-    });
+function flattenCdpResourceTree(frameTree) {
+  const assets = [];
+  const seen = new Set();
+  const pending = frameTree && typeof frameTree === "object" ? [frameTree] : [];
+  let scannedFrames = 0;
+  let sawOverflow = false;
+  while (pending.length > 0 && !sawOverflow) {
+    if (scannedFrames >= MAX_PAGE_ASSET_FRAMES) {
+      sawOverflow = true;
+      break;
+    }
+    const current = pending.pop();
+    scannedFrames += 1;
+    const frameId = typeof current.frame?.id === "string" ? current.frame.id : null;
+    const resources = Array.isArray(current.resources) ? current.resources : [];
+    for (let index = 0; index < resources.length; index += 1) {
+      const resource = resources[index];
+      if (typeof resource?.url !== "string" || seen.has(resource.url)) continue;
+      if (assets.length >= MAX_PAGE_ASSETS) {
+        sawOverflow = true;
+        break;
+      }
+      seen.add(resource.url);
+      assets.push({ url: resource.url, kind: resource.type, mimeType: resource.mimeType, frameId });
+    }
+    const children = Array.isArray(current.childFrames) ? current.childFrames : [];
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      if (pending.length + scannedFrames >= MAX_PAGE_ASSET_FRAMES) {
+        sawOverflow = true;
+        break;
+      }
+      pending.push(children[index]);
+    }
   }
-  for (const child of Array.isArray(frameTree.childFrames) ? frameTree.childFrames : []) {
-    flattenCdpResourceTree(child, output);
-  }
-  return output;
+  return { assets, sawOverflow };
 }
 
 function normalizePageAssetInventoryEntry(value) {
@@ -3067,12 +3165,22 @@ function normalizePageAssetInventoryEntry(value) {
   try { parsed = new URL(value.url); } catch { return null; }
   if (!["http:", "https:", "data:", "blob:"].includes(parsed.protocol)) return null;
   return {
-    url: parsed.href,
+    rawUrl: parsed.href,
+    url: redactNetworkUrl(parsed.href),
     kind: typeof value.kind === "string" ? truncateString(value.kind, 50) : "other",
     mimeType: typeof value.mimeType === "string" ? truncateString(value.mimeType, 255) : "",
     frameId: typeof value.frameId === "string" ? value.frameId : undefined,
     truncated: false
   };
+}
+
+function pageAssetOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin : null;
+  } catch {
+    return null;
+  }
 }
 
 function pageAssetDecodedBase64Bytes(value) {

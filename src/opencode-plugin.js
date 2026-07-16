@@ -1026,6 +1026,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           if (typeof args.outputDirectory !== "string") return JSON.stringify(inventory, null, 2);
           const bundle = await materializePageAssetBundle({
             assets: inventory.assets,
+            inventoryTruncated: inventory.truncated === true,
             outputDirectory: args.outputDirectory,
             projectDirectory: context.directory,
             totalByteLimit: args.maxTotalBytes ?? 5 * 1024 * 1024

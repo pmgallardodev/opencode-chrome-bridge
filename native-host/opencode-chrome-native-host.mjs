@@ -22,6 +22,31 @@ const DEFAULT_CLIENT_NAME = "opencode-plugin";
 const STATUS_HANDSHAKE_TIMEOUT_MS = 1000;
 const VERSION_RE = /^\d+\.\d+\.\d+$/u;
 const CAPABILITY_RE = /^[a-z][a-z0-9.-]{0,99}$/u;
+const HOST_REQUIRED_EXTENSION_CAPABILITIES = Object.freeze([
+  "bridge.handshake",
+  "browser.accessibility",
+  "browser.assets",
+  "browser.batch",
+  "browser.bookmarks",
+  "browser.cdp",
+  "browser.console",
+  "browser.downloads",
+  "browser.events",
+  "browser.file-upload",
+  "browser.find",
+  "browser.history",
+  "browser.navigation",
+  "browser.network",
+  "browser.notifications",
+  "browser.page-context",
+  "browser.screenshots",
+  "browser.tab-groups",
+  "browser.tabs",
+  "browser.wait",
+  "browser.windows",
+  "session.resume",
+  "session.tab-leases"
+]);
 
 const pending = new Map();
 const eventSubscribers = new Set();
@@ -109,7 +134,7 @@ function handleNativeMessage(payload) {
     // Liveness probe from the extension: reply so the popup can distinguish a
     // healthy host from a present-but-wedged one.
     const id = typeof message.id === "string" ? message.id : null;
-    writeNativeMessage({ type: "pong", id, host: hostHandshake() }).catch((error) => {
+    writeNativeMessage({ type: "pong", id, host: popupHostHandshake(message.handshake) }).catch((error) => {
       log(`could not answer ping: ${error?.message ?? error}`);
     });
     return;
@@ -243,7 +268,17 @@ function hostHandshake() {
     name: HOST_NAME,
     protocolMax: HOST_PROTOCOL_MAX,
     protocolMin: HOST_PROTOCOL_MIN,
+    requiredCapabilities: [...HOST_REQUIRED_EXTENSION_CAPABILITIES],
     version: HOST_VERSION
+  };
+}
+
+function popupHostHandshake(value) {
+  const diagnostics = [];
+  const extension = normalizeExtensionHandshake(value, diagnostics);
+  return {
+    ...hostHandshake(),
+    extension: diagnostics.length === 0 ? extension : null
   };
 }
 

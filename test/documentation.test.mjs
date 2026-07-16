@@ -126,6 +126,10 @@ test("README documents v1.3 session control, privacy, assets, notifications, and
   assert.match(readme, /npm run install:native/u);
   assert.match(readme, /npm run install:opencode/u);
   assert.match(readme, /chrome:\/\/extensions/u);
+  assert.match(readme, /cross-origin content.*not fetched|never fetches.*cross-origin/iu);
+  assert.match(readme, /asset URLs.*redact|redact.*asset URLs/iu);
+  assert.match(readme, /complete manifest permissions.*host origins|host origins.*complete manifest permissions/iu);
+  assert.match(readme, /missing capabilities/iu);
 });
 
 test("README documents the exact Browser Intelligence public tools and safeguards", async () => {

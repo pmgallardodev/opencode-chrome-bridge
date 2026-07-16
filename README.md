@@ -425,10 +425,14 @@ the whole action list before side effects when any origin is refused.
 staging bytes. Directories, symlink escapes, identity swaps, stale refs, and partial
 commits fail closed. `chrome_page_assets` combines DOM and CDP inventories, deduplicates
 URLs, and can materialize resource content under a project-relative `outputDirectory`.
-Its bundle contains collision-safe filenames plus a `manifest.json` with original URLs,
+Its bundle contains collision-safe filenames plus a `manifest.json` with redacted source URLs,
 MIME types, SHA-256 hashes, byte sizes, truncation flags, and per-resource errors. Binary
 CDP resources are decoded from base64; total decoded content is capped at 10 MiB. Bundle
 publication is atomic and realpath/symlink containment checks reject workspace escapes.
+Asset URLs redact credentials, fragments, and sensitive signed-query values before they
+enter a response, filename, or manifest. This release never fetches cross-origin content:
+cross-origin iframe and subresource URLs remain redacted inventory metadata with an
+explicit skipped-content error.
 
 The `notifications` permission is used only by `chrome_notify`; notification text is
 bounded and the packaged OpenCode icon is used. No bridge credential is displayed.
@@ -781,7 +785,10 @@ npm run install:opencode
 
 Open `chrome://extensions/?id=miccjajdhchpcdpmmiahheilooppepnl`, enable the extension
 and its required permissions, and click reload. The popup shows only bounded diagnostic
-text and these repair commands; it never renders local bridge secrets.
+text and these repair commands; it never renders local bridge secrets. It compares the
+complete manifest permissions and host origins with Chrome's active grants, and compares
+the extension's actual capability handshake with the native host requirements. Missing
+capabilities, permissions, and origins are listed in sorted form.
 
 ## OpenCode Chrome Bridge vs MCP Playwright
 

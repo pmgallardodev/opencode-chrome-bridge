@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -67,4 +67,49 @@ test("page asset transaction cleanup never recursively follows an unverified fin
   const source = await readFile(path.resolve(import.meta.dirname, "../src/workspace-artifacts.js"), "utf8");
   assert.match(source, /stagingPath = path\.join\(directory\.projectRoot/u);
   assert.doesNotMatch(source, /rm\(finalPath,\s*\{\s*recursive:\s*true/u);
+});
+
+test("page asset publication rolls back its own bundle after an output-directory symlink swap", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-race-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-race-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  await mkdir(path.join(projectDirectory, "artifacts"));
+  await writeFile(path.join(outside, "unrelated.txt"), "keep me");
+  const originalDirectory = path.join(projectDirectory, "artifacts-original");
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "artifacts",
+    assets: [{ url: "https://example.com/app.js", mimeType: "text/javascript", content: "secret bytes" }],
+    renameBundle: async (source, destination) => {
+      await rename(path.join(projectDirectory, "artifacts"), originalDirectory);
+      await symlink(outside, path.join(projectDirectory, "artifacts"));
+      await rename(source, destination);
+    }
+  }), /output directory changed|identity|publish/iu);
+  assert.deepEqual(await readdir(outside), ["unrelated.txt"]);
+  assert.equal(await readFile(path.join(outside, "unrelated.txt"), "utf8"), "keep me");
+  assert.deepEqual(await readdir(originalDirectory), []);
+});
+
+test("page asset manifests propagate inventory overflow and never persist signed URL secrets", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-private-"));
+  t.after(() => rm(projectDirectory, { recursive: true, force: true }));
+  const bundle = await materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    inventoryTruncated: true,
+    assets: [{
+      url: "https://user:password@example.com/app.js?X-Amz-Credential=AKIA-SECRET&token=raw-token#private",
+      mimeType: "text/javascript",
+      content: "console.log('safe')"
+    }]
+  });
+  const manifest = await readFile(path.join(bundle.path, "manifest.json"), "utf8");
+  assert.equal(JSON.parse(manifest).inventoryTruncated, true);
+  assert.equal(JSON.parse(manifest).truncated, true);
+  assert.doesNotMatch(`${manifest}\n${(await readdir(bundle.path)).join("\n")}`, /user|password|AKIA-SECRET|raw-token|#private/iu);
+  assert.match(manifest, /X-Amz-Credential=%5BREDACTED%5D/iu);
 });

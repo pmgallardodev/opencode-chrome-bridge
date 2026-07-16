@@ -3,7 +3,7 @@ import os from "node:os";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin, { TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin, { ALL_TOOL_REQUIRED_CAPABILITIES, TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
 import * as pluginModule from "../src/opencode-plugin.js";
 import { writeDataUrlToFile } from "../src/bridge-client.js";
 import { createLauncher, isSupportedNodeVersion, nativeHostLayout } from "../scripts/lib/platform-support.mjs";
@@ -95,6 +95,15 @@ test("popup exposes actionable repair states without rendering bridge secrets", 
   assert.match(popupScript, /chrome:\/\/extensions/u);
   assert.match(popupScript, /chrome\.permissions\.contains/u);
   assert.doesNotMatch(`${popup}\n${popupScript}`, /state\.json|bearer token|OPENCODE_SERVER_PASSWORD/iu);
+});
+
+test("native pong publishes the current sorted extension capability requirements", async () => {
+  const nativeHost = await readFile(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"), "utf8");
+  assert.match(nativeHost, /HOST_REQUIRED_EXTENSION_CAPABILITIES/u);
+  assert.match(nativeHost, /hostHandshake\([\s\S]*requiredCapabilities/u);
+  for (const capability of ALL_TOOL_REQUIRED_CAPABILITIES) {
+    assert.ok(nativeHost.includes(`"${capability}"`), `native popup contract is missing ${capability}`);
+  }
 });
 
 test("background supports full CDP commands plus browser history and bookmarks", async () => {
