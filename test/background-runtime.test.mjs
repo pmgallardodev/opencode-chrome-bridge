@@ -4189,6 +4189,82 @@ test("workflow page mutations acquire the scoped navigation barrier before debug
   assert.equal(inputEffects, 0);
 });
 
+test("workflow abort during a delayed step binding cannot start page effects", async () => {
+  let stored = {};
+  let frameReads = 0;
+  let releaseBinding;
+  let markBindingPending;
+  const bindingPending = new Promise((resolve) => { markBindingPending = resolve; });
+  const delayedBinding = new Promise((resolve) => { releaseBinding = resolve; });
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    webNavigationGetFrame: async ({ tabId }) => {
+      frameReads += 1;
+      if (frameReads === 2) {
+        markBindingPending();
+        await delayedBinding;
+      }
+      return { documentId: `document-${tabId}`, frameId: 0 };
+    },
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }]
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "binding-abort", name: "Binding abort", shortcut: "binding-abort",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const controller = new AbortController();
+  const run = harness.execute("workflowRun", {
+    id: "binding-abort", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  }, { signal: controller.signal });
+  await bindingPending;
+  controller.abort(new Error("cancelled during binding"));
+  releaseBinding();
+  const result = await run;
+  assert.equal(result.ok, false);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+  assert.equal(harness.calls.executeScript, 0);
+  assert.equal(harness.calls.sendMessage, 0);
+});
+
+test("workflow activation timeout waits for an in-flight browser mutation to settle", async () => {
+  let stored = {};
+  let focusedMutations = 0;
+  let tabMutations = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      focusedMutations += 1;
+      return { id: windowId };
+    },
+    tabsUpdate: async (tabId) => {
+      tabMutations += 1;
+      return { active: true, id: tabId, url: "https://example.com", windowId: 1 };
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "activation-timeout", name: "Activation timeout", shortcut: "activation-timeout",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "activateTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const startedAt = Date.now();
+  const result = await harness.execute("workflowRun", {
+    id: "activation-timeout", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  });
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - startedAt >= 75);
+  assert.equal(focusedMutations, 1);
+  assert.equal(tabMutations, 0);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(focusedMutations, 1);
+  assert.equal(tabMutations, 0);
+});
+
 test("workflow redirect outside its preauthorized union stops before later steps", async () => {
   let stored = {};
   const harness = createBackgroundHarness({
@@ -4273,6 +4349,30 @@ test("workflow screenshot capture obeys both per-step and total abort deadlines"
     assert.equal(result.stoppedAt, 0);
     assert.ok(Date.now() - startedAt < 300);
   }
+});
+
+test("workflow wait capabilities follow their condition and download waits need no page binding", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{ bytesReceived: 10, filename: "/tmp/file.txt", id, state: "complete" }],
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async () => { tabReads += 1; throw new Error("download workflow must not inspect tabs"); }
+  });
+  const workflow = (id, condition) => ({
+    schemaVersion: 1, id, name: id, shortcut: id, requiredCapabilities: [], requiredOrigins: [],
+    steps: [{ method: "waitFor", params: { condition, ...(condition.type === "download" ? {} : { tabId: 7 }) } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  const network = await harness.execute("workflowImport", { workflow: workflow("network-wait", { type: "networkIdle", idleMs: 10 }) });
+  assert.equal(JSON.stringify(network.requiredCapabilities), JSON.stringify(["browser.cdp", "browser.tabs", "browser.wait"]));
+  const download = await harness.execute("workflowImport", { workflow: workflow("download-wait", { type: "download", downloadId: 42 }) });
+  assert.equal(JSON.stringify(download.requiredCapabilities), JSON.stringify(["browser.downloads", "browser.wait"]));
+  const result = await harness.execute("workflowRun", { id: "download-wait", expectedOrigins: [], totalTimeoutMs: 5000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].value.download.id, 42);
+  assert.equal(tabReads, 0);
 });
 
 test("workflow recording rejects sensitive waits and a full recorder before browser effects", async () => {
@@ -4389,6 +4489,42 @@ test("workflow storage and playback enforce recursion, count, payload, and timeo
   await assert.rejects(() => harness.execute("workflowList", {}), /storage payload.*too large|500000/iu);
   stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [], unexpected: true } };
   await assert.rejects(() => harness.execute("workflowList", {}), /unsupported fields|schema.*invalid/iu);
+});
+
+test("workflow final origin unions are bounded before collection writes or recorded effects", async () => {
+  const origins = Array.from({ length: 100 }, (_, index) => `https://origin-${index}.example`);
+  let stored = {};
+  let tabUpdates = 0;
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => { stored = { ...stored, ...structuredClone(value) }; };
+  const harness = createBackgroundHarness({
+    storageLocalGet,
+    storageLocalSet,
+    tabsUpdate: async (tabId, update) => {
+      tabUpdates += 1;
+      return { id: tabId, url: update.url, windowId: 1 };
+    }
+  });
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "origin-overflow", name: "Origin overflow", shortcut: "origin-overflow",
+    requiredCapabilities: [], requiredOrigins: origins,
+    steps: [{ method: "navigate", params: { tabId: 7, url: "https://destination.example/path" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } }), /origin.*100|too many/iu);
+  assert.equal(JSON.stringify(await harness.execute("workflowList", {})), JSON.stringify([]));
+
+  stored.opencodeWorkflowRecording = {
+    schemaVersion: 1, name: "Origin journal", shortcut: "origin-journal",
+    pendingStep: null, requiredCapabilities: [], requiredOrigins: origins,
+    revision: 0, startedAt: "2026-01-01T00:00:00.000Z", steps: []
+  };
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://new-origin.example:443/"], method: "navigate",
+    params: { tabId: 7, url: "https://new-origin.example/path" }
+  }), /origin.*100|too many/iu);
+  assert.equal(tabUpdates, 0);
+  assert.equal(stored.opencodeWorkflowRecording.pendingStep, null);
 });
 
 function createBackgroundHarness({

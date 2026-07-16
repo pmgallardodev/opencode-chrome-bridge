@@ -105,6 +105,7 @@ const WORKFLOW_STORAGE_KEY = "opencodeWorkflows";
 const WORKFLOW_RECORDING_STORAGE_KEY = "opencodeWorkflowRecording";
 const MAX_WORKFLOWS = 100;
 const MAX_WORKFLOW_STEPS = 100;
+const MAX_WORKFLOW_ORIGINS = 100;
 const MAX_WORKFLOW_STORAGE_BYTES = 500_000;
 const MAX_WORKFLOW_NAME_CHARS = 120;
 const MAX_WORKFLOW_SHORTCUT_CHARS = 80;
@@ -758,12 +759,14 @@ async function prepareWorkflowRecordingStep(recording, method, params) {
 function workflowRecordingMetadata(recording, plan) {
   const capabilities = new Set(recording.requiredCapabilities);
   const origins = new Set(recording.requiredOrigins);
-  for (const capability of WORKFLOW_STEP_METHODS[plan.recordedMethod].capability) {
+  for (const capability of workflowStepCapabilities(plan.step)) {
     capabilities.add(capability);
   }
   for (const scope of plan.expectedOrigins) origins.add(workflowOrigin(scope));
   if (plan.recordedMethod === "navigate") origins.add(workflowOrigin(plan.recordedParams.url));
-  return { requiredCapabilities: [...capabilities].sort(), requiredOrigins: [...origins].sort() };
+  const requiredOrigins = [...origins].sort();
+  assertWorkflowOriginCount(requiredOrigins, "Workflow recording origins");
+  return { requiredCapabilities: [...capabilities].sort(), requiredOrigins };
 }
 
 async function journalWorkflowRecordingStep(recording, plan) {
@@ -817,12 +820,12 @@ async function loadWorkflowRecording() {
   const shortcut = normalizeWorkflowShortcut(raw.shortcut);
   if (!Array.isArray(raw.steps) || raw.steps.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording steps are invalid");
   const steps = await Promise.all(raw.steps.map(validateWorkflowStep));
-  const derivedCapabilities = [...new Set(steps.flatMap((step) => WORKFLOW_STEP_METHODS[step.method].capability))].sort();
+  const derivedCapabilities = [...new Set(steps.flatMap(workflowStepCapabilities))].sort();
   if (!Array.isArray(raw.requiredCapabilities)
     || JSON.stringify([...new Set(raw.requiredCapabilities)].sort()) !== JSON.stringify(derivedCapabilities)) {
     throw new Error("Active workflow recording capabilities do not match its typed steps");
   }
-  if (!Array.isArray(raw.requiredOrigins) || raw.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording origins are invalid");
+  if (!Array.isArray(raw.requiredOrigins) || raw.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) throw new Error("Active workflow recording origins are invalid");
   const requiredOrigins = [...new Set(raw.requiredOrigins.map(workflowOrigin))].sort();
   if (!Number.isSafeInteger(raw.revision) || raw.revision < 0) throw new Error("Active workflow recording revision is invalid");
   let pendingStep = null;
@@ -832,12 +835,12 @@ async function loadWorkflowRecording() {
       throw new Error("Active workflow recording pending journal schema is invalid");
     }
     const step = await validateWorkflowStep(raw.pendingStep.step);
-    const pendingCapabilities = [...new Set([...derivedCapabilities, ...WORKFLOW_STEP_METHODS[step.method].capability])].sort();
+    const pendingCapabilities = [...new Set([...derivedCapabilities, ...workflowStepCapabilities(step)])].sort();
     if (!Array.isArray(raw.pendingStep.requiredCapabilities)
       || JSON.stringify([...new Set(raw.pendingStep.requiredCapabilities)].sort()) !== JSON.stringify(pendingCapabilities)) {
       throw new Error("Active workflow recording pending journal capabilities are invalid");
     }
-    if (!Array.isArray(raw.pendingStep.requiredOrigins) || raw.pendingStep.requiredOrigins.length > MAX_WORKFLOW_STEPS) {
+    if (!Array.isArray(raw.pendingStep.requiredOrigins) || raw.pendingStep.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) {
       throw new Error("Active workflow recording pending journal origins are invalid");
     }
     pendingStep = {
@@ -854,6 +857,10 @@ async function loadWorkflowRecording() {
 }
 
 async function saveWorkflowRecording(recording) {
+  assertWorkflowOriginCount(recording.requiredOrigins, "Active workflow recording origins");
+  if (recording.pendingStep) {
+    assertWorkflowOriginCount(recording.pendingStep.requiredOrigins, "Active workflow recording pending origins");
+  }
   const serialized = JSON.stringify(recording);
   if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) throw new Error("Active workflow recording payload is too large");
   try {
@@ -951,6 +958,7 @@ async function runWorkflow(params, options = {}) {
   const bindings = new Map((options.workflowExpectedBindings ?? []).map((binding) => [binding.tabId, binding]));
   for (const tabId of [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))]) {
     const current = await currentPageBinding(tabId);
+    throwIfAborted(options.signal);
     if (!workflowScopeAuthorized(current.pageScope, authorizedScopes)) {
       throw new Error(`Workflow origin preflight failed; current page scope is not authorized: ${current.pageScope}`);
     }
@@ -973,6 +981,7 @@ async function runWorkflow(params, options = {}) {
       const expected = hasTab ? bindings.get(step.params.tabId) : null;
       if (hasTab) {
         const current = await currentPageBinding(step.params.tabId);
+        throwIfAborted(options.signal);
         if (!expected || !workflowBindingMatches(current, expected)) {
           throw new Error(`Workflow document binding changed before step ${index}`);
         }
@@ -987,12 +996,14 @@ async function runWorkflow(params, options = {}) {
         step,
         Math.min(step.timeoutMs, remainingMs),
         options.signal,
-        (stepSignal) => executeScopedPageCommand({
-          expectedBindings: expected ? [expected] : [],
-          expectedScopes: stepScopes,
-          method: step.method,
-          params: cloneWorkflowValue(step.params)
-        }, { signal: stepSignal, workflowInternal: true })
+        (stepSignal) => step.method === "waitFor" && step.params.condition.type === "download"
+          ? executeCommand(step.method, cloneWorkflowValue(step.params), { signal: stepSignal, workflowInternal: true })
+          : executeScopedPageCommand({
+            expectedBindings: expected ? [expected] : [],
+            expectedScopes: stepScopes,
+            method: step.method,
+            params: cloneWorkflowValue(step.params)
+          }, { signal: stepSignal, workflowInternal: true })
       );
       const after = hasTab ? await currentPageBinding(step.params.tabId, value?.url) : null;
       if (step.method === "navigate") {
@@ -1041,14 +1052,18 @@ async function resolveWorkflowRuntimeOrigins(steps) {
 function executeWorkflowStep(step, timeoutMs, parentSignal, operation) {
   const controller = new AbortController();
   const onParentAbort = () => controller.abort(parentSignal.reason);
-  parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  if (parentSignal?.aborted) controller.abort(parentSignal.reason);
+  else parentSignal?.addEventListener("abort", onParentAbort, { once: true });
   let rejectOnAbort;
   const abortPromise = new Promise((_, reject) => {
     rejectOnAbort = () => reject(controller.signal.reason ?? new Error("Workflow step was cancelled"));
     controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
   });
   const timer = setTimeout(() => controller.abort(new Error(`Workflow step ${step.method} timed out after ${timeoutMs}ms`)), timeoutMs);
-  const execution = Promise.resolve().then(() => operation(controller.signal));
+  const execution = Promise.resolve().then(() => {
+    throwIfAborted(controller.signal);
+    return operation(controller.signal);
+  });
   return Promise.race([execution, abortPromise]).catch(async (error) => {
     if (controller.signal.aborted) await execution.catch(() => {});
     throw error;
@@ -1086,6 +1101,9 @@ async function loadWorkflowCollection() {
 
 async function saveWorkflowCollection(collection) {
   assertUniqueWorkflows(collection.workflows);
+  for (const workflow of collection.workflows) {
+    assertWorkflowOriginCount(workflow.requiredOrigins, `Workflow ${workflow.id ?? "unknown"} origins`);
+  }
   const serialized = JSON.stringify(collection);
   if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
     throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
@@ -1123,9 +1141,9 @@ async function validateWorkflowSchema(value, { hydrateOrigins = false } = {}) {
   const shortcut = normalizeWorkflowShortcut(value.shortcut);
   if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_WORKFLOW_STEPS) throw new Error(`Workflow steps must contain 1 to ${MAX_WORKFLOW_STEPS} entries`);
   if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > 100) throw new Error("Workflow requiredCapabilities is invalid");
-  if (!Array.isArray(value.requiredOrigins) || value.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Workflow requiredOrigins is invalid");
+  if (!Array.isArray(value.requiredOrigins) || value.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) throw new Error("Workflow requiredOrigins is invalid");
   const steps = await Promise.all(value.steps.map(validateWorkflowStep));
-  const requiredCapabilities = [...new Set(steps.flatMap((step) => WORKFLOW_STEP_METHODS[step.method].capability))].sort();
+  const requiredCapabilities = [...new Set(steps.flatMap(workflowStepCapabilities))].sort();
   const requiredOrigins = new Set(steps
     .filter((step) => step.method === "navigate")
     .map((step) => workflowOrigin(step.params.url)));
@@ -1139,9 +1157,26 @@ async function validateWorkflowSchema(value, { hydrateOrigins = false } = {}) {
   } else {
     for (const origin of value.requiredOrigins) requiredOrigins.add(workflowOrigin(origin));
   }
+  const normalizedOrigins = [...requiredOrigins].sort();
+  assertWorkflowOriginCount(normalizedOrigins, "Workflow required origins");
   const createdAt = requireWorkflowTimestamp(value.createdAt, "createdAt");
   const updatedAt = requireWorkflowTimestamp(value.updatedAt, "updatedAt");
-  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins: [...requiredOrigins].sort(), steps, createdAt, updatedAt };
+  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins: normalizedOrigins, steps, createdAt, updatedAt };
+}
+
+function workflowStepCapabilities(step) {
+  if (step?.method === "waitFor") {
+    const conditionType = step.params?.condition?.type;
+    if (conditionType === "download") return ["browser.downloads", "browser.wait"];
+    if (conditionType === "networkIdle") return ["browser.cdp", "browser.tabs", "browser.wait"];
+  }
+  return WORKFLOW_STEP_METHODS[step.method].capability;
+}
+
+function assertWorkflowOriginCount(origins, label) {
+  if (!Array.isArray(origins) || origins.length > MAX_WORKFLOW_ORIGINS) {
+    throw new Error(`${label} are limited to ${MAX_WORKFLOW_ORIGINS}`);
+  }
 }
 
 async function validateWorkflowStep(value) {
@@ -1449,10 +1484,10 @@ async function activateTab(tabId, signal) {
   const tab = await abortableChromeOperation(chrome.tabs.get(tabId), signal);
   throwIfAborted(signal);
   if (tab.windowId !== undefined) {
-    await abortableChromeOperation(chrome.windows.update(tab.windowId, { focused: true }), signal);
+    await chrome.windows.update(tab.windowId, { focused: true });
     throwIfAborted(signal);
   }
-  const activated = await abortableChromeOperation(chrome.tabs.update(tabId, { active: true }), signal);
+  const activated = await chrome.tabs.update(tabId, { active: true });
   throwIfAborted(signal);
   return tabInfo(activated);
 }
