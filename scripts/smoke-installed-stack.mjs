@@ -98,6 +98,7 @@ export async function runInstalledStackSmoke({
     const binding = {
       documentId: tab.documentId,
       navigationGeneration: tab.navigationGeneration,
+      pageScope: tab.pageScope,
       tabId
     };
     const webMcp = await command("webMcpList", { tabId }, {

@@ -2237,7 +2237,8 @@ function assertExpectedScopeAuthorized(actualScope, expectedScopes) {
 }
 
 function canonicalPermissionScope(value) {
-  if (typeof value !== "string" || hasAmbiguousPermissionEncoding(value)) {
+  if (typeof value !== "string") throw new Error("Page scope must be a string URL");
+  if (hasAmbiguousPermissionEncoding(value)) {
     throw new Error("Page scope contains an ambiguous encoded separator or traversal");
   }
   let parsed;
@@ -3744,7 +3745,12 @@ async function resumeSession(params) {
 }
 
 function assertClaimableTab(tab) {
-  if (!isClaimableUrl(tab?.url)) {
+  // A freshly created tab has not committed its navigation yet: tabs.get
+  // reports url as "" while the requested URL is still in pendingUrl. Only
+  // fall back to pendingUrl in that window; once a URL has committed it is
+  // authoritative, so a chrome:// tab stays unclaimable while it navigates.
+  const committedUrl = typeof tab?.url === "string" && tab.url.length > 0 ? tab.url : null;
+  if (!isClaimableUrl(committedUrl ?? tab?.pendingUrl)) {
     throw new Error(`Chrome internal tab ${tab?.id ?? "unknown"} cannot be claimed because its URL is unsupported or invalid`);
   }
 }
