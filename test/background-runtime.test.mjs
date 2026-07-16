@@ -5221,7 +5221,7 @@ test("WebMCP invoke uses the exact discovered descriptor, JSON input string, and
   assert.equal(invocations[0][2].signal instanceof AbortSignal, true);
 });
 
-test("WebMCP invoke returns bounded structured page errors and timeouts", async () => {
+test("WebMCP invoke returns bounded structured page errors and lets committed work settle", async () => {
   const thrown = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "explode", description: "Explode" }],
     executeTool: async () => { throw new Error("page exploded token=secret"); }
@@ -5235,15 +5235,13 @@ test("WebMCP invoke returns bounded structured page errors and timeouts", async 
 
   const timed = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "wait", description: "Wait" }],
-    executeTool: async (_name, _input, { signal }) => new Promise((resolve, reject) => {
-      signal.addEventListener("abort", () => reject(new Error("timed out by signal")), { once: true });
-    })
+    executeTool: async () => new Promise((resolve) => setTimeout(() => resolve({ settled: true }), 70))
   } }) });
   const timedResult = await timed.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: {}, timeoutMs: 50, toolName: "wait"
   }));
-  assert.equal(timedResult.ok, false);
-  assert.equal(timedResult.error.code, "WEBMCP_TIMEOUT");
+  assert.equal(timedResult.ok, true);
+  assert.equal(JSON.stringify(timedResult.result), '{"settled":true}');
 });
 
 test("WebMCP invoke rejects invalid inputs and page outputs without lossy serialization", async () => {
@@ -5278,7 +5276,7 @@ test("WebMCP invoke rejects invalid inputs and page outputs without lossy serial
   }
 });
 
-test("WebMCP invocation discards output on cancellation and navigation races", async () => {
+test("WebMCP committed invocation preserves output after cancellation and rejects navigation races", async () => {
   let currentUrl = "https://example.com";
   let release;
   let started;
@@ -5303,7 +5301,7 @@ test("WebMCP invocation discards output on cancellation and navigation races", a
   assert.equal(reachedPage, true, "WebMCP invocation must reach the page without hanging the test");
   controller.abort(new Error("cancel WebMCP"));
   release();
-  await assert.rejects(run, /cancel WebMCP/u);
+  assert.equal(JSON.stringify((await run).result), '{"done":true}');
 
   currentUrl = "https://example.com";
   const navigated = createBackgroundHarness({
@@ -5350,19 +5348,16 @@ test("WebMCP exact-document dispatch never runs getTools in a raced destination 
   assert.equal(destinationEffects, 0);
 });
 
-test("WebMCP external cancellation aborts and settles the page tool before returning", async () => {
+test("WebMCP external cancellation after commit does not abort the page tool", async () => {
   let effects = 0;
   let started;
   const began = new Promise((resolve) => { started = resolve; });
   const mainWorld = webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "slow", description: "Slow" }],
-    executeTool: async (_name, _input, options) => new Promise((resolve, reject) => {
+    executeTool: async (_name, _input, options) => new Promise((resolve) => {
       started();
       const timer = setTimeout(() => { effects += 1; resolve({ late: true }); }, 80);
-      options?.signal?.addEventListener("abort", () => {
-        clearTimeout(timer);
-        setTimeout(() => reject(new Error("page observed abort")), 10);
-      }, { once: true });
+      options?.signal?.addEventListener("abort", () => clearTimeout(timer), { once: true });
     })
   } });
   const controller = new AbortController();
@@ -5372,9 +5367,8 @@ test("WebMCP external cancellation aborts and settles the page tool before retur
   }), { signal: controller.signal });
   await began;
   controller.abort(new Error("cancel exact WebMCP"));
-  await assert.rejects(run, /cancel exact WebMCP/u);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(effects, 0);
+  assert.equal(JSON.stringify((await run).result), '{"late":true}');
+  assert.equal(effects, 1);
   assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
 });
 
@@ -5401,28 +5395,18 @@ test("WebMCP cancellation during discovery never starts the page tool and leaves
   assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
 });
 
-test("WebMCP timeout aborts and settles the page tool with no post-return effect", async () => {
+test("WebMCP admission timeout after discovery has zero tool effects", async () => {
   let effects = 0;
-  let observedAbort = false;
   const mainWorld = webMcpMainWorld({ documentContext: {
-    getTools: async () => [{ name: "timeout", description: "Timeout" }],
-    executeTool: async (_name, _input, { signal } = {}) => new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { effects += 1; resolve({ late: true }); }, 100);
-      signal?.addEventListener("abort", () => {
-        observedAbort = true;
-        clearTimeout(timer);
-        setTimeout(() => reject(new Error("timeout aborted")), 10);
-      }, { once: true });
-    })
+    getTools: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); return [{ name: "timeout", description: "Timeout" }]; },
+    executeTool: async () => { effects += 1; return { late: true }; }
   } });
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
   const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: {}, timeoutMs: 50, toolName: "timeout"
   }));
   assert.equal(result.ok, false);
-  assert.equal(result.error.code, "WEBMCP_TIMEOUT");
-  assert.equal(observedAbort, true);
-  await new Promise((resolve) => setTimeout(resolve, 110));
+  assert.equal(result.error.code, "WEBMCP_DISCOVERY_TIMEOUT");
   assert.equal(effects, 0);
   assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
 });
@@ -5531,23 +5515,31 @@ test("WebMCP discovery hard deadline returns structurally and releases the scope
   assert.equal(followup.supported, true);
 });
 
-test("WebMCP never returns or releases the barrier before an aborted official execution settles", async () => {
+test("WebMCP committed execution ignores cancellation and deadline until natural success", async () => {
   let releaseExecution;
+  let executionSignal;
   const mainWorld = webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "stuck", description: "Stuck" }],
-    executeTool: async () => new Promise((resolve) => { releaseExecution = resolve; })
+    executeTool: async (_descriptor, _inputJson, { signal }) => {
+      executionSignal = signal;
+      return new Promise((resolve) => { releaseExecution = resolve; });
+    }
   } });
+  const controller = new AbortController();
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
   let settled = false;
   const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: {}, timeoutMs: 50, toolName: "stuck"
-  })).finally(() => { settled = true; });
+  }), { signal: controller.signal }).finally(() => { settled = true; });
+  while (!releaseExecution) await new Promise((resolve) => setTimeout(resolve, 1));
+  controller.abort(new Error("client disconnected after commit"));
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.equal(settled, false);
+  assert.equal(executionSignal.aborted, false);
   releaseExecution({ stopped: true });
   const outcome = await run;
-  assert.equal(outcome.ok, false);
-  assert.equal(outcome.error.code, "WEBMCP_TIMEOUT");
+  assert.equal(outcome.ok, true);
+  assert.equal(JSON.stringify(outcome.result), '{"stopped":true}');
 
   mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
   const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
@@ -5566,15 +5558,14 @@ test("WebMCP enforces output limits by incremental UTF-8 bytes", async () => {
   assert.equal(result.error.code, "WEBMCP_OUTPUT_TOO_LARGE");
 });
 
-test("WebMCP abort channel stays isolated and official abort settles with no late effect", async () => {
-  let lateEffects = 0;
+test("WebMCP committed execution ignores cancellation until natural rejection and then cleans up", async () => {
+  let rejectExecution;
+  let executionSignal;
   const mainWorld = webMcpMainWorld({ documentContext: {
     async getTools() { return [{ name: "slow", description: "Slow" }]; },
     async executeTool(_descriptor, _inputJson, { signal }) {
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { lateEffects += 1; resolve({ late: true }); }, 80);
-        signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
-      });
+      executionSignal = signal;
+      return new Promise((_resolve, reject) => { rejectExecution = reject; });
     }
   } });
   const controller = new AbortController();
@@ -5582,14 +5573,20 @@ test("WebMCP abort channel stays isolated and official abort settles with no lat
   const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: {}, timeoutMs: 1_000, toolName: "slow"
   }), { signal: controller.signal });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  while (!rejectExecution) await new Promise((resolve) => setTimeout(resolve, 1));
   controller.abort(new Error("hidden-channel abort"));
-  await assert.rejects(run, /hidden-channel abort/u);
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(executionSignal.aborted, false);
+  rejectExecution(new Error("natural page rejection"));
+  const result = await run;
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_TOOL_ERROR");
+  assert.match(result.error.message, /natural page rejection/u);
   const exposedKeys = Reflect.ownKeys(mainWorld.page)
     .filter((key) => typeof key === "string" && /opencode.*webmcp/i.test(key));
   assert.deepEqual(exposedKeys, []);
-  assert.equal(lateEffects, 0);
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
+  assert.equal((await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }))).supported, true);
 });
 
 test("WebMCP isolated execution ignores pre-poisoned MAIN globals", async () => {
@@ -5625,7 +5622,7 @@ test("WebMCP does not require a page-created clean realm", async () => {
   assert.equal(mainWorld.framesCreated, 0);
 });
 
-test("WebMCP discovery and execution share one end-to-end deadline", async () => {
+test("WebMCP deadline is admission-only once execution commits", async () => {
   const startedAt = Date.now();
   const mainWorld = webMcpMainWorld({ documentContext: {
     getTools: async () => {
@@ -5642,9 +5639,9 @@ test("WebMCP discovery and execution share one end-to-end deadline", async () =>
     input: {}, timeoutMs: 50, toolName: "budget"
   }));
   const elapsed = Date.now() - startedAt;
-  assert.equal(result.ok, false);
-  assert.equal(result.error.code, "WEBMCP_TIMEOUT");
-  assert.ok(elapsed < 80, `one 50ms budget must not become sequential phase budgets (${elapsed}ms)`);
+  assert.equal(result.ok, true);
+  assert.equal(JSON.stringify(result.result), '{"tooLate":true}');
+  assert.ok(elapsed >= 60, `committed execution must settle naturally (${elapsed}ms)`);
 });
 
 test("WebMCP rejects monkeypatched noncooperative methods before any delayed side effect", async () => {

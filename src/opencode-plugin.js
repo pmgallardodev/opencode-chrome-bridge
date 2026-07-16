@@ -23,15 +23,19 @@ const PAGE_ORIGIN_PERMISSION = "browser.origin";
 const SCHEDULE_UNATTENDED_PERMISSION = "browser.schedule-unattended";
 const MAX_ORIGIN_GRANT_SESSIONS = 100;
 const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
-const WEBMCP_TRANSPORT_TIMEOUT_MS = 35_000;
+const WEBMCP_LIST_TRANSPORT_TIMEOUT_MS = 35_000;
+const WEBMCP_INVOKE_TRANSPORT_TIMEOUT_MS = 0;
 const pageOriginSessionGrants = new Map();
 
 async function webMcpBridgeCommand(method, params, signal) {
   try {
-    return await bridgeCommand(method, params, { signal, timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS });
+    return await bridgeCommand(method, params, {
+      signal,
+      timeoutMs: method === "webMcpInvoke" ? WEBMCP_INVOKE_TRANSPORT_TIMEOUT_MS : WEBMCP_LIST_TRANSPORT_TIMEOUT_MS
+    });
   } catch (error) {
     if (/Bridge request timed out/iu.test(error?.message ?? "")) {
-      throw new Error("WebMCP platform failure: the isolated native operation did not settle after cancellation");
+      throw new Error("WebMCP platform failure: isolated discovery did not settle before the transport deadline");
     }
     throw error;
   }
@@ -1210,7 +1214,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         }
       }),
       chrome_webmcp_list: tool({
-        description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter only reads feature-detected document.modelContext or navigator.modelContext APIs in Chrome's MAIN world.",
+        description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter reads feature-detected document.modelContext or navigator.modelContext APIs in the extension's ISOLATED world.",
         args: {
           tabId: schema.number().int().describe("Chrome tab id whose approved current origin and exact document will be bound to this discovery call."),
           timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("WebMCP discovery deadline in milliseconds.")
@@ -1220,12 +1224,12 @@ export default async function OpenCodeChromeBridgePlugin() {
         }
       }),
       chrome_webmcp_invoke: tool({
-        description: "Invoke one exact WebMCP tool exposed by the current document, with bounded JSON input, output, and execution time. The current origin requires explicit approval.",
+        description: "Invoke one exact WebMCP tool exposed by the current document, with bounded JSON input and output. The current origin requires explicit approval; once native executeTool dispatch commits, it settles naturally.",
         args: {
           tabId: schema.number().int().describe("Chrome tab id whose current origin has been explicitly approved."),
           toolName: schema.string().min(1).max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u).describe("Exact WebMCP tool name returned by chrome_webmcp_list."),
           input: schema.any().optional().describe("Losslessly JSON-serializable input, limited to 64 KiB."),
-          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("Page tool timeout in milliseconds.")
+          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("Admission/pre-dispatch deadline in milliseconds; it does not time out a committed page tool.")
         },
         async execute(args, context) {
           return JSON.stringify(await webMcpBridgeCommand("webMcpInvoke", {

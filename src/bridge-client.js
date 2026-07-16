@@ -256,26 +256,23 @@ async function request(method, pathname, body, extraHeaders = {}, externalSignal
   if (externalSignal) {
     return abortableHttpRequest({ body, headers, method, signal: externalSignal, timeoutMs, url });
   }
-  const controller = new AbortController();
-  const onExternalAbort = () => controller.abort(externalSignal.reason);
-  externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timeout = controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
     response = await fetch(url, {
       method,
-      signal: controller.signal,
+      signal: controller?.signal,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body)
     });
   } catch (error) {
-    if (error?.name === "AbortError") {
+    if (controller !== null && error?.name === "AbortError") {
       throw new Error(`Bridge request timed out after ${timeoutMs}ms`);
     }
     throw error;
   } finally {
-    clearTimeout(timeout);
-    externalSignal?.removeEventListener("abort", onExternalAbort);
+    if (timeout !== null) clearTimeout(timeout);
   }
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.ok === false) {
@@ -316,7 +313,7 @@ function abortableHttpRequest({ body, headers, method, signal, timeoutMs, url })
         resolve(payload);
       });
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Bridge request timed out after ${timeoutMs}ms`)));
+    if (timeoutMs > 0) req.setTimeout(timeoutMs, () => req.destroy(new Error(`Bridge request timed out after ${timeoutMs}ms`)));
     req.on("error", (error) => {
       reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
     });
@@ -410,9 +407,11 @@ function compareVersions(left, right) {
 }
 
 function requestTimeoutMs(body) {
-  const commandTimeout = Number(body?.timeoutMs);
-  if (Number.isFinite(commandTimeout) && commandTimeout > 0) {
-    return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(1000, commandTimeout + 1000));
+  const commandTimeout = body?.timeoutMs;
+  if (commandTimeout === 0) return 0;
+  const parsedTimeout = Number(commandTimeout);
+  if (Number.isFinite(parsedTimeout) && parsedTimeout > 0) {
+    return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(1000, parsedTimeout + 1000));
   }
   return DEFAULT_REQUEST_TIMEOUT_MS;
 }

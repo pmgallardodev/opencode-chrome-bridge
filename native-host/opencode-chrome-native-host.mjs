@@ -124,7 +124,7 @@ function handleNativeMessage(payload) {
     const entry = pending.get(message.id);
     if (!entry) return;
     pending.delete(message.id);
-    clearTimeout(entry.timeout);
+    if (entry.timeout !== null) clearTimeout(entry.timeout);
     if (message.ok) entry.resolve(message.result);
     else entry.reject(new ExtensionCommandError(message.error || "Chrome extension command failed"));
     return;
@@ -158,6 +158,12 @@ async function handleHttp(req, res) {
     if (req.method === "POST" && requestUrl.pathname === "/command") {
       requireJsonRequest(req);
       const body = await readJsonBody(req);
+      const noTimeout = body.timeoutMs === 0
+        && body.method === "scopedCommand"
+        && body.params?.method === "webMcpInvoke";
+      if (body.timeoutMs === 0 && !noTimeout) {
+        throw new HttpError(400, "No-timeout transport is restricted to WebMCP invoke");
+      }
       const command = sendCommand(body.method, body.params ?? {}, body.timeoutMs);
       const cancelOnDisconnect = () => {
         if (!res.writableEnded) cancelPendingCommand(
@@ -471,12 +477,12 @@ function sendCommand(method, params, timeoutMs = 15000) {
   const id = `opencode:${nextId++}`;
   const message = { type: "command", id, method, params };
   const command = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const timeout = timeoutMs === 0 ? null : setTimeout(() => {
       cancelPendingCommand(id, new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
     }, clampTimeout(timeoutMs));
     pending.set(id, { resolve, reject, timeout });
     writeNativeMessage(message).catch((error) => {
-      clearTimeout(timeout);
+      if (timeout !== null) clearTimeout(timeout);
       pending.delete(id);
       reject(error);
     });
@@ -489,7 +495,7 @@ function cancelPendingCommand(id, reason) {
   const entry = pending.get(id);
   if (!entry) return false;
   pending.delete(id);
-  clearTimeout(entry.timeout);
+  if (entry.timeout !== null) clearTimeout(entry.timeout);
   writeNativeMessage({ type: "cancel", id }).catch((error) => {
     log(`could not cancel Chrome command ${id}: ${error?.message ?? error}`);
   });

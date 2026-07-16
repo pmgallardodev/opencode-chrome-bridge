@@ -2399,8 +2399,8 @@ async function runWebMcpIsolatedAdapter(tabId, documentId, operation, payload, s
     signal?.removeEventListener("abort", abortInvocation);
   }
   if (aborted) await abortExecution;
-  throwIfAborted(signal);
   if (!Array.isArray(results) || results.length !== 1 || typeof results[0]?.result !== "string") {
+    throwIfAborted(signal);
     throw new Error("WebMCP isolated-world adapter returned an invalid envelope");
   }
   const serialized = results[0].result;
@@ -2410,11 +2410,14 @@ async function runWebMcpIsolatedAdapter(tabId, documentId, operation, payload, s
     }
     throw new Error("WebMCP metadata response is too large");
   }
+  let envelope;
   try {
-    return JSON.parse(serialized);
+    envelope = JSON.parse(serialized);
   } catch {
     throw new Error("WebMCP isolated-world adapter returned invalid JSON");
   }
+  if (aborted && envelope?.committed !== true) throwIfAborted(signal);
+  return envelope;
 }
 
 function webMcpAbortAdapter(abortChannel) {
@@ -2458,7 +2461,6 @@ async function webMcpIsolatedAdapter(operation, payload) {
     const stringCharCodeAt = SafeString.prototype.charCodeAt;
     const stringIncludes = SafeString.prototype.includes;
     const stringSlice = SafeString.prototype.slice;
-    const abortControllerAbort = SafeAbortController.prototype.abort;
     const addEventListener = clean.EventTarget.prototype.addEventListener;
     const removeEventListener = clean.EventTarget.prototype.removeEventListener;
     const safeSetTimeout = clean.setTimeout;
@@ -2470,10 +2472,13 @@ async function webMcpIsolatedAdapter(operation, payload) {
     const maxEnvelopeBytes = 768 * 1024;
     const dangerousKeys = new SafeSet(["__proto__", "constructor", "prototype"]);
     const controller = new SafeAbortController();
+    let committed = false;
+    let preDispatchAborted = false;
     let abortResolve;
     const abortPromise = new SafePromise((resolve) => { abortResolve = resolve; });
     const onAbort = () => {
-      reflectApply(abortControllerAbort, controller, []);
+      if (committed) return;
+      preDispatchAborted = true;
       abortResolve({ kind: "abort" });
     };
     if (!payload || typeof payload !== "object" || typeof payload.abortChannel !== "string"
@@ -2570,7 +2575,8 @@ async function webMcpIsolatedAdapter(operation, payload) {
       return visit(value, 0);
     };
     const safeMessage = (message) => reflectApply(stringSlice, SafeString(message || "WebMCP error"), [0, 500]);
-    const errorEnvelope = (code, message, supported, source = null) => ({
+    const errorEnvelope = (code, message, supported, source = null, wasCommitted = false) => ({
+      ...(wasCommitted ? { committed: true } : {}),
       error: { code, message: safeMessage(message) }, ok: false, source, supported
     });
     const serialize = (value) => {
@@ -2672,43 +2678,36 @@ async function webMcpIsolatedAdapter(operation, payload) {
       if (typeof officialExecuteTool !== "function") {
         return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
       }
-      const executionRemainingMs = remainingMs();
-      if (executionRemainingMs <= 0) return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP tool timed out", true, source));
+      if (preDispatchAborted) return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP operation was aborted", true, source));
+      if (remainingMs() <= 0) return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP admission deadline expired before dispatch", true, source));
       const abortSignalGetter = getOwnPropertyDescriptor(SafeAbortController.prototype, "signal")?.get;
       if (typeof abortSignalGetter !== "function") return unsupported;
       const signal = reflectApply(abortSignalGetter, controller, []);
+      // Commit and native dispatch are one synchronous step. After this point,
+      // cancellation and the admission deadline cannot affect the page tool.
+      committed = true;
       const execution = settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
         () => reflectApply(officialExecuteTool, context, [descriptor, inputJson, { signal }])
       ]));
-      const executionOutcome = await reflectApply(SafePromise.race, SafePromise, [[
-        execution, delay(executionRemainingMs, "execution-timeout"), abortPromise
-      ]]);
-      if (executionOutcome.kind === "execution-timeout" || executionOutcome.kind === "abort") {
-        reflectApply(abortControllerAbort, controller, []);
-        // The official isolated-world executeTool contract owns cancellation.
-        // Never release the scoped barrier while its promise is still pending.
-        await execution;
-        return serialize(errorEnvelope(executionOutcome.kind === "execution-timeout" ? "WEBMCP_TIMEOUT" : "WEBMCP_TOOL_ERROR",
-          executionOutcome.kind === "execution-timeout" ? "WebMCP tool timed out" : "WebMCP operation was aborted", true, source));
-      }
+      const executionOutcome = await execution;
       if (executionOutcome.kind === "rejected") {
         if (executionOutcome.error?.code === "WEBMCP_INVOCATION_UNSUPPORTED") {
-          return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
+          return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source, true));
         }
-        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, source));
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, source, true));
       }
       let result;
       try {
         result = cloneJson(executionOutcome.value, "WebMCP output", 512 * 1024);
       } catch (error) {
         const message = SafeString(error?.message || error);
-        return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source));
+        return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source, true));
       }
-      return serialize({ invocation: "executeTool", ok: true, result, source, supported: true, toolName: payload.toolName });
+      return serialize({ committed: true, invocation: "executeTool", ok: true, result, source, supported: true, toolName: payload.toolName });
     } catch (error) {
       const message = safeMessage(error?.message || error);
       if (operation === "list") return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
-      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true));
+      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true, null, committed));
     } finally {
       try { reflectApply(setForEach, timers, [(timer) => safeClearTimeout(timer)]); } catch {}
       try { reflectApply(removeEventListener, globalThis, [payload.abortChannel, onAbort]); } catch {}
