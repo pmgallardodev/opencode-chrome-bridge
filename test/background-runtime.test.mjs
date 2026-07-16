@@ -1499,7 +1499,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   const result = await harness.execute("handshake", {});
 
   assert.equal(result.extensionId, "test-extension");
-  assert.equal(result.extensionVersion, "1.3.0");
+  assert.equal(result.extensionVersion, "1.4.0");
   assert.equal(result.hostName, "com.opencode.chrome_bridge");
   assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
   assert.ok(result.capabilities.includes("bridge.handshake"));
@@ -1512,7 +1512,7 @@ test("popup status compares actual extension capabilities with host client requi
   const harness = createBackgroundHarness();
   const status = harness.popupStatus({
     name: "com.opencode.chrome_bridge",
-    version: "1.3.0",
+    version: "1.4.0",
     protocolMin: "1.0.0",
     protocolMax: "1.0.0",
     requiredCapabilities: ["browser.tabs", "browser.future", "bridge.handshake"]
@@ -5874,7 +5874,7 @@ function createBackgroundHarness({
     },
     runtime: {
       connectNative: () => nativePort,
-      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.3.0" }),
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.4.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,

@@ -21,3 +21,45 @@ As an additional layer, every browser tool except `chrome_status` requires an Op
 Only install the extension and plugin on trusted machines and Chrome profiles. Never publish bridge state files, screenshots, HAR files, traces, or logs that may contain browser data.
 
 The RSA value in `extension/manifest.json` is a public Chrome extension signing key used only to keep the unpacked extension ID stable. It is not a credential.
+
+## Workflow and schedule boundary
+
+Workflows contain only the versioned, typed allowlist documented in the README. Import and
+execution recompute required capabilities and origins from the steps; recursive/meta actions,
+sensitive fields, unknown schemas, oversized data, and future schema versions fail closed.
+The complete capability and origin union is approved before a run's first side effect.
+
+A scheduled run is unattended browser control. Creation and material updates therefore require
+both the ordinary tool decision and a separate explicit approval for
+`browser.schedule-unattended`. That exact approval binds the workflow fingerprint, recurrence,
+notification policy, required origins, and managed tabs. The extension does not accept a boolean
+or client-generated substitute. Any bound change invalidates the approval and requires a new decision.
+
+Schedule state and Chrome alarm changes use durable journals and committed semantics: success
+is returned only after the transition is committed. Startup repairs interrupted transitions;
+occurrence claims deduplicate alarms, and completed work is not replayed after a crash. Manual
+runs remain cancellable and use the same fail-closed preflight. Schedules, history, origins,
+steps, timeouts, and serialized storage are all bounded.
+
+## Experimental WebMCP boundary
+
+WebMCP is an experimental Chrome feature and must be enabled explicitly for local development.
+Only an origin-isolated, top-level, exact current document may expose tools. Discovery and
+invocation run through an extension content script in Chrome's `ISOLATED` world and use the
+official `document.modelContext` signatures; no callable registry is installed in page globals.
+
+Descriptors, schemas, inputs, outputs, JSON structure, adapter envelopes, deadlines, token
+lifetimes, and concurrency are bounded. Admission prepares a random document-bound token and
+performs a final synchronous signal/deadline check before committing the exact descriptor in
+that same document. Once committed, invocation is irrevocable: client cancellation or
+disconnect cannot abort the page signal or release its navigation barrier early. The barrier
+is released only when the page invocation settles or rejects, while capacity remains reserved
+for status and ordinary bridge commands.
+
+## Privacy and release artifacts
+
+The bridge has no cloud relay or telemetry. Tokens, workflows, schedules, approval fingerprints,
+and sanitized history remain local. Screenshots, page assets, browser traces, downloaded third-
+party extensions, credentials, internal audit copies, and private `docs/superpowers` material
+must never be committed. Release verification checks the tracked tree for these classes of
+accidental artifact in addition to checking exact component versions.
