@@ -64,10 +64,34 @@ test("WebMCP dispatch is exact-document targeted and guarded by the scoped navig
   assert.doesNotMatch(source, /world:\s*"MAIN"[\s\S]{0,500}webMcp/u);
 });
 
+test("WebMCP invocation uses service-worker prepare and atomic commit with isolated descriptor custody", async () => {
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  assert.match(source, /"prepare"[\s\S]{0,300}webMcpPrepareToken/u);
+  const invoke = source.slice(source.indexOf("async function invokeWebMcpTool"), source.indexOf("async function requireWebMcpDocumentBinding"));
+  assert.match(invoke, /throwIfAborted\(signal\)[\s\S]*runWebMcpIsolatedAdapter\([^)]*"commit"/u);
+  assert.match(source, /operation === "commit"[\s\S]{0,800}registry/u);
+  assert.match(source, /operation === "cleanup"/u);
+  assert.match(source, /WEBMCP_PREPARED_REGISTRY_LIMIT/u);
+  assert.match(source, /WEBMCP_PREPARED_TTL_MS/u);
+});
+
+test("WebMCP lock waiting and no-timeout quotas are independently bounded", async () => {
+  const background = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  const host = await readFile(new URL("../native-host/opencode-chrome-native-host.mjs", import.meta.url), "utf8");
+  assert.match(background, /withDebuggerLock\(key, callback, signal\)/u);
+  assert.match(background, /abortableChromeOperation\(prev, signal\)/u);
+  assert.match(background, /MAX_COMMITTED_WEBMCP_INVOKES\s*=\s*8/u);
+  assert.match(background, /activeCommittedWebMcpInvokes\.size\s*>=\s*MAX_COMMITTED_WEBMCP_INVOKES/u);
+  assert.match(host, /MAX_NO_TIMEOUT_WEBMCP_INVOKES\s*=\s*8/u);
+  assert.match(host, /noTimeout\s*&&\s*noTimeoutWebMcpInvokes\.size\s*>=\s*MAX_NO_TIMEOUT_WEBMCP_INVOKES/u);
+  assert.match(host, /Too many committed WebMCP invocations/u);
+  assert.match(host, /message\?\.type === "settled"/u);
+});
+
 test("WebMCP uses only documented discovery and abortable invocation methods", async () => {
   const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
   assert.match(source, /reflectApply\(officialGetTools, context/u);
-  assert.match(source, /reflectApply\(officialExecuteTool,[\s\S]{0,160}descriptor,[\s\S]{0,80}inputJson,[\s\S]{0,80}\{ signal/u);
+  assert.match(source, /reflectApply\(entry\.executeTool,[\s\S]{0,160}entry\.descriptor,[\s\S]{0,80}payload\.inputJson,[\s\S]{0,80}\{ signal/u);
   assert.doesNotMatch(source, /const (?:getTools|executeTool) = context\.(?:getTools|executeTool)/u);
   assert.doesNotMatch(source, /\.listTools\(|\.invokeTool\(|\.callTool\(|context\.tools/u);
 });

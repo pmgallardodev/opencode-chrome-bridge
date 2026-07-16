@@ -5395,6 +5395,46 @@ test("WebMCP cancellation during discovery never starts the page tool and leaves
   assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
 });
 
+test("WebMCP cancellation observed after prepare but before service-worker commit has zero effects", async () => {
+  let effects = 0;
+  const controller = new AbortController();
+  const isolated = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "race", description: "Race" }],
+    executeTool: async () => { effects += 1; return { raced: true }; }
+  } });
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (details) => {
+      const result = await isolated(details);
+      if (details.args?.[0] === "prepare") controller.abort(new Error("abort before atomic commit"));
+      return result;
+    }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "race"
+  }), { signal: controller.signal }), /abort before atomic commit/u);
+  assert.equal(effects, 0);
+});
+
+test("queued same-tab WebMCP invoke expires before commit while the committed barrier remains held", async () => {
+  let release;
+  let effects = 0;
+  const isolated = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "serial", description: "Serial" }],
+    executeTool: async () => { effects += 1; return new Promise((resolve) => { release = resolve; }); }
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: isolated });
+  const first = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "serial"
+  }));
+  while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+  await assert.rejects(() => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "serial"
+  })), /abort|timeout|deadline/iu);
+  assert.equal(effects, 1);
+  release({ done: true });
+  await first;
+});
+
 test("WebMCP admission timeout after discovery has zero tool effects", async () => {
   let effects = 0;
   const mainWorld = webMcpMainWorld({ documentContext: {

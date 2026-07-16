@@ -75,6 +75,9 @@ const MAX_WEBMCP_JSON_KEY_CHARS = 1_000;
 const MIN_WEBMCP_TIMEOUT_MS = 50;
 const MAX_WEBMCP_TIMEOUT_MS = 30_000;
 const DEFAULT_WEBMCP_TIMEOUT_MS = 10_000;
+const WEBMCP_PREPARED_REGISTRY_LIMIT = 8;
+const WEBMCP_PREPARED_TTL_MS = 30_000;
+const MAX_COMMITTED_WEBMCP_INVOKES = 8;
 const WEBMCP_TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u;
 const MAX_NETWORK_REQUEST_STATES = 1_000;
 const MAX_NETWORK_BUFFER_CHARS = 2_000_000;
@@ -231,6 +234,7 @@ const tabNavigationAttempts = new Map();
 const retiredMainFrameLoaders = new Map();
 let navigationAttemptSequence = 1;
 const activeNativeCommands = new Map();
+const activeCommittedWebMcpInvokes = new Set();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
 let workflowMutationQueue = Promise.resolve();
@@ -473,6 +477,7 @@ async function handleNativeMessage(message) {
     return;
   }
   if (message?.type !== "command" || typeof message.id !== "string") return;
+  const settlementTracked = message.method === "scopedCommand" && message.params?.method === "webMcpInvoke";
   const controller = new AbortController();
   activeNativeCommands.set(message.id, controller);
   try {
@@ -488,6 +493,9 @@ async function handleNativeMessage(message) {
       error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS)
     });
   } finally {
+    if (settlementTracked && controller.signal.aborted) {
+      try { postNativeResponse({ type: "settled", id: message.id }); } catch {}
+    }
     if (activeNativeCommands.get(message.id) === controller) activeNativeCommands.delete(message.id);
   }
 }
@@ -2315,7 +2323,49 @@ async function invokeWebMcpTool(params, signal, pageGuard, deadlineEpochMs) {
   const inputJson = JSON.stringify(input);
   const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
   const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
-  const envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "invoke", { abortChannel, deadlineEpochMs, inputJson, timeoutMs, toolName }, signal);
+  const webMcpPrepareToken = crypto.randomUUID();
+  let preparationIssued = false;
+  let committed = false;
+  let extensionCommitTracked = false;
+  let envelope;
+  try {
+    preparationIssued = true;
+    const preparation = await runWebMcpIsolatedAdapter(tabId, documentId, "prepare", {
+      abortChannel, deadlineEpochMs, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+      timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+    }, signal);
+    if (preparation?.prepared !== true || preparation.toolName !== toolName
+      || preparation.tool?.name !== toolName
+      || !["document", "navigator"].includes(preparation.source)) {
+      envelope = preparation;
+    } else {
+      await pageGuard(params);
+      throwIfAborted(signal);
+      if (Date.now() >= deadlineEpochMs) {
+        envelope = webMcpInvocationError("WEBMCP_TIMEOUT", "WebMCP admission deadline expired before dispatch", true);
+      } else if (activeCommittedWebMcpInvokes.size >= MAX_COMMITTED_WEBMCP_INVOKES) {
+        envelope = webMcpInvocationError("WEBMCP_TOOL_ERROR", "Too many committed WebMCP invocations", true);
+      } else {
+        // This assignment and the executeScript issue inside runWebMcpIsolatedAdapter
+        // are synchronous: cancellation observed afterwards is post-commit.
+        committed = true;
+        activeCommittedWebMcpInvokes.add(webMcpPrepareToken);
+        extensionCommitTracked = true;
+        envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "commit", {
+          abortChannel, deadlineEpochMs, inputJson, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+          timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+        }, null);
+      }
+    }
+  } finally {
+    if (extensionCommitTracked) activeCommittedWebMcpInvokes.delete(webMcpPrepareToken);
+    if (preparationIssued && !committed) {
+      await runWebMcpIsolatedAdapter(tabId, documentId, "cleanup", {
+        abortChannel, deadlineEpochMs, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+        timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+      }, null).catch(() => {});
+    }
+  }
   if (!isRecord(envelope)) throw new Error("WebMCP invocation response is invalid");
   if (envelope.ok === false) {
     const error = validateWebMcpError(envelope.error);
@@ -2445,6 +2495,7 @@ async function webMcpIsolatedAdapter(operation, payload) {
     const SafeString = clean.String;
     const SafePromise = clean.Promise;
     const SafeSet = clean.Set;
+    const SafeMap = clean.Map;
     const SafeAbortController = clean.AbortController;
     const objectCreate = SafeObject.create;
     const getOwnPropertyDescriptor = SafeObject.getOwnPropertyDescriptor;
@@ -2458,6 +2509,10 @@ async function webMcpIsolatedAdapter(operation, payload) {
     const setDelete = SafeSet.prototype.delete;
     const setForEach = SafeSet.prototype.forEach;
     const setHas = SafeSet.prototype.has;
+    const mapDelete = SafeMap.prototype.delete;
+    const mapEntries = SafeMap.prototype.entries;
+    const mapGet = SafeMap.prototype.get;
+    const mapSet = SafeMap.prototype.set;
     const stringCharCodeAt = SafeString.prototype.charCodeAt;
     const stringIncludes = SafeString.prototype.includes;
     const stringSlice = SafeString.prototype.slice;
@@ -2467,6 +2522,7 @@ async function webMcpIsolatedAdapter(operation, payload) {
     const safeClearTimeout = clean.clearTimeout;
     const safeJsonStringify = clean.JSON.stringify;
     const safeDateNow = clean.Date.now;
+    const symbolFor = clean.Symbol.for;
     const objectPrototype = SafeObject.prototype;
     const timers = new SafeSet();
     const maxEnvelopeBytes = 768 * 1024;
@@ -2601,6 +2657,61 @@ async function webMcpIsolatedAdapter(operation, payload) {
     ]);
 
     try {
+      const registrySymbol = reflectApply(symbolFor, clean.Symbol, ["opencode.webmcp.prepared.v1"]);
+      let registry = globalThis[registrySymbol];
+      if (!(registry instanceof SafeMap)) {
+        registry = new SafeMap();
+        SafeObject.defineProperty(globalThis, registrySymbol, { configurable: false, enumerable: false, value: registry });
+      }
+      const validRegistryConfig = Number.isInteger(payload.registryLimit) && payload.registryLimit > 0
+        && payload.registryLimit <= 16 && Number.isInteger(payload.ttlMs) && payload.ttlMs >= 1_000 && payload.ttlMs <= 60_000;
+      const validToken = typeof payload.token === "string" && /^[0-9a-f-]{36}$/u.test(payload.token);
+      if (["prepare", "commit", "cleanup"].includes(operation) && (!validRegistryConfig || !validToken)) {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP prepared invocation token is invalid", true));
+      }
+      const now = reflectApply(safeDateNow, clean.Date, []);
+      for (const [token, entry] of reflectApply(mapEntries, registry, [])) {
+        if (!entry || entry.expiresAt <= now) {
+          try { safeClearTimeout(entry?.timer); } catch {}
+          reflectApply(mapDelete, registry, [token]);
+        }
+      }
+      if (operation === "cleanup") {
+        const entry = reflectApply(mapGet, registry, [payload.token]);
+        if (entry) try { safeClearTimeout(entry.timer); } catch {}
+        reflectApply(mapDelete, registry, [payload.token]);
+        return serialize({ cleaned: true, ok: true });
+      }
+      if (operation === "commit") {
+        const entry = reflectApply(mapGet, registry, [payload.token]);
+        if (!entry || entry.expiresAt <= now || entry.toolName !== payload.toolName) {
+          return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP prepared invocation expired or was not found", true));
+        }
+        reflectApply(mapDelete, registry, [payload.token]);
+        try { safeClearTimeout(entry.timer); } catch {}
+        const abortSignalGetter = getOwnPropertyDescriptor(SafeAbortController.prototype, "signal")?.get;
+        if (typeof abortSignalGetter !== "function") return unsupported;
+        const signal = reflectApply(abortSignalGetter, controller, []);
+        committed = true;
+        const executionOutcome = await settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
+          () => reflectApply(entry.executeTool, entry.context, [entry.descriptor, payload.inputJson, { signal }])
+        ]));
+        if (executionOutcome.kind === "rejected") {
+          if (executionOutcome.error?.code === "WEBMCP_INVOCATION_UNSUPPORTED") {
+            return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, entry.source, true));
+          }
+          return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, entry.source, true));
+        }
+        let result;
+        try {
+          result = cloneJson(executionOutcome.value, "WebMCP output", 512 * 1024);
+        } catch (error) {
+          const message = SafeString(error?.message || error);
+          return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, entry.source, true));
+        }
+        return serialize({ committed: true, invocation: "executeTool", ok: true, result, source: entry.source,
+          supported: true, toolName: entry.toolName });
+      }
       const documentContext = typeof document === "object" && document ? document.modelContext : null;
       const navigatorContext = typeof navigator === "object" && navigator ? navigator.modelContext : null;
       const context = documentContext && typeof documentContext === "object"
@@ -2664,7 +2775,7 @@ async function webMcpIsolatedAdapter(operation, payload) {
         publicTools[index] = publicTool;
       }
       if (operation === "list") return serialize({ source, supported: true, tools: publicTools });
-      if (operation !== "invoke" || typeof payload.toolName !== "string" || typeof payload.inputJson !== "string") {
+      if (operation !== "prepare" || typeof payload.toolName !== "string") {
         return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation request is invalid", true, source));
       }
       let selected = null;
@@ -2673,37 +2784,22 @@ async function webMcpIsolatedAdapter(operation, payload) {
       }
       if (!selected) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
       const descriptor = selected.descriptor;
-      const inputJson = payload.inputJson;
       const officialExecuteTool = context.executeTool;
       if (typeof officialExecuteTool !== "function") {
         return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
       }
       if (preDispatchAborted) return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP operation was aborted", true, source));
       if (remainingMs() <= 0) return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP admission deadline expired before dispatch", true, source));
-      const abortSignalGetter = getOwnPropertyDescriptor(SafeAbortController.prototype, "signal")?.get;
-      if (typeof abortSignalGetter !== "function") return unsupported;
-      const signal = reflectApply(abortSignalGetter, controller, []);
-      // Commit and native dispatch are one synchronous step. After this point,
-      // cancellation and the admission deadline cannot affect the page tool.
-      committed = true;
-      const execution = settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
-        () => reflectApply(officialExecuteTool, context, [descriptor, inputJson, { signal }])
-      ]));
-      const executionOutcome = await execution;
-      if (executionOutcome.kind === "rejected") {
-        if (executionOutcome.error?.code === "WEBMCP_INVOCATION_UNSUPPORTED") {
-          return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source, true));
-        }
-        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, source, true));
+      if (registry.size >= payload.registryLimit) {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "Too many prepared WebMCP invocations", true, source));
       }
-      let result;
-      try {
-        result = cloneJson(executionOutcome.value, "WebMCP output", 512 * 1024);
-      } catch (error) {
-        const message = SafeString(error?.message || error);
-        return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source, true));
-      }
-      return serialize({ committed: true, invocation: "executeTool", ok: true, result, source, supported: true, toolName: payload.toolName });
+      const expiresAt = now + payload.ttlMs;
+      const timer = safeSetTimeout(() => { reflectApply(mapDelete, registry, [payload.token]); }, payload.ttlMs);
+      try { timer?.unref?.(); } catch {}
+      reflectApply(mapSet, registry, [payload.token, {
+        context, descriptor, executeTool: officialExecuteTool, expiresAt, source, timer, toolName: payload.toolName
+      }]);
+      return serialize({ prepared: true, source, supported: true, tool: selected.publicTool, toolName: payload.toolName });
     } catch (error) {
       const message = safeMessage(error?.message || error);
       if (operation === "list") return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
@@ -4254,7 +4350,7 @@ async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal, 
     }
   }, async () => {
     if (navigationBarriers.get(tabId) === barrier) navigationBarriers.delete(tabId);
-  });
+  }, signal);
 }
 
 async function drainNavigationBarrier(barrier) {
@@ -4309,7 +4405,7 @@ function setMembership(set, value, present) {
   else set.delete(value);
 }
 
-async function withDebuggerTarget(debugTarget, callback, afterCleanup) {
+async function withDebuggerTarget(debugTarget, callback, afterCleanup, signal) {
   const key = debuggerKey(debugTarget);
   return withDebuggerLock(key, async () => {
     // Persistent attachment state can change while this operation waits for the lock.
@@ -4328,7 +4424,7 @@ async function withDebuggerTarget(debugTarget, callback, afterCleanup) {
       if (shouldDetach) await chrome.debugger.detach(debugTarget).catch(() => {});
       await afterCleanup?.();
     }
-  });
+  }, signal);
 }
 
 function debuggerKey(debugTarget) {
@@ -4342,18 +4438,29 @@ function isPersistentDebuggerAttached(tabId) {
   return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId) || networkTrackerAttached.has(tabId);
 }
 
-async function withDebuggerLock(key, callback) {
+async function withDebuggerLock(key, callback, signal) {
   const prev = debuggerQueue.get(key) ?? Promise.resolve();
   let resolveLock;
   const lock = new Promise((resolve) => { resolveLock = resolve; });
   debuggerQueue.set(key, lock);
 
-  await prev;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    resolveLock();
+    if (debuggerQueue.get(key) === lock) debuggerQueue.delete(key);
+  };
+  try {
+    await abortableChromeOperation(prev, signal);
+  } catch (error) {
+    Promise.resolve(prev).finally(release);
+    throw error;
+  }
   try {
     return await callback();
   } finally {
-    resolveLock();
-    if (debuggerQueue.get(key) === lock) debuggerQueue.delete(key);
+    release();
   }
 }
 
