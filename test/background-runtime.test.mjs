@@ -4527,7 +4527,119 @@ test("workflow final origin unions are bounded before collection writes or recor
   assert.equal(stored.opencodeWorkflowRecording.pendingStep, null);
 });
 
+test("schedule recurrence uses local calendar boundaries without monthly, annual, or DST drift", async () => {
+  const harness = createBackgroundHarness();
+  const parts = (timestamp) => {
+    const value = new Date(timestamp);
+    return [value.getFullYear(), value.getMonth() + 1, value.getDate(), value.getHours(), value.getMinutes()];
+  };
+  const daily = { kind: "daily", hour: 2, minute: 30 };
+  const dstRun = harness.nextScheduleRun(daily, new Date(2026, 2, 28, 3, 0).getTime());
+  assert.deepEqual(parts(dstRun), [2026, 3, 29, 3, 30]);
+  assert.deepEqual(parts(harness.nextScheduleRun(daily, dstRun)), [2026, 3, 30, 2, 30]);
+
+  const monthly = { kind: "monthly", day: 31, hour: 10, minute: 0 };
+  const february = harness.nextScheduleRun(monthly, new Date(2027, 0, 31, 10, 0).getTime());
+  assert.deepEqual(parts(february), [2027, 2, 28, 10, 0]);
+  assert.deepEqual(parts(harness.nextScheduleRun(monthly, february)), [2027, 3, 31, 10, 0]);
+
+  const leap = { kind: "annual", month: 2, day: 29, hour: 8, minute: 15 };
+  assert.deepEqual(parts(harness.nextScheduleRun(leap, new Date(2026, 1, 28, 8, 15).getTime())), [2027, 2, 28, 8, 15]);
+  assert.deepEqual(parts(harness.nextScheduleRun(leap, new Date(2027, 1, 28, 8, 15).getTime())), [2028, 2, 29, 8, 15]);
+});
+
+test("schedules create named alarms, restore them, and deduplicate one occurrence", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 1, id: "workflow-1", name: "Workflow", shortcut: "workflow",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; }
+  });
+  const schedule = await harness.execute("scheduleCreate", {
+    enabled: true, name: "Daily workflow", notify: "success",
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    requiredOrigins: ["https://example.com"], unattendedApproved: true, workflowId: "workflow-1"
+  });
+  assert.match(harness.calls.alarmsCreate[0].name, /^opencode-workflow-schedule:/u);
+  assert.equal(harness.calls.alarmsCreate[0].info.when, schedule.nextRunAt);
+
+  stored.opencodeSchedules.schedules[0].lastScheduledFor = schedule.nextRunAt;
+  harness.calls.alarmsCreate.length = 0;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(harness.calls.alarmsCreate.length, 1);
+  assert.ok(harness.calls.alarmsCreate[0].info.when > schedule.nextRunAt);
+  const restored = (await harness.execute("scheduleList"))[0];
+  assert.equal(restored.nextRunAt, harness.calls.alarmsCreate[0].info.when);
+  assert.equal(restored.historyCount, 0);
+  stored.opencodeSchedules.schedules[0].lastScheduledFor = null;
+  stored.opencodeSchedules.schedules[0].nextRunAt = schedule.nextRunAt;
+  await harness.events.alarmsOnAlarm.emit({
+    name: `opencode-workflow-schedule:${schedule.id}`,
+    scheduledTime: schedule.nextRunAt - 60_000
+  });
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 0);
+  const alarm = { name: `opencode-workflow-schedule:${schedule.id}`, scheduledTime: schedule.nextRunAt };
+  await Promise.all([harness.events.alarmsOnAlarm.emit(alarm), harness.events.alarmsOnAlarm.emit(alarm)]);
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].ok, true);
+  assert.equal(harness.calls.notifications.length, 1);
+});
+
+test("scheduled execution fails closed and sanitizes bounded history and notifications", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 1, id: "workflow-locked", name: "Workflow", shortcut: "workflow-locked",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  let currentUrl = "https://example.com/app";
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => {
+      if (currentUrl === "throw") throw new Error("locked https://private.example/?token=top-secret");
+      return { active: true, id: tabId, url: currentUrl, windowId: 1 };
+    }
+  });
+  const schedule = await harness.execute("scheduleCreate", {
+    enabled: true, name: "Locked workflow", notify: "failure",
+    recurrence: { kind: "weekly", weekday: 1, hour: 8, minute: 0 },
+    requiredOrigins: ["https://example.com"], unattendedApproved: true, workflowId: "workflow-locked"
+  });
+
+  stored.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  stored.opencodeWorkflows.workflows[0].steps = [{ method: "getTab", params: { tabId: 7 } }];
+  currentUrl = "https://changed.example/app";
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  currentUrl = "chrome://settings";
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  currentUrl = "throw";
+  for (let index = 0; index < 55; index += 1) {
+    assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  }
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 50);
+  assert.equal(JSON.stringify(history).includes("top-secret"), false);
+  assert.equal(JSON.stringify(history).includes("private.example"), false);
+  assert.ok(harness.calls.notifications.length >= 1);
+
+  stored.opencodeSchedules.schedules[0].unattendedApproved = false;
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  stored.opencodeSchedules.schedules[0].unattendedApproved = true;
+  stored.opencodeWorkflows.workflows = [];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+});
+
 function createBackgroundHarness({
+  alarmsClear = async () => true,
+  alarmsCreate = async () => {},
+  alarmsGetAll = async () => [],
   storageGet = async () => ({}),
   storageSet = async () => {},
   debuggerAttach = async () => {},
@@ -4559,9 +4671,10 @@ function createBackgroundHarness({
   windowsUpdate = async (windowId) => ({ id: windowId }),
   webNavigationGetFrame = async ({ tabId }) => ({ documentId: `document-${tabId}`, frameId: 0 })
 } = {}) {
-  const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], notifications: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { alarmsClear: [], alarmsCreate: [], debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], notifications: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
+    alarmsOnAlarm: createEvent(),
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent((args) => {
       if (!fillNetworkProvenance || args[1] !== "Network.requestWillBeSent") return args;
@@ -4575,6 +4688,7 @@ function createBackgroundHarness({
     nativeOnDisconnect: createEvent(),
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
+    runtimeOnStartup: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnActivated: createEvent(),
     tabsOnReplaced: createEvent(),
@@ -4602,9 +4716,10 @@ function createBackgroundHarness({
   if (storageManagedGet) storage.managed = { get: storageManagedGet };
   const chrome = {
     alarms: {
-      clear: async () => true,
-      create: async () => {},
-      onAlarm: createEvent()
+      clear: async (name) => { calls.alarmsClear.push(name); return alarmsClear(name); },
+      create: async (name, info) => { calls.alarmsCreate.push({ name, info }); return alarmsCreate(name, info); },
+      getAll: alarmsGetAll,
+      onAlarm: events.alarmsOnAlarm
     },
     bookmarks: { search: async () => [] },
     debugger: {
@@ -4649,7 +4764,7 @@ function createBackgroundHarness({
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,
-      onStartup: createEvent()
+      onStartup: events.runtimeOnStartup
     },
     scripting: {
       executeScript: async (injection) => {
@@ -4774,6 +4889,11 @@ function createBackgroundHarness({
       context.__testParams = params;
       context.__testOptions = options;
       return vm.runInContext("executeCommand(__testMethod, __testParams, __testOptions)", context);
+    },
+    nextScheduleRun(recurrence, afterMs) {
+      context.__testRecurrence = recurrence;
+      context.__testAfterMs = afterMs;
+      return vm.runInContext("nextScheduleRunAt(__testRecurrence, __testAfterMs)", context);
     },
     reloadTabLeases() {
       return vm.runInContext(

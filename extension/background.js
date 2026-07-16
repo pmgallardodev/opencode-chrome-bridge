@@ -17,6 +17,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.network",
   "browser.notifications",
   "browser.page-context",
+  "browser.schedules",
   "browser.screenshots",
   "browser.tab-groups",
   "browser.tabs",
@@ -111,6 +112,12 @@ const MAX_WORKFLOW_NAME_CHARS = 120;
 const MAX_WORKFLOW_SHORTCUT_CHARS = 80;
 const DEFAULT_WORKFLOW_STEP_TIMEOUT_MS = 10_000;
 const DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS = 60_000;
+const SCHEDULE_SCHEMA_VERSION = 1;
+const SCHEDULE_STORAGE_KEY = "opencodeSchedules";
+const SCHEDULE_ALARM_PREFIX = "opencode-workflow-schedule:";
+const MAX_SCHEDULES = 100;
+const MAX_SCHEDULE_HISTORY = 50;
+const MAX_SCHEDULE_STORAGE_BYTES = 500_000;
 const WORKFLOW_STEP_METHODS = Object.freeze({
   activateTab: { capability: ["browser.tabs", "browser.windows"], type: "activateTab" },
   back: { capability: ["browser.navigation", "browser.tabs"], type: "back" },
@@ -126,7 +133,8 @@ const WORKFLOW_STEP_METHODS = Object.freeze({
 });
 const WORKFLOW_CONTROL_METHODS = new Set([
   "workflowStartRecording", "workflowStopRecording", "workflowCancelRecording",
-  "workflowList", "workflowGet", "workflowImport", "workflowDelete", "workflowRun"
+  "workflowList", "workflowGet", "workflowImport", "workflowDelete", "workflowRun",
+  "scheduleCreate", "scheduleList", "scheduleUpdate", "scheduleDelete", "scheduleRunNow", "scheduleHistory"
 ]);
 const BATCH_ACTION_METHODS = Object.freeze({
   activateTab: "activateTab",
@@ -210,11 +218,31 @@ const tabLeases = new Map();
 const uploadTransfers = new Map();
 let workflowMutationQueue = Promise.resolve();
 let workflowRecordingFault = null;
+let scheduleMutationQueue = Promise.resolve();
 
-chrome.runtime.onInstalled.addListener(connectNativeHost);
-chrome.runtime.onStartup.addListener(connectNativeHost);
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) connectNativeHost();
+chrome.runtime.onInstalled.addListener(async () => {
+  connectNativeHost();
+  await restoreScheduleAlarms();
+});
+chrome.runtime.onStartup.addListener(async () => {
+  connectNativeHost();
+  await restoreScheduleAlarms();
+});
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === RECONNECT_ALARM) {
+    connectNativeHost();
+    return;
+  }
+  if (typeof alarm?.name === "string" && alarm.name.startsWith(SCHEDULE_ALARM_PREFIX)) {
+    try {
+      await executeSchedule(alarm.name.slice(SCHEDULE_ALARM_PREFIX.length), {
+        scheduledTime: alarm.scheduledTime,
+        trigger: "alarm"
+      });
+    } catch (error) {
+      sendEvent({ category: "scheduler", type: "alarmFailed", error: sanitizeScheduleError(error) });
+    }
+  }
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
@@ -675,6 +703,18 @@ async function executeCommandCore(method, params, options = {}) {
       return deleteWorkflow(params);
     case "workflowRun":
       return runWorkflow(params, options);
+    case "scheduleCreate":
+      return createSchedule(params);
+    case "scheduleList":
+      return listSchedules();
+    case "scheduleUpdate":
+      return updateSchedule(params);
+    case "scheduleDelete":
+      return deleteSchedule(params);
+    case "scheduleRunNow":
+      return runScheduleNow(params);
+    case "scheduleHistory":
+      return scheduleHistory(params);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
@@ -1249,6 +1289,372 @@ function requireWorkflowTimestamp(value, label) {
 
 function cloneWorkflowValue(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function queueScheduleMutation(operation) {
+  const next = scheduleMutationQueue.then(operation, operation);
+  scheduleMutationQueue = next.catch(() => {});
+  return next;
+}
+
+async function createSchedule(params) {
+  return queueScheduleMutation(async () => {
+    assertScheduleFields(params, ["enabled", "name", "notify", "recurrence", "requiredOrigins", "unattendedApproved", "workflowId"], "schedule create");
+    if (params.unattendedApproved !== true) throw new Error("Schedule creation requires explicit unattendedApproved: true");
+    const workflow = await scheduledWorkflowSnapshot(params.workflowId);
+    const requiredOrigins = normalizeScheduleOrigins(params.requiredOrigins);
+    assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+    const now = new Date().toISOString();
+    const schedule = validateSchedule({
+      schemaVersion: SCHEDULE_SCHEMA_VERSION,
+      id: crypto.randomUUID(),
+      name: requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "schedule name"),
+      workflowId: workflow.id,
+      requiredCapabilities: workflow.requiredCapabilities,
+      requiredOrigins,
+      unattendedApproved: true,
+      enabled: params.enabled !== false,
+      notify: validateScheduleNotify(params.notify ?? "none"),
+      recurrence: validateScheduleRecurrence(params.recurrence),
+      nextRunAt: 0,
+      lastScheduledFor: null,
+      history: [],
+      createdAt: now,
+      updatedAt: now
+    });
+    schedule.nextRunAt = nextScheduleRunAt(schedule.recurrence, Date.now());
+    const collection = await loadScheduleCollection();
+    if (collection.schedules.length >= MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
+    await saveScheduleCollection({ schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: [...collection.schedules, schedule] });
+    await armScheduleAlarm(schedule);
+    return schedule;
+  });
+}
+
+async function listSchedules() {
+  const { schedules } = await loadScheduleCollection();
+  return schedules.map(({ history, ...schedule }) => ({ ...schedule, historyCount: history.length }));
+}
+
+async function scheduleHistory(params) {
+  const schedule = resolveSchedule(await loadScheduleCollection(), params);
+  return schedule.history;
+}
+
+async function updateSchedule(params) {
+  return queueScheduleMutation(async () => {
+    assertScheduleFields(params, ["enabled", "id", "name", "notify", "recurrence", "requiredOrigins", "unattendedApproved"], "schedule update");
+    const collection = await loadScheduleCollection();
+    const existing = resolveSchedule(collection, { id: params.id });
+    const workflow = await scheduledWorkflowSnapshot(existing.workflowId);
+    const requiredOrigins = params.requiredOrigins == null ? existing.requiredOrigins : normalizeScheduleOrigins(params.requiredOrigins);
+    assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+    const recurrence = params.recurrence == null ? existing.recurrence : validateScheduleRecurrence(params.recurrence);
+    const updated = validateSchedule({
+      ...existing,
+      enabled: params.enabled ?? existing.enabled,
+      name: params.name == null ? existing.name : requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "schedule name"),
+      notify: params.notify == null ? existing.notify : validateScheduleNotify(params.notify),
+      recurrence,
+      requiredCapabilities: workflow.requiredCapabilities,
+      requiredOrigins,
+      unattendedApproved: params.unattendedApproved ?? existing.unattendedApproved,
+      nextRunAt: nextScheduleRunAt(recurrence, Date.now()),
+      updatedAt: new Date().toISOString()
+    });
+    await saveScheduleCollection({
+      schemaVersion: SCHEDULE_SCHEMA_VERSION,
+      schedules: collection.schedules.map((entry) => entry.id === updated.id ? updated : entry)
+    });
+    await armScheduleAlarm(updated);
+    return updated;
+  });
+}
+
+async function deleteSchedule(params) {
+  return queueScheduleMutation(async () => {
+    const collection = await loadScheduleCollection();
+    const schedule = resolveSchedule(collection, params);
+    await saveScheduleCollection({
+      schemaVersion: SCHEDULE_SCHEMA_VERSION,
+      schedules: collection.schedules.filter((entry) => entry.id !== schedule.id)
+    });
+    await chrome.alarms.clear(scheduleAlarmName(schedule.id));
+    return { deleted: true, id: schedule.id };
+  });
+}
+
+function runScheduleNow(params) {
+  if (!isRecord(params) || Object.keys(params).some((field) => field !== "id")) {
+    throw new Error("scheduleRunNow requires exactly one id");
+  }
+  return executeSchedule(requireBoundedWorkflowString(params.id, 100, "schedule id"), { trigger: "manual" });
+}
+
+function executeSchedule(id, { scheduledTime, trigger }) {
+  return queueScheduleMutation(async () => {
+    const collection = await loadScheduleCollection();
+    const schedule = resolveSchedule(collection, { id });
+    const occurrence = trigger === "alarm"
+      ? (Number.isFinite(scheduledTime) ? Math.trunc(scheduledTime) : schedule.nextRunAt)
+      : null;
+    if (trigger === "alarm" && occurrence !== schedule.nextRunAt) {
+      return { stale: true, ok: false, scheduleId: schedule.id };
+    }
+    if (trigger === "alarm" && schedule.lastScheduledFor === occurrence) {
+      return { duplicate: true, ok: false, scheduleId: schedule.id };
+    }
+    let claimed = schedule;
+    if (trigger === "alarm") {
+      claimed = { ...schedule, lastScheduledFor: occurrence, updatedAt: new Date().toISOString() };
+      await replaceSchedule(collection, claimed);
+    }
+    const startedAt = new Date().toISOString();
+    let ok = false;
+    let error;
+    try {
+      if (claimed.unattendedApproved !== true) throw new Error("Explicit unattended approval is missing");
+      if (trigger === "alarm" && claimed.enabled !== true) throw new Error("Schedule is disabled");
+      const workflow = await scheduledWorkflowSnapshot(claimed.workflowId);
+      assertSameStringSet(claimed.requiredCapabilities, workflow.requiredCapabilities, "Workflow capability requirements changed");
+      assertSameStringSet(claimed.requiredOrigins, workflow.requiredOrigins, "Workflow origin requirements changed");
+      const result = await runWorkflow({
+        id: workflow.id,
+        expectedOrigins: claimed.requiredOrigins,
+        totalTimeoutMs: DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS
+      }, { workflowExpectedScopes: claimed.requiredOrigins.map((origin) => canonicalPermissionScope(`${origin}/`)), workflowInternal: true });
+      if (result.ok !== true) throw new Error(result.results?.find((entry) => entry.ok === false)?.error ?? "Workflow execution failed");
+      ok = true;
+    } catch (executionError) {
+      error = sanitizeScheduleError(executionError);
+    }
+    const entry = {
+      id: crypto.randomUUID(),
+      finishedAt: new Date().toISOString(),
+      ok,
+      startedAt,
+      trigger,
+      ...(error ? { error } : {})
+    };
+    const latest = resolveSchedule(await loadScheduleCollection(), { id: claimed.id });
+    const nextRunAt = trigger === "alarm"
+      ? nextScheduleRunAt(latest.recurrence, Math.max(occurrence, Date.now()))
+      : latest.nextRunAt;
+    const updated = {
+      ...latest,
+      history: [...latest.history, entry].slice(-MAX_SCHEDULE_HISTORY),
+      nextRunAt,
+      updatedAt: new Date().toISOString()
+    };
+    const latestCollection = await loadScheduleCollection();
+    await replaceSchedule(latestCollection, updated);
+    if (trigger === "alarm") await armScheduleAlarm(updated);
+    await notifyScheduleResult(updated, entry);
+    return { ...entry, scheduleId: updated.id };
+  });
+}
+
+async function scheduledWorkflowSnapshot(workflowId) {
+  const id = requireBoundedWorkflowString(workflowId, 100, "workflow id");
+  const collection = await loadWorkflowCollection();
+  const workflow = collection.workflows.find((entry) => entry.id === id);
+  if (!workflow) throw new Error(`Scheduled workflow ${id} was not found`);
+  const hydrated = await validateWorkflowSchema(workflow, { hydrateOrigins: true });
+  const missing = hydrated.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
+  if (missing.length > 0) throw new Error(`Scheduled workflow capabilities are unavailable: ${missing.join(", ")}`);
+  return hydrated;
+}
+
+async function replaceSchedule(collection, schedule) {
+  await saveScheduleCollection({
+    schemaVersion: SCHEDULE_SCHEMA_VERSION,
+    schedules: collection.schedules.map((entry) => entry.id === schedule.id ? schedule : entry)
+  });
+}
+
+async function restoreScheduleAlarms() {
+  try {
+    await queueScheduleMutation(async () => {
+      const collection = await loadScheduleCollection();
+      let recovered = false;
+      const schedules = collection.schedules.map((schedule) => {
+        if (schedule.lastScheduledFor !== schedule.nextRunAt) return schedule;
+        recovered = true;
+        return {
+          ...schedule,
+          nextRunAt: nextScheduleRunAt(schedule.recurrence, Math.max(schedule.nextRunAt, Date.now())),
+          updatedAt: new Date().toISOString()
+        };
+      });
+      if (recovered) await saveScheduleCollection({ schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules });
+      for (const schedule of schedules) await armScheduleAlarm(schedule);
+    });
+  } catch (error) {
+    sendEvent({ category: "scheduler", type: "restoreFailed", error: sanitizeScheduleError(error) });
+  }
+}
+
+async function armScheduleAlarm(schedule) {
+  const name = scheduleAlarmName(schedule.id);
+  await chrome.alarms.clear(name);
+  if (schedule.enabled !== true || schedule.unattendedApproved !== true) return;
+  await chrome.alarms.create(name, { when: schedule.nextRunAt });
+}
+
+function scheduleAlarmName(id) {
+  return `${SCHEDULE_ALARM_PREFIX}${id}`;
+}
+
+async function loadScheduleCollection() {
+  let stored;
+  try { stored = await chrome.storage.local.get(SCHEDULE_STORAGE_KEY); }
+  catch (error) { throw new Error(`Could not read schedule storage: ${error?.message ?? String(error)}`); }
+  const raw = stored?.[SCHEDULE_STORAGE_KEY];
+  if (raw == null) return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: [] };
+  if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_SCHEDULE_STORAGE_BYTES) throw new Error("Schedule storage payload is too large");
+  if (!isRecord(raw)
+    || Object.keys(raw).some((field) => !["schemaVersion", "schedules"].includes(field))
+    || raw.schemaVersion !== SCHEDULE_SCHEMA_VERSION
+    || !Array.isArray(raw.schedules)
+    || raw.schedules.length > MAX_SCHEDULES) throw new Error("Persisted schedule collection schema is invalid");
+  const schedules = raw.schedules.map(validateSchedule);
+  if (new Set(schedules.map((entry) => entry.id)).size !== schedules.length) throw new Error("Schedule ids must be unique");
+  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules };
+}
+
+async function saveScheduleCollection(collection) {
+  if (!isRecord(collection) || collection.schemaVersion !== SCHEDULE_SCHEMA_VERSION || !Array.isArray(collection.schedules)) {
+    throw new Error("Schedule collection is invalid");
+  }
+  const validated = { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: collection.schedules.map(validateSchedule) };
+  if (validated.schedules.length > MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
+  const serialized = JSON.stringify(validated);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_SCHEDULE_STORAGE_BYTES) throw new Error("Schedule storage payload is too large");
+  try { await chrome.storage.local.set({ [SCHEDULE_STORAGE_KEY]: validated }); }
+  catch (error) { throw new Error(`Could not write schedule storage: ${error?.message ?? String(error)}`); }
+}
+
+function validateSchedule(value) {
+  if (!isRecord(value) || value.schemaVersion !== SCHEDULE_SCHEMA_VERSION) throw new Error("Schedule schemaVersion is unsupported");
+  const allowed = ["schemaVersion", "id", "name", "workflowId", "requiredCapabilities", "requiredOrigins", "unattendedApproved", "enabled", "notify", "recurrence", "nextRunAt", "lastScheduledFor", "history", "createdAt", "updatedAt"];
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Schedule contains unsupported fields: ${extra.join(", ")}`);
+  const id = requireBoundedWorkflowString(value.id, 100, "schedule id");
+  const name = requireBoundedWorkflowString(value.name, MAX_WORKFLOW_NAME_CHARS, "schedule name");
+  const workflowId = requireBoundedWorkflowString(value.workflowId, 100, "workflow id");
+  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > 100
+    || value.requiredCapabilities.some((entry) => typeof entry !== "string" || !/^[a-z][a-z0-9.-]{0,99}$/u.test(entry))) {
+    throw new Error("Schedule requiredCapabilities are invalid");
+  }
+  const requiredCapabilities = [...new Set(value.requiredCapabilities)].sort();
+  const requiredOrigins = normalizeScheduleOrigins(value.requiredOrigins);
+  if (typeof value.unattendedApproved !== "boolean" || typeof value.enabled !== "boolean") throw new Error("Schedule approval and enabled flags must be booleans");
+  const notify = validateScheduleNotify(value.notify);
+  const recurrence = validateScheduleRecurrence(value.recurrence);
+  if (!Number.isSafeInteger(value.nextRunAt) || value.nextRunAt < 0) throw new Error("Schedule nextRunAt is invalid");
+  if (value.lastScheduledFor !== null && (!Number.isSafeInteger(value.lastScheduledFor) || value.lastScheduledFor < 0)) throw new Error("Schedule lastScheduledFor is invalid");
+  if (!Array.isArray(value.history) || value.history.length > MAX_SCHEDULE_HISTORY) throw new Error("Schedule history is invalid");
+  const history = value.history.map(validateScheduleHistoryEntry);
+  const createdAt = requireWorkflowTimestamp(value.createdAt, "schedule createdAt");
+  const updatedAt = requireWorkflowTimestamp(value.updatedAt, "schedule updatedAt");
+  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, id, name, workflowId, requiredCapabilities, requiredOrigins, unattendedApproved: value.unattendedApproved, enabled: value.enabled, notify, recurrence, nextRunAt: value.nextRunAt, lastScheduledFor: value.lastScheduledFor, history, createdAt, updatedAt };
+}
+
+function validateScheduleHistoryEntry(value) {
+  if (!isRecord(value) || Object.keys(value).some((field) => !["id", "startedAt", "finishedAt", "trigger", "ok", "error"].includes(field))) {
+    throw new Error("Schedule history entry is invalid");
+  }
+  const id = requireBoundedWorkflowString(value.id, 100, "schedule history id");
+  const startedAt = requireWorkflowTimestamp(value.startedAt, "schedule history startedAt");
+  const finishedAt = requireWorkflowTimestamp(value.finishedAt, "schedule history finishedAt");
+  if (!['alarm', 'manual'].includes(value.trigger) || typeof value.ok !== "boolean") throw new Error("Schedule history status is invalid");
+  const error = value.error == null ? undefined : sanitizeScheduleError(value.error);
+  return { id, startedAt, finishedAt, trigger: value.trigger, ok: value.ok, ...(error ? { error } : {}) };
+}
+
+function validateScheduleRecurrence(value) {
+  if (!isRecord(value) || !["daily", "weekly", "monthly", "annual"].includes(value.kind)) throw new Error("Schedule recurrence kind is invalid");
+  const allowed = { daily: ["kind", "hour", "minute"], weekly: ["kind", "weekday", "hour", "minute"], monthly: ["kind", "day", "hour", "minute"], annual: ["kind", "month", "day", "hour", "minute"] }[value.kind];
+  if (Object.keys(value).some((field) => !allowed.includes(field))) throw new Error("Schedule recurrence contains unsupported fields");
+  if (!Number.isInteger(value.hour) || value.hour < 0 || value.hour > 23 || !Number.isInteger(value.minute) || value.minute < 0 || value.minute > 59) throw new Error("Schedule local time is invalid");
+  if (value.kind === "weekly" && (!Number.isInteger(value.weekday) || value.weekday < 0 || value.weekday > 6)) throw new Error("Schedule weekday is invalid");
+  if (["monthly", "annual"].includes(value.kind) && (!Number.isInteger(value.day) || value.day < 1 || value.day > 31)) throw new Error("Schedule day is invalid");
+  if (value.kind === "annual" && (!Number.isInteger(value.month) || value.month < 1 || value.month > 12)) throw new Error("Schedule month is invalid");
+  return { ...value };
+}
+
+function nextScheduleRunAt(rawRecurrence, afterMs) {
+  const recurrence = validateScheduleRecurrence(rawRecurrence);
+  if (!Number.isFinite(afterMs)) throw new Error("Schedule recurrence baseline is invalid");
+  const after = new Date(afterMs);
+  const candidateFor = (year, month, day) => {
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    return new Date(year, month, Math.min(day, lastDay), recurrence.hour, recurrence.minute, 0, 0).getTime();
+  };
+  if (recurrence.kind === "daily" || recurrence.kind === "weekly") {
+    for (let offset = 0; offset <= 370; offset += 1) {
+      const date = new Date(after.getFullYear(), after.getMonth(), after.getDate() + offset);
+      if (recurrence.kind === "weekly" && date.getDay() !== recurrence.weekday) continue;
+      const candidate = candidateFor(date.getFullYear(), date.getMonth(), date.getDate());
+      if (candidate > afterMs) return candidate;
+    }
+  } else if (recurrence.kind === "monthly") {
+    for (let offset = 0; offset <= 24; offset += 1) {
+      const month = new Date(after.getFullYear(), after.getMonth() + offset, 1);
+      const candidate = candidateFor(month.getFullYear(), month.getMonth(), recurrence.day);
+      if (candidate > afterMs) return candidate;
+    }
+  } else {
+    for (let offset = 0; offset <= 200; offset += 1) {
+      const candidate = candidateFor(after.getFullYear() + offset, recurrence.month - 1, recurrence.day);
+      if (candidate > afterMs) return candidate;
+    }
+  }
+  throw new Error("Could not compute the next schedule occurrence");
+}
+
+function normalizeScheduleOrigins(value) {
+  if (!Array.isArray(value) || value.length > MAX_WORKFLOW_ORIGINS) throw new Error("Schedule requiredOrigins are invalid");
+  return [...new Set(value.map(workflowOrigin))].sort();
+}
+
+function validateScheduleNotify(value) {
+  if (!["none", "success", "failure", "always"].includes(value)) throw new Error("Schedule notify must be none, success, failure, or always");
+  return value;
+}
+
+function assertSameStringSet(left, right, message) {
+  if (JSON.stringify([...new Set(left)].sort()) !== JSON.stringify([...new Set(right)].sort())) throw new Error(message);
+}
+
+function assertScheduleFields(value, allowed, label) {
+  if (!isRecord(value)) throw new Error(`${label} params must be an object`);
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`${label} contains unsupported fields: ${extra.join(", ")}`);
+}
+
+function resolveSchedule(collection, params) {
+  if (!isRecord(params) || Object.keys(params).some((field) => field !== "id")) throw new Error("Select exactly one schedule by id");
+  const id = requireBoundedWorkflowString(params.id, 100, "schedule id");
+  const schedule = collection.schedules.find((entry) => entry.id === id);
+  if (!schedule) throw new Error(`Schedule ${id} was not found`);
+  return schedule;
+}
+
+function sanitizeScheduleError(error) {
+  const raw = typeof error === "string" ? error : error?.message ?? String(error);
+  return truncateString(raw, 500)
+    .replace(/https?:\/\/[^\s]+/giu, "[redacted-url]")
+    .replace(/(?:token|secret|password|authorization|cookie)\s*[=:]\s*[^\s,;]+/giu, "$1=[redacted]")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .trim();
+}
+
+async function notifyScheduleResult(schedule, entry) {
+  if (schedule.notify === "none" || (entry.ok && schedule.notify === "failure") || (!entry.ok && schedule.notify === "success")) return;
+  const title = entry.ok ? "OpenCode schedule completed" : "OpenCode schedule failed";
+  const message = entry.ok ? `${schedule.name} completed.` : `${schedule.name} failed. Open schedule history for details.`;
+  await createNotification({ title, message }).catch(() => {});
 }
 
 async function executeScopedPageCommand(envelope, options) {

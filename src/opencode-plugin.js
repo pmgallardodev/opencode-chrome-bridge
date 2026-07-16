@@ -122,6 +122,12 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_release_debuggers: capabilities("browser.cdp"),
   chrome_reload: capabilities("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_schedule_create: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedule_delete: capabilities("browser.schedules"),
+  chrome_schedule_history: capabilities("browser.schedules"),
+  chrome_schedule_run_now: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedule_update: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedules: capabilities("browser.schedules"),
   chrome_screenshot: capabilities("browser.screenshots", "browser.tabs", "browser.windows"),
   chrome_screenshot_region: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows"),
   chrome_scroll: capabilities("browser.cdp", "browser.tabs"),
@@ -325,6 +331,21 @@ export default async function OpenCodeChromeBridgePlugin() {
     id: schema.string().min(1).max(100).optional().describe("Workflow id. Use exactly one selector."),
     name: schema.string().min(1).max(120).optional().describe("Workflow name. Use exactly one selector."),
     shortcut: schema.string().min(1).max(80).optional().describe("Normalized workflow shortcut. Use exactly one selector.")
+  };
+  const scheduleRecurrence = schema.discriminatedUnion("kind", [
+    schema.strictObject({ kind: schema.literal("daily"), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("weekly"), weekday: schema.number().int().min(0).max(6), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("monthly"), day: schema.number().int().min(1).max(31), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("annual"), month: schema.number().int().min(1).max(12), day: schema.number().int().min(1).max(31), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) })
+  ]);
+  const scheduleCreateArgs = {
+    name: schema.string().min(1).max(120),
+    workflowId: schema.string().min(1).max(100),
+    recurrence: scheduleRecurrence,
+    requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
+    unattendedApproved: schema.literal(true).describe("Explicitly approve unattended execution for exactly these persisted origins."),
+    enabled: schema.boolean().default(true),
+    notify: schema.enum(["none", "success", "failure", "always"]).default("none")
   };
 
   return {
@@ -1278,6 +1299,56 @@ export default async function OpenCodeChromeBridgePlugin() {
             signal: context.abort,
             timeoutMs: Math.min(126000, (args.totalTimeoutMs ?? 60000) + 5000)
           }), null, 2);
+        }
+      }),
+      chrome_schedule_create: tool({
+        description: "Create a bounded local-calendar schedule for one workflow using explicit persistent unattended origin grants.",
+        args: scheduleCreateArgs,
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleCreate", args), null, 2);
+        }
+      }),
+      chrome_schedules: tool({
+        description: "List persisted workflow schedules without execution history bodies.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("scheduleList"), null, 2);
+        }
+      }),
+      chrome_schedule_update: tool({
+        description: "Update one workflow schedule and recompute its next local-calendar occurrence.",
+        args: {
+          id: schema.string().min(1).max(100),
+          name: schema.string().min(1).max(120).optional(),
+          recurrence: scheduleRecurrence.optional(),
+          requiredOrigins: schema.array(schema.string().url().max(2000)).max(100).optional(),
+          unattendedApproved: schema.boolean().optional(),
+          enabled: schema.boolean().optional(),
+          notify: schema.enum(["none", "success", "failure", "always"]).optional()
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleUpdate", args), null, 2);
+        }
+      }),
+      chrome_schedule_delete: tool({
+        description: "Delete one persisted workflow schedule and its named Chrome alarm.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleDelete", args), null, 2);
+        }
+      }),
+      chrome_schedule_run_now: tool({
+        description: "Run one schedule now through the same unattended fail-closed capability and origin preflight.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleRunNow", args, { timeoutMs: 126000 }), null, 2);
+        }
+      }),
+      chrome_schedule_history: tool({
+        description: "Read the bounded sanitized execution history for one workflow schedule.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleHistory", args), null, 2);
         }
       }),
       chrome_blocked_urls: tool({
