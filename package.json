@@ -18,7 +18,8 @@
     "print:extension-id": "node scripts/print-extension-id.mjs",
     "test": "node --test",
     "verify": "node scripts/verify.mjs",
-    "smoke:native": "node scripts/smoke-native-host.mjs"
+    "smoke:native": "node scripts/smoke-native-host.mjs",
+    "smoke:installed": "node scripts/smoke-installed-stack.mjs"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.17.20"

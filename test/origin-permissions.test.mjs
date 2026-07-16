@@ -147,7 +147,7 @@ test("schedule creation requires a dedicated exact persistent approval after the
   assert.equal(JSON.stringify(asks[1]).includes("lease-a"), false);
 });
 
-test("public E2E journey handshakes then runs context, find, batch, resume, workflow, and schedule preflight", async () => {
+test("mocked public orchestration handshakes then runs context, find, batch, resume, workflow, and schedule preflight", async () => {
   pluginModule.clearPageOriginSessionGrants();
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];

@@ -437,7 +437,9 @@ Workflows are local, typed data rather than arbitrary scripts. The current schem
     }
   ],
   "requiredCapabilities": ["browser.navigation", "browser.tabs"],
-  "requiredOrigins": ["https://example.com:443/dashboard"]
+  "requiredOrigins": ["https://example.com:443/dashboard"],
+  "createdAt": "2026-07-16T12:00:00.000Z",
+  "updatedAt": "2026-07-16T12:00:00.000Z"
 }
 ```
 
@@ -446,6 +448,7 @@ The allowlist contains `activateTab`, `back`, `clickElement`, `findElements`, `f
 meta, sensitive, or unknown operations are rejected. Version-0 data receives only the
 narrow built-in migration; unknown and future schema versions fail closed. Import never
 trusts supplied capability or origin metadata: both sets are recomputed from the steps.
+`createdAt` and `updatedAt` are required ISO 8601 timestamps with an explicit timezone.
 
 Storage is bounded to 100 workflows, 100 steps and 100 origins per workflow, and 500,000
 serialized bytes. Names are limited to 120 characters, shortcuts to 80, each step timeout
@@ -573,6 +576,7 @@ Navigation commands (`chrome_open`, `chrome_open_window`) refuse URLs matching `
 | Run tests | `npm test` | Runs the Node built-in test suite |
 | Verify wiring | `npm run verify` | Checks native host manifest + OpenCode config |
 | Smoke native host | `npm run smoke:native` | Tests that the native host can bind, write state, and round-trip commands and events |
+| Smoke installed stack | `npm run smoke:installed` | Exercises the installed host, extension, managed tab, workflow, and disabled schedule end to end |
 
 ## Project structure
 
@@ -726,6 +730,7 @@ Then reload **OpenCode Chrome Bridge** at `chrome://extensions`, restart OpenCod
 npm run verify
 npm run check:chrome-extension
 npm run smoke:native
+npm run smoke:installed
 ```
 
 The same sequence repairs stale launchers, native-host manifests, or plugin configuration.
@@ -850,6 +855,15 @@ What each command proves:
 - `npm run verify` — OpenCode config and Chrome native-host manifest are wired to this workspace.
 - `npm run check:chrome-extension` — Chrome has loaded this unpacked extension.
 - `npm run smoke:native` — the native host can bind a local bridge, write bridge state, and round-trip commands and events.
+- `npm run smoke:installed` — the real authenticated HTTP bridge, native messaging host,
+  extension worker, managed tab lease, workflow storage, and disabled-schedule lifecycle work
+  together. It creates only a dedicated inactive local-fixture tab and unique records, then
+  deletes the schedule/workflow and finalizes that session in `finally`; existing user tabs are
+  never selected or modified. WebMCP discovery is reported conditionally when Chrome enables it.
+
+Reload the unpacked extension at `chrome://extensions` before `npm run smoke:installed` after
+changing extension code. The command requires a connected, compatible v1.4.0 extension and
+fails before opening its fixture tab when Chrome still runs an older service worker.
 
 For a direct bridge status check:
 

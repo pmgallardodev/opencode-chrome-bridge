@@ -24,4 +24,9 @@ test("workflow public tool schemas are bounded and use id, name, or shortcut sel
     assert.ok(tool.chrome_workflow_get.args[key]);
     assert.ok(tool.chrome_workflow_run.args[key]);
   }
+  const readme = await import("node:fs/promises").then(({ readFile }) => readFile(new URL("../README.md", import.meta.url), "utf8"));
+  const example = JSON.parse(readme.match(/Workflows are local[\s\S]*?```json\n([\s\S]*?)\n```/u)?.[1] ?? "null");
+  assert.equal(tool.chrome_workflow_import.args.workflow.safeParse(example).success, true);
+  assert.equal(tool.chrome_workflow_import.args.workflow.safeParse({ ...example, createdAt: "not-a-date" }).success, false);
+  assert.equal(tool.chrome_workflow_import.args.workflow.safeParse({ ...example, updatedAt: "2026-07-16" }).success, false);
 });

@@ -343,8 +343,8 @@ export default async function OpenCodeChromeBridgePlugin() {
     requiredCapabilities: schema.array(schema.string().min(1).max(100)).max(100),
     requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
     steps: schema.array(workflowStep).min(1).max(100),
-    createdAt: schema.string().min(1).max(100),
-    updatedAt: schema.string().min(1).max(100)
+    createdAt: schema.string().datetime({ offset: true }).max(100),
+    updatedAt: schema.string().datetime({ offset: true }).max(100)
   });
   const workflowSelectorArgs = {
     id: schema.string().min(1).max(100).optional().describe("Workflow id. Use exactly one selector."),

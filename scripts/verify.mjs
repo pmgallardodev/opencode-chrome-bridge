@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { parseJsonc } from "./lib/opencode-config.mjs";
+import { scanTrackedFiles } from "./lib/release-artifact-scan.mjs";
 import {
   createLauncher,
   isSupportedNodeVersion,
@@ -85,13 +86,11 @@ if (!changelog.includes("## v1.4.0 — 2026-07-16")) throw new Error("CHANGELOG 
 if (!security.includes("committed semantics") || !security.includes("irrevocable")) {
   throw new Error("SECURITY must document committed schedule and irrevocable WebMCP semantics");
 }
-const { stdout: trackedOutput } = await execFileAsync("git", ["ls-files"], { cwd: repoRoot, windowsHide: true });
-const forbiddenTracked = trackedOutput.split(/\r?\n/u).filter(Boolean).filter((relativePath) => (
-  /(^|\/)(?:audit-copies?|competitor-extensions?|downloaded-extensions?|credentials?|screenshots?|docs\/superpowers|superpowers)(?:\/|$)/iu.test(relativePath)
-  || /(^|\/)(?:internal[-_ ]?audits?)(?:\/|$)/iu.test(relativePath)
-));
-if (forbiddenTracked.length > 0) {
-  throw new Error(`Forbidden release artifacts are tracked: ${forbiddenTracked.join(", ")}`);
+const { stdout: trackedOutput } = await execFileAsync("git", ["ls-files", "-z"], { cwd: repoRoot, encoding: "buffer", windowsHide: true });
+const trackedPaths = trackedOutput.toString("utf8").split("\0").filter(Boolean);
+const releaseIssues = await scanTrackedFiles({ root: repoRoot, trackedPaths });
+if (releaseIssues.length > 0) {
+  throw new Error(`Release artifact scan failed: ${releaseIssues.map((issue) => `${issue.path}: ${issue.reason}`).join("; ")}`);
 }
 
 const csp = manifest.content_security_policy?.extension_pages;

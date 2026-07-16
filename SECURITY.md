@@ -61,5 +61,10 @@ for status and ordinary bridge commands.
 The bridge has no cloud relay or telemetry. Tokens, workflows, schedules, approval fingerprints,
 and sanitized history remain local. Screenshots, page assets, browser traces, downloaded third-
 party extensions, credentials, internal audit copies, and private `docs/superpowers` material
-must never be committed. Release verification checks the tracked tree for these classes of
-accidental artifact in addition to checking exact component versions.
+must never be committed. Release verification normalizes path separators, case, Unicode, and
+spacing before rejecting `.env` variants, credential/token/key files, screenshots and traces,
+downloaded extension archives/directories, audit copies, and `docs/superpowers` variants. It
+also scans bounded tracked text for private-key blocks, GitHub/OpenAI tokens, AWS access keys,
+and obvious password/token assignments. Only the named adversarial scanner fixture is excluded
+from content scanning; documentation placeholders such as `YOUR_TOKEN_HERE` are recognized as
+non-secret. Sensitive binary/archive names are rejected without attempting to decode them.

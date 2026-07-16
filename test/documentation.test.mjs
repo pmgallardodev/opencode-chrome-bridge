@@ -135,6 +135,7 @@ test("v1.4 documentation covers every new workflow, schedule, and WebMCP contrac
   assert.match(changelog, /workflow|schedule|WebMCP/iu);
   assert.match(security, /unattended[\s\S]*explicit approval/iu);
   assert.match(security, /WebMCP[\s\S]*irrevocable|irrevocable[\s\S]*WebMCP/iu);
+  assert.match(readme, /smoke:installed/iu);
 });
 
 test("release tree excludes internal audits, competitor downloads, credentials, screenshots, and superpowers docs", async () => {
