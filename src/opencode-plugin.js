@@ -1,19 +1,62 @@
 import path from "node:path";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   bridgeCommand,
   bridgeStatus,
   pollEvents,
   requireBridgeCapabilities,
+  withBridgePageScopes,
   writeDataUrlToFile
 } from "./bridge-client.js";
 import {
   materializeContextText,
+  materializePageAssetBundle,
   materializeReadPageArtifacts
 } from "./workspace-artifacts.js";
 
 const capabilities = (...names) => Object.freeze(["bridge.handshake", ...names].sort());
+const MAX_UPLOAD_FILES = 20;
+const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
+const PAGE_ORIGIN_PERMISSION = "browser.origin";
+const MAX_ORIGIN_GRANT_SESSIONS = 100;
+const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
+const pageOriginSessionGrants = new Map();
+
+const DESTINATION_SCOPED_TOOLS = new Set(["chrome_open", "chrome_open_window"]);
+const TAB_SCOPED_TOOLS = new Set([
+  "chrome_accessibility_tree", "chrome_activate_tab", "chrome_back", "chrome_cdp",
+  "chrome_click", "chrome_click_element", "chrome_close_tab", "chrome_dom_content",
+  "chrome_double_click", "chrome_drag", "chrome_evaluate", "chrome_fill_element",
+  "chrome_find", "chrome_forward", "chrome_get_console_logs", "chrome_get_tab",
+  "chrome_hover", "chrome_keypress", "chrome_move", "chrome_network_requests",
+  "chrome_page_assets",
+  "chrome_page_text", "chrome_read_page", "chrome_reload", "chrome_reset_viewport",
+  "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
+  "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
+  "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step", "chrome_cursor_state",
+  "chrome_favicon_badge"
+]);
+const PAGE_SCOPED_TOOLS = new Set([
+  ...DESTINATION_SCOPED_TOOLS,
+  ...TAB_SCOPED_TOOLS,
+  "chrome_batch",
+  "chrome_cdp_targets",
+  "chrome_events",
+  "chrome_tabs"
+]);
+const RETURNED_URL_TOOLS = new Set([
+  "chrome_accessibility_tree", "chrome_activate_tab", "chrome_back", "chrome_dom_content",
+  "chrome_forward", "chrome_get_tab", "chrome_open", "chrome_page_text", "chrome_reload",
+  "chrome_tab_context", "chrome_wait_for"
+]);
+const BATCH_RETURNED_URL_ACTIONS = new Set([
+  "activateTab", "back", "forward", "getTab", "navigate", "reload", "tabContext", "waitFor"
+]);
+const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
+  "Page.getLayoutMetrics", "Runtime.evaluate", "Runtime.getProperties", "Page.navigate"
+]);
 
 const BATCH_ACTION_CAPABILITIES = Object.freeze({
   activateTab: ["browser.tabs", "browser.windows"],
@@ -55,6 +98,7 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_events: capabilities("browser.events"),
   chrome_favicon_badge: capabilities("browser.tabs"),
   chrome_fill_element: capabilities("browser.accessibility", "browser.cdp", "browser.tabs"),
+  chrome_upload_files: capabilities("browser.accessibility", "browser.file-upload", "browser.tabs"),
   chrome_find: capabilities("browser.find", "browser.tabs"),
   chrome_finalize_tabs: capabilities("browser.cdp", "browser.tabs", "session.tab-leases"),
   chrome_forward: capabilities("browser.navigation", "browser.tabs"),
@@ -66,10 +110,14 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_hover: capabilities("browser.cdp", "browser.tabs"),
   chrome_keypress: capabilities("browser.cdp", "browser.tabs"),
   chrome_move: capabilities("browser.cdp", "browser.tabs"),
+  chrome_network_requests: capabilities("browser.cdp", "browser.network", "browser.tabs"),
+  chrome_page_assets: capabilities("browser.assets", "browser.cdp", "browser.tabs"),
+  chrome_notify: capabilities("browser.notifications"),
   chrome_open: capabilities("browser.navigation", "browser.tabs", "session.tab-leases"),
   chrome_open_window: capabilities("browser.navigation", "browser.tabs", "browser.windows", "session.tab-leases"),
   chrome_page_text: capabilities("browser.cdp", "browser.tabs"),
   chrome_read_page: capabilities("browser.accessibility", "browser.page-context", "browser.screenshots", "browser.tabs", "browser.windows"),
+  chrome_resume_session: capabilities("browser.tab-groups", "browser.tabs", "session.resume"),
   chrome_release_debuggers: capabilities("browser.cdp"),
   chrome_reload: capabilities("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
@@ -94,6 +142,9 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
 export const ALL_TOOL_REQUIRED_CAPABILITIES = Object.freeze(
   [...new Set(Object.values(TOOL_CAPABILITY_REQUIREMENTS).flat())].sort()
 );
+export const TOOL_ORIGIN_SCOPE_CLASSIFICATION = Object.freeze(Object.fromEntries(
+  Object.keys(TOOL_CAPABILITY_REQUIREMENTS).map((name) => [name, PAGE_SCOPED_TOOLS.has(name) ? "page" : "browser"])
+));
 
 export default async function OpenCodeChromeBridgePlugin() {
   const { tool } = await loadOpenCodeTool();
@@ -208,7 +259,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "List open Chrome tabs visible to the OpenCode Chrome Bridge extension.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeCommand("listTabs"), null, 2);
+          return JSON.stringify(filterPublicPageMetadata(await bridgeCommand("listTabs")), null, 2);
         }
       }),
       chrome_open: tool({
@@ -313,6 +364,16 @@ export default async function OpenCodeChromeBridgePlugin() {
         },
         async execute(args) {
           return JSON.stringify(await bridgeCommand("finalizeTabs", args), null, 2);
+        }
+      }),
+      chrome_resume_session: tool({
+        description: "Resume live handoff tabs from a managed browser session, clean up stale leases, regroup them, and assign a new turn.",
+        args: {
+          sessionId: schema.string().min(1).max(100).describe("Browser-control session id to resume."),
+          turnId: schema.string().min(1).max(100).describe("New browser-control turn id.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("resumeSession", args), null, 2);
         }
       }),
       chrome_end_turn: tool({
@@ -621,35 +682,67 @@ export default async function OpenCodeChromeBridgePlugin() {
         async execute(args, context) {
           const timeoutMs = args.timeoutMs;
 
-          const clickResult = await bridgeCommand("click", {
-            tabId: args.tabId,
-            x: args.x,
-            y: args.y,
-            button: args.button,
-            modifiers: args.modifiers
-          }, { timeoutMs });
+          let clickResult;
+          let transitionScope;
+          let transitionBinding;
+          try {
+            clickResult = await bridgeCommand("click", {
+              tabId: args.tabId,
+              x: args.x,
+              y: args.y,
+              button: args.button,
+              modifiers: args.modifiers
+            }, { timeoutMs });
+            transitionScope = clickResult?.transition?.pageScope;
+            if (transitionScope && typeof context.authorizePageTransition === "function") {
+              transitionBinding = await context.authorizePageTransition(transitionScope);
+            }
+          } catch (error) {
+            transitionScope = pageScopeFromMismatchError(error);
+            if (!transitionScope || typeof context.authorizePageTransition !== "function") throw error;
+            transitionBinding = await context.authorizePageTransition(transitionScope);
+            clickResult = { navigated: true, scope: transitionScope };
+          }
 
           const waitMs = args.waitMs ?? 400;
           if (waitMs > 0) await sleep(waitMs);
 
-          let evaluation;
-          if (typeof args.expression === "string" && args.expression.length > 0) {
-            evaluation = await bridgeCommand("evaluate", {
-              tabId: args.tabId,
-              expression: args.expression
-            }, { timeoutMs });
+          // A navigation may commit asynchronously after the native click has
+          // already returned. Always bind the finishing work to the live page
+          // after the wait, without repeating the click.
+          const liveTab = await bridgeCommand("getTab", { tabId: args.tabId });
+          if (typeof liveTab?.url !== "string") throw new Error("Wizard target no longer exposes a page URL");
+          const liveScope = canonicalPageScope(liveTab.url);
+          if (typeof context.authorizePageTransition !== "function") {
+            throw new Error("Wizard finishing work requires live page transition authorization");
           }
+          transitionScope = liveScope;
+          transitionBinding = await context.authorizePageTransition(liveScope);
 
-          let screenshot;
-          if (typeof args.screenshotPath === "string" && args.screenshotPath.length > 0) {
-            const outputPath = await resolveProjectOutputPath(context.directory, args.screenshotPath, "screenshotPath");
-            const result = await bridgeCommand(
-              "screenshot",
-              { tabId: args.tabId, format: args.screenshotFormat, quality: args.screenshotQuality },
-              { timeoutMs: Math.max(timeoutMs ?? 15000, 30000) }
-            );
-            screenshot = await writeDataUrlToFile(result.dataUrl, outputPath);
-          }
+          const finishStep = async () => {
+            let evaluation;
+            if (typeof args.expression === "string" && args.expression.length > 0) {
+              evaluation = await bridgeCommand("evaluate", {
+                tabId: args.tabId,
+                expression: args.expression
+              }, { timeoutMs });
+            }
+
+            let screenshot;
+            if (typeof args.screenshotPath === "string" && args.screenshotPath.length > 0) {
+              const outputPath = await resolveProjectOutputPath(context.directory, args.screenshotPath, "screenshotPath");
+              const result = await bridgeCommand(
+                "screenshot",
+                { tabId: args.tabId, format: args.screenshotFormat, quality: args.screenshotQuality },
+                { timeoutMs: Math.max(timeoutMs ?? 15000, 30000) }
+              );
+              screenshot = await writeDataUrlToFile(result.dataUrl, outputPath);
+            }
+            return { evaluation, screenshot };
+          };
+          const { evaluation, screenshot } = transitionScope
+            ? await withBridgePageScopes([transitionScope], finishStep, transitionBinding ? [transitionBinding] : [])
+            : await finishStep();
 
           return JSON.stringify({
             clicked: true,
@@ -664,7 +757,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         description: "List Chrome DevTools Protocol targets visible to the OpenCode Chrome Bridge extension.",
         args: {},
         async execute() {
-          return JSON.stringify(await bridgeCommand("cdpTargets"), null, 2);
+          return JSON.stringify(filterPublicPageMetadata(await bridgeCommand("cdpTargets")), null, 2);
         }
       }),
       chrome_cdp: tool({
@@ -871,7 +964,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           since: schema.number().int().min(0).default(0).describe("Return events with seq greater than this value. Use 0 for the current buffer, or the nextSeq from the previous call.")
         },
         async execute(args) {
-          return JSON.stringify(await pollEvents(args.since ?? 0), null, 2);
+          return JSON.stringify(filterOriginBearingEvents(await pollEvents(args.since ?? 0)), null, 2);
         }
       }),
       chrome_get_console_logs: tool({
@@ -889,8 +982,78 @@ export default async function OpenCodeChromeBridgePlugin() {
           }), null, 2);
         }
       }),
+      chrome_network_requests: tool({
+        description: "Read bounded high-level network request summaries for a Chrome tab. URLs redact credentials, fragments, and sensitive query values; response/request bodies, cookies, and authorization headers are never captured.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          methods: schema.array(schema.string().min(1).max(20)).max(20).optional().describe("Optional exact HTTP method allowlist."),
+          resourceTypes: schema.array(schema.string().min(1).max(50)).max(20).optional().describe("Optional exact CDP resource type allowlist."),
+          statusMin: schema.number().int().min(0).max(999).optional().describe("Optional minimum HTTP status."),
+          statusMax: schema.number().int().min(0).max(999).optional().describe("Optional maximum HTTP status."),
+          urlContains: schema.string().min(1).max(500).optional().describe("Optional substring matched against the redacted URL."),
+          failuresOnly: schema.boolean().optional().describe("Only return requests with a loading failure."),
+          since: schema.number().int().min(0).optional().describe("Only return entries with a cursor greater than this value."),
+          limit: schema.number().int().min(1).max(500).optional().describe("Maximum entries to return; defaults to 100."),
+          clear: schema.boolean().optional().describe("Clear the tab's network buffer after taking this snapshot."),
+          autoAttach: schema.boolean().optional().describe("Auto-attach and enable Network capture when needed; defaults to true.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("networkRequests", {
+            ...args,
+            autoAttach: args.autoAttach !== false,
+            clear: args.clear === true,
+            failuresOnly: args.failuresOnly === true,
+            limit: args.limit ?? 100,
+            since: args.since ?? 0
+          }), null, 2);
+        }
+      }),
+      chrome_page_assets: tool({
+        description: "Inventory page assets from the DOM and Chrome DevTools Protocol. Optionally fetch bounded resource content and write one atomic collision-safe bundle with a URL manifest, MIME types, SHA-256 hashes, sizes, truncation, and errors inside the OpenCode workspace.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          includeContent: schema.boolean().optional().describe("Fetch resource content through CDP. Automatically enabled when outputDirectory is set."),
+          outputDirectory: schema.string().min(1).max(500).optional().describe("Project-relative directory where a collision-safe page-assets bundle is written."),
+          maxTotalBytes: schema.number().int().min(1).max(10 * 1024 * 1024).optional().describe("Total decoded resource byte cap; defaults to 5 MiB and cannot exceed 10 MiB.")
+        },
+        async execute(args, context) {
+          const includeContent = args.includeContent === true || typeof args.outputDirectory === "string";
+          const inventory = await bridgeCommand("pageAssets", {
+            tabId: args.tabId,
+            includeContent,
+            maxTotalBytes: args.maxTotalBytes ?? 5 * 1024 * 1024
+          }, { signal: context.abort });
+          if (typeof args.outputDirectory !== "string") return JSON.stringify(inventory, null, 2);
+          const bundle = await materializePageAssetBundle({
+            assets: inventory.assets,
+            inventoryTruncated: inventory.truncated === true,
+            outputDirectory: args.outputDirectory,
+            projectDirectory: context.directory,
+            totalByteLimit: args.maxTotalBytes ?? 5 * 1024 * 1024
+          });
+          return JSON.stringify({
+            ...inventory,
+            assets: bundle.assets,
+            bundle: {
+              path: bundle.path,
+              relativePath: bundle.relativePath,
+              totalBytes: bundle.totalBytes
+            }
+          }, null, 2);
+        }
+      }),
+      chrome_notify: tool({
+        description: "Show a bounded branded OpenCode desktop notification through Chrome.",
+        args: {
+          title: schema.string().min(1).max(120).describe("Notification title, up to 120 characters."),
+          message: schema.string().min(1).max(1000).describe("Notification message, up to 1000 characters.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("notify", args), null, 2);
+        }
+      }),
       chrome_release_debuggers: tool({
-        description: "Release persistent Chrome debugger attachments created by console logging or CDP event subscriptions.",
+        description: "Release persistent Chrome debugger attachments and buffered state created by console logging, network capture, or CDP event subscriptions.",
         args: {
           tabIds: schema.array(schema.number().int()).optional().describe("Specific tab ids to release. Omit to release all persistent debugger attachments.")
         },
@@ -954,6 +1117,23 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("fillElement", args), null, 2);
         }
       }),
+      chrome_upload_files: tool({
+        description: "Upload workspace files to a live file input by accessibility-tree reference. Every real path must remain inside the current OpenCode workspace; directories, symlink escapes, oversized inputs, stale refs, and partial uploads are rejected.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id."),
+          ref: schema.string().min(1).max(50).describe("Live file-input reference from chrome_accessibility_tree."),
+          paths: schema.array(schema.string().min(1).max(4096)).min(1).max(MAX_UPLOAD_FILES).describe("Workspace-relative or contained absolute file paths.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await uploadWorkspaceFiles({
+            directory: context.directory,
+            paths: args.paths,
+            ref: args.ref,
+            signal: context.abort,
+            tabId: args.tabId
+          }), null, 2);
+        }
+      }),
       chrome_blocked_urls: tool({
         description: "List the effective blocked URL patterns the bridge enforces on navigation. Patterns come from enterprise managed storage and the extension's local storage key blockedUrlPatterns.",
         args: {},
@@ -981,7 +1161,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("unsubscribeCdpEvents", args), null, 2);
         }
       })
-    })
+    }, schema)
   };
 }
 
@@ -1022,18 +1202,26 @@ const APPROVAL_METADATA = {
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
+  chrome_upload_files: (args) => ({ action: "Upload workspace files to a page file input", tabId: args.tabId, ref: args.ref, files: args.paths?.length }),
   chrome_find: (args) => ({ action: "Find ranked page elements", tabId: args.tabId, query: previewText(args.query), role: args.role }),
   chrome_dom_content: (args) => ({ action: "Read the page DOM content", tabId: args.tabId, contentType: args.contentType }),
   chrome_get_console_logs: (args) => ({ action: "Read the page console logs", tabId: args.tabId }),
+  chrome_network_requests: (args) => ({ action: "Read bounded page network request summaries", tabId: args.tabId, clear: args.clear }),
+  chrome_page_assets: (args) => ({ action: "Inventory or bundle page assets", tabId: args.tabId, outputDirectory: args.outputDirectory }),
+  chrome_notify: (args) => ({ action: "Show a Chrome notification", title: previewText(args.title) }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })
 };
 
-function requireApprovals(tools) {
+function requireApprovals(tools, schema) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
+    if (PAGE_SCOPED_TOOLS.has(name)) {
+      definition.args.originGrant = schema.enum(["once", "session"]).default("once")
+        .describe("Use once for this call, or explicitly cache approved page scopes only for the current OpenCode session.");
+    }
     const describe = APPROVAL_METADATA[name]
       ?? (() => ({ action: definition.description ?? `Run ${name}` }));
     const run = definition.execute;
@@ -1051,11 +1239,494 @@ function requireApprovals(tools) {
         });
         const requiredCapabilities = requiredCapabilitiesForTool(name, args);
         await requireBridgeCapabilities(requiredCapabilities);
-        return run(args, context);
+        const executionArgs = PAGE_SCOPED_TOOLS.has(name) ? withoutOriginGrant(args) : args;
+        if (!PAGE_SCOPED_TOOLS.has(name) || (name === "chrome_wait_for" && args?.condition?.type === "download")) {
+          return run(executionArgs, context);
+        }
+        const callGrants = new Set();
+        const operationStartedAt = name === "chrome_batch" ? Date.now() : undefined;
+        validateRawCdpAccess(name, executionArgs);
+        await resolveImplicitPageTarget(name, executionArgs);
+        const pageMetadata = new Map();
+        const beforeScopes = await resolvePageScopes(name, executionArgs, pageMetadata);
+        const beforeBindings = await resolvePageBindings(name, executionArgs, pageMetadata);
+        await authorizePageScopes(
+          approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
+          args?.originGrant,
+          context,
+          describe(args),
+          callGrants
+        );
+        const executionContext = {
+          ...context,
+          authorizePageTransition: async (scope) => {
+            await authorizePageScopes(
+              approvalScopesForTool(name, executionArgs, [scope], "transition"),
+              args?.originGrant,
+              context,
+              {
+                ...describe(args),
+                action: `Authorize page transition during ${name}`
+              },
+              callGrants
+            );
+            return Number.isInteger(executionArgs.tabId)
+              ? (await resolvePageBindings(name, executionArgs))[0]
+              : undefined;
+          }
+        };
+        const result = name === "chrome_batch"
+          ? await runPermissionAwareBatch(
+            executionArgs, args?.originGrant, context, describe(args), callGrants, operationStartedAt
+          )
+          : beforeScopes.length === 0
+            ? await run(executionArgs, executionContext)
+            : await withBridgePageScopes(beforeScopes, () => run(executionArgs, executionContext), beforeBindings);
+        const afterScopes = [
+          ...pageScopesFromReturnedResult(name, executionArgs, result),
+          ...await resolvePostExecutionPageScopes(name, executionArgs, result)
+        ];
+        await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
+          ...describe(args),
+          action: `Re-authorize page scope after ${name}`
+        }, callGrants);
+        return result;
       }
     };
   }
   return guarded;
+}
+
+async function runPermissionAwareBatch(args, originGrant, context, metadata, callGrants, operationStartedAt) {
+  const startedAt = operationStartedAt ?? Date.now();
+  const totalTimeoutMs = args.totalTimeoutMs ?? 60_000;
+  const deadline = startedAt + totalTimeoutMs;
+  const results = [];
+  let stoppedAt = null;
+  for (let index = 0; index < args.actions.length; index += 1) {
+    const action = args.actions[index];
+    const remaining = deadline - Date.now();
+    let scopes;
+    let bindings = [];
+    try {
+      if (remaining < 50) throw new Error(`browser batch total timeout after ${totalTimeoutMs}ms`);
+      const pageMetadata = new Map();
+      scopes = await resolveBatchPageScopes([action], pageMetadata);
+      bindings = await resolvePageBindings("chrome_batch", { actions: [action] }, pageMetadata);
+      await authorizePageScopes(scopes, originGrant, context, {
+        ...metadata,
+        action: `Authorize browser batch action ${index}`,
+        actionIndex: index,
+        actionType: action.type
+      }, callGrants);
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, ok: false, type: action?.type });
+      if (error?.pageOriginDenied === true || args.stopOnError !== false || remaining < 50) {
+        stoppedAt = index;
+        break;
+      }
+      continue;
+    }
+    try {
+      const actionRemaining = deadline - Date.now();
+      if (actionRemaining < 50) throw new Error(`browser batch total timeout after ${totalTimeoutMs}ms`);
+      const executeOne = () => bridgeCommand("browserBatch", {
+        actions: [action],
+        stopOnError: true,
+        totalTimeoutMs: Math.min(actionRemaining, totalTimeoutMs)
+      }, { timeoutMs: Math.min(125_000, actionRemaining + 5_000) });
+      const one = scopes.length === 0 ? await executeOne() : await withBridgePageScopes(scopes, executeOne, bindings);
+      const entry = one?.results?.[0];
+      if (!entry?.ok) throw new Error(entry?.error ?? `browser batch action ${index} failed`);
+      results.push({ ...entry, index });
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, ok: false, type: action?.type });
+      if (args.stopOnError !== false) {
+        stoppedAt = index;
+        break;
+      }
+    }
+  }
+  return JSON.stringify({
+    completed: results.length,
+    elapsedMs: Date.now() - startedAt,
+    ok: results.length === args.actions.length && results.every((entry) => entry.ok),
+    results,
+    stoppedAt,
+    totalActions: args.actions.length
+  }, null, 2);
+}
+
+export function canonicalPageScope(value) {
+  if (typeof value !== "string" || hasAmbiguousPageScopeEncoding(value)) {
+    throw new Error("Page scope contains an ambiguous encoded separator or traversal");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Page origin permission requires a valid absolute http or https URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Page origin permission supports only http and https URLs");
+  }
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return `${parsed.protocol}//${parsed.hostname}:${port}${normalizePermissionPath(parsed.pathname)}`;
+}
+
+function hasAmbiguousPageScopeEncoding(value) {
+  const pathPart = value.split(/[?#]/u, 1)[0];
+  return /\\|%(?:2f|5c|2e|25)/iu.test(pathPart);
+}
+
+export function pageScopeCovers(grant, requested) {
+  const granted = splitPageScope(canonicalPageScope(grant));
+  const target = splitPageScope(canonicalPageScope(requested));
+  if (granted.origin !== target.origin) return false;
+  if (granted.path === "/") return true;
+  if (target.path === granted.path) return true;
+  const prefix = granted.path.endsWith("/") ? granted.path.slice(0, -1) : granted.path;
+  return target.path.startsWith(`${prefix}/`);
+}
+
+function approvalScopesForTool(name, args, scopes, phase) {
+  const exact = [...new Set(scopes.map(canonicalPageScope))];
+  const needsOriginRoot = name === "chrome_evaluate"
+    || (name === "chrome_wizard_step" && typeof args?.expression === "string" && args.expression.length > 0);
+  if (needsOriginRoot) return exact.map(originRootPageScope);
+  if (name !== "chrome_cdp") return exact;
+  if (args?.method === "Page.navigate") {
+    if (phase !== "before" || exact.length === 0) return exact;
+    return [originRootPageScope(exact[0]), ...exact.slice(1)];
+  }
+  return exact.map(originRootPageScope);
+}
+
+function originRootPageScope(scope) {
+  return `${splitPageScope(canonicalPageScope(scope)).origin}/`;
+}
+
+export function clearPageOriginSessionGrants() {
+  pageOriginSessionGrants.clear();
+}
+
+async function authorizePageScopes(scopes, originGrant, context, metadata, callGrants = new Set()) {
+  const requested = [...new Set(scopes.map(canonicalPageScope))].sort();
+  if (requested.length === 0) return;
+  const sessionMode = originGrant === "session";
+  const sessionID = sessionMode ? requirePermissionSessionID(context?.sessionID) : null;
+  const grants = [...callGrants, ...(sessionID == null ? [] : (pageOriginSessionGrants.get(sessionID) ?? []))];
+  const missing = requested.filter((scope) => !grants.some((grant) => pageScopeCovers(grant, scope)));
+  if (missing.length === 0) return;
+  await context.ask({
+    permission: PAGE_ORIGIN_PERMISSION,
+    patterns: missing,
+    always: missing,
+    metadata: {
+      ...metadata,
+      action: metadata?.action ?? "Access browser pages",
+      originCount: missing.length,
+      origins: missing
+    }
+  }).catch((error) => {
+    if (error && typeof error === "object") error.pageOriginDenied = true;
+    throw error;
+  });
+  for (const scope of missing) callGrants.add(scope);
+  if (sessionID != null) cachePageOriginSessionGrants(sessionID, missing);
+}
+
+async function resolvePageScopes(name, args, pageMetadata) {
+  if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
+  if (name === "chrome_batch") return resolveBatchPageScopes(args.actions, pageMetadata);
+  if (name === "chrome_tabs") {
+    return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
+  }
+  if (name === "chrome_cdp_targets") {
+    return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("cdpTargets")));
+  }
+  if (name === "chrome_events") {
+    return pageScopesFromObject(filterOriginBearingEvents(await pollEvents(args.since ?? 0)));
+  }
+  if (name === "chrome_cdp" && !Number.isInteger(args.tabId)) {
+    if (typeof args.targetId !== "string" || args.targetId.length === 0) {
+      throw new Error("chrome_cdp requires tabId for origin-scoped authorization, or a valid targetId");
+    }
+    const targets = await bridgeCommand("cdpTargets");
+    const target = Array.isArray(targets) ? targets.find((entry) => entry?.id === args.targetId || entry?.targetId === args.targetId) : null;
+    if (typeof target?.url !== "string") throw new Error("Unable to resolve the CDP target page origin");
+    if (!Number.isInteger(target.tabId)) throw new Error("CDP target is not bound to a top-level Chrome tab");
+    args.tabId = target.tabId;
+    const scopes = [canonicalPageScope(target.url)];
+    if (args.method === "Page.navigate") scopes.push(canonicalPageScope(args.commandParams?.url));
+    return scopes;
+  }
+  if (TAB_SCOPED_TOOLS.has(name)) {
+    if (Number.isInteger(args.tabId)) {
+      const scopes = [await scopeForTab(args.tabId, pageMetadata)];
+      if (name === "chrome_cdp" && args.method === "Page.navigate") {
+        scopes.push(canonicalPageScope(args.commandParams?.url));
+      }
+      return scopes;
+    }
+    if (name === "chrome_screenshot" || name === "chrome_screenshot_region") {
+      const activeTabs = (await bridgeCommand("listTabs")).filter((tab) => tab?.active === true);
+      if (activeTabs.length === 0) throw new Error("Unable to resolve an active page origin for the screenshot");
+      return scopesFromTabs(activeTabs);
+    }
+    throw new Error(`${name} requires a tabId for origin-scoped page access`);
+  }
+  return [];
+}
+
+async function resolvePageBindings(name, args, pageMetadata) {
+  let tabIds = [];
+  if (name === "chrome_batch") tabIds = batchTabIds(args.actions);
+  else if (Number.isInteger(args?.tabId)) tabIds = [args.tabId];
+  if (tabIds.length === 0) return [];
+  const bindings = [];
+  for (const tabId of tabIds) {
+    const tab = await tabMetadata(tabId, pageMetadata);
+    if (typeof tab?.documentId !== "string" || !Number.isInteger(tab?.navigationGeneration)) continue;
+    bindings.push({
+      documentId: tab.documentId,
+      navigationGeneration: tab.navigationGeneration,
+      pageScope: canonicalPageScope(tab.url),
+      tabId
+    });
+  }
+  return bindings;
+}
+
+function validateRawCdpAccess(name, args) {
+  if (name !== "chrome_cdp") return;
+  if (!ALLOWED_RAW_PAGE_CDP_METHODS.has(args.method)) {
+    throw new Error(`CDP method ${String(args.method)} is not allowed; use a dedicated high-level browser tool`);
+  }
+}
+
+async function resolvePostExecutionPageScopes(name, args, result) {
+  if (name === "chrome_close_tab") return [];
+  if (name === "chrome_batch") return scopesForTabIds(batchTabIds(args.actions));
+  if (name === "chrome_tabs") return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
+  if (name === "chrome_cdp_targets") return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("cdpTargets")));
+  if (name === "chrome_events") return [];
+  if (DESTINATION_SCOPED_TOOLS.has(name)) {
+    if (Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+    const output = parseToolOutput(result);
+    if (name === "chrome_open_window" && Number.isInteger(output?.id)) {
+      const tabs = await bridgeCommand("listTabs");
+      if (!Array.isArray(tabs)) throw new Error("Chrome tab metadata must be an array");
+      return scopesFromTabs(tabs.filter((tab) => tab?.windowId === output.id));
+    }
+    const createdTabs = Array.isArray(output?.tabs) ? output.tabs : [output];
+    const scopes = [];
+    for (const tab of createdTabs) {
+      if (Number.isInteger(tab?.id)) scopes.push(await scopeForTab(tab.id));
+      else if (typeof tab?.url === "string") scopes.push(canonicalPageScope(tab.url));
+    }
+    return scopes;
+  }
+  if (TAB_SCOPED_TOOLS.has(name) && Number.isInteger(args.tabId)) return [await scopeForTab(args.tabId)];
+  if ((name === "chrome_screenshot" || name === "chrome_screenshot_region") && args.tabId == null) {
+    return resolvePageScopes(name, args);
+  }
+  if (name === "chrome_cdp" && typeof args.targetId === "string") {
+    return resolvePageScopes(name, args);
+  }
+  return [];
+}
+
+async function resolveImplicitPageTarget(name, args) {
+  if ((name !== "chrome_screenshot" && name !== "chrome_screenshot_region") || Number.isInteger(args.tabId)) return;
+  const tab = await bridgeCommand("getActiveTab");
+  if (!Number.isInteger(tab?.id) || !isPagePermissionUrl(tab.url)) {
+    throw new Error("The actual active screenshot tab is not an authorized web page");
+  }
+  args.tabId = tab.id;
+}
+
+async function resolveBatchPageScopes(actions, pageMetadata) {
+  const scopes = [];
+  const currentTabIds = new Set();
+  for (const action of actions) {
+    if (action?.type === "navigate") {
+      scopes.push(canonicalPageScope(action.params?.url));
+      continue;
+    }
+    if (action?.type === "waitFor" && action.params?.condition?.type === "download") continue;
+    if (Number.isInteger(action?.params?.tabId)) currentTabIds.add(action.params.tabId);
+  }
+  scopes.push(...await scopesForTabIds([...currentTabIds], pageMetadata));
+  return [...new Set(scopes)].sort();
+}
+
+function batchTabIds(actions) {
+  return [...new Set(actions
+    .map((action) => action?.params?.tabId)
+    .filter(Number.isInteger))];
+}
+
+async function scopesForTabIds(tabIds, pageMetadata) {
+  return Promise.all(tabIds.map((tabId) => scopeForTab(tabId, pageMetadata)));
+}
+
+async function scopeForTab(tabId, pageMetadata) {
+  const tab = await tabMetadata(tabId, pageMetadata);
+  if (typeof tab?.url !== "string") throw new Error(`Chrome tab ${tabId} did not expose a page URL`);
+  return canonicalPageScope(tab.url);
+}
+
+async function tabMetadata(tabId, cache) {
+  if (cache?.has(tabId)) return cache.get(tabId);
+  const tab = await bridgeCommand("getTab", { tabId });
+  cache?.set(tabId, tab);
+  return tab;
+}
+
+function scopesFromTabs(tabs) {
+  if (!Array.isArray(tabs)) throw new Error("Chrome tab metadata must be an array");
+  return [...new Set(tabs.flatMap((tab) => {
+    if (typeof tab?.url !== "string") throw new Error("Chrome tab did not expose a page URL");
+    return isPagePermissionUrl(tab.url) ? [canonicalPageScope(tab.url)] : [];
+  }))].sort();
+}
+
+function filterPublicPageMetadata(entries) {
+  if (!Array.isArray(entries)) throw new Error("Chrome page metadata must be an array");
+  return entries.filter((entry) => isPagePermissionUrl(entry?.url));
+}
+
+function filterOriginBearingEvents(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.events)) return payload;
+  return {
+    ...payload,
+    events: payload.events.filter((entry) => {
+      const event = entry?.event ?? entry;
+      if (event?.category === "cdp") {
+        return typeof event.pageScope === "string"
+          && Number.isInteger(event.navigationGeneration)
+          && isPagePermissionUrl(event.pageScope);
+      }
+      return !containsUnsupportedPageUrl(event);
+    })
+  };
+}
+
+export function sanitizeOriginBearingEvents(payload) {
+  return filterOriginBearingEvents(payload);
+}
+
+function containsUnsupportedPageUrl(value) {
+  if (!value || typeof value !== "object") return false;
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === "url" || key === "pendingUrl") && typeof entry === "string" && !isPagePermissionUrl(entry)) return true;
+    if (entry && typeof entry === "object" && containsUnsupportedPageUrl(entry)) return true;
+  }
+  return false;
+}
+
+function pageScopesFromObject(value) {
+  const scopes = [];
+  if (!value || typeof value !== "object") return scopes;
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === "url" || key === "pendingUrl" || key === "pageScope") && isPagePermissionUrl(entry)) scopes.push(canonicalPageScope(entry));
+    else if (entry && typeof entry === "object") scopes.push(...pageScopesFromObject(entry));
+  }
+  return [...new Set(scopes)].sort();
+}
+
+function withoutOriginGrant(args) {
+  if (!args || typeof args !== "object") return args;
+  const clean = { ...args };
+  delete clean.originGrant;
+  return clean;
+}
+
+function normalizePermissionPath(pathname) {
+  const pathValue = pathname || "/";
+  const normalized = pathValue.replace(/%([0-9a-fA-F]{2})/gu, (encoded, hex) => {
+    const value = Number.parseInt(hex, 16);
+    const character = String.fromCharCode(value);
+    return /[A-Za-z0-9._~-]/u.test(character) ? character : `%${hex.toUpperCase()}`;
+  });
+  return normalized;
+}
+
+function isPagePermissionUrl(value) {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function parseToolOutput(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function pageScopeFromMismatchError(error) {
+  const match = /Page scope changed or is not authorized: (https?:\/\/\S+)/u.exec(error?.message ?? "");
+  return match ? canonicalPageScope(match[1]) : null;
+}
+
+function pageScopesFromReturnedResult(name, args, value) {
+  const output = parseToolOutput(value);
+  if (name === "chrome_tabs" || name === "chrome_cdp_targets") {
+    return Array.isArray(output) ? scopesFromTabs(output) : [];
+  }
+  if (name === "chrome_events") return pageScopesFromObject(output);
+  if (name === "chrome_read_page") {
+    return isPagePermissionUrl(output?.context?.url) ? [canonicalPageScope(output.context.url)] : [];
+  }
+  if (name === "chrome_batch") {
+    if (!Array.isArray(output?.results)) return [];
+    return output.results.flatMap((entry) => {
+      const action = args.actions?.[entry?.index];
+      if (!action || !BATCH_RETURNED_URL_ACTIONS.has(action.type)) return [];
+      return isPagePermissionUrl(entry?.result?.url) ? [canonicalPageScope(entry.result.url)] : [];
+    });
+  }
+  if (RETURNED_URL_TOOLS.has(name) && isPagePermissionUrl(output?.url)) {
+    return [canonicalPageScope(output.url)];
+  }
+  return [];
+}
+
+function splitPageScope(scope) {
+  const parsed = new URL(scope);
+  return {
+    origin: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+    path: normalizePermissionPath(parsed.pathname)
+  };
+}
+
+function requirePermissionSessionID(sessionID) {
+  if (typeof sessionID !== "string" || sessionID.length === 0 || sessionID.length > 200) {
+    throw new Error("originGrant session requires a bounded OpenCode context.sessionID");
+  }
+  return sessionID;
+}
+
+function cachePageOriginSessionGrants(sessionID, scopes) {
+  let grants = pageOriginSessionGrants.get(sessionID);
+  if (!grants) {
+    if (pageOriginSessionGrants.size >= MAX_ORIGIN_GRANT_SESSIONS) {
+      pageOriginSessionGrants.delete(pageOriginSessionGrants.keys().next().value);
+    }
+    grants = new Set();
+    pageOriginSessionGrants.set(sessionID, grants);
+  }
+  for (const scope of scopes) {
+    if (grants.size >= MAX_ORIGIN_GRANTS_PER_SESSION) break;
+    grants.add(scope);
+  }
 }
 
 export function requiredCapabilitiesForTool(name, args) {
@@ -1101,6 +1772,113 @@ function requiredCapabilitiesForBatchAction(action) {
 function previewText(value) {
   if (typeof value !== "string") return undefined;
   return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+}
+
+export async function uploadWorkspaceFiles({
+  command = bridgeCommand,
+  directory,
+  paths,
+  ref,
+  signal,
+  tabId,
+  chunkBytes = UPLOAD_CHUNK_BYTES
+}) {
+  if (typeof directory !== "string" || directory.length === 0) throw new Error("workspace directory is required");
+  if (!Array.isArray(paths) || paths.length === 0) throw new Error("upload requires at least one file");
+  if (paths.length > MAX_UPLOAD_FILES) throw new Error(`upload supports at most ${MAX_UPLOAD_FILES} files`);
+  if (!Number.isInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > UPLOAD_CHUNK_BYTES) {
+    throw new Error(`upload chunkBytes must be between 1 and ${UPLOAD_CHUNK_BYTES}`);
+  }
+  const workspace = await realpath(directory);
+  const files = [];
+  let totalBytes = 0;
+  let transferId;
+  try {
+    for (const inputPath of paths) {
+      throwIfUploadAborted(signal);
+      if (typeof inputPath !== "string" || inputPath.length === 0 || inputPath.length > 4096) {
+        throw new Error("upload path is invalid");
+      }
+      const candidate = path.resolve(workspace, inputPath);
+      const resolved = await realpath(candidate).catch(() => { throw new Error(`upload file does not exist: ${inputPath}`); });
+      assertUploadPathWithin(workspace, resolved, inputPath);
+      let handle;
+      try {
+        handle = await open(resolved, "r");
+        const info = await handle.stat();
+        const boundPath = await realpath(candidate).catch(() => { throw new Error(`upload file changed during validation: ${inputPath}`); });
+        assertUploadPathWithin(workspace, boundPath, inputPath);
+        const boundInfo = await lstat(boundPath);
+        if (boundInfo.dev !== info.dev || boundInfo.ino !== info.ino) {
+          throw new Error(`upload file identity changed during validation: ${inputPath}`);
+        }
+        if (!info.isFile()) throw new Error(`upload path is not a regular file: ${inputPath}`);
+        totalBytes += info.size;
+        if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+          throw new Error(`upload total exceeds ${MAX_UPLOAD_TOTAL_BYTES} bytes`);
+        }
+        files.push({
+          chunkCount: Math.ceil(info.size / chunkBytes),
+          handle,
+          name: path.basename(candidate),
+          size: info.size,
+          type: "application/octet-stream"
+        });
+        handle = null;
+      } finally {
+        await handle?.close();
+      }
+    }
+    throwIfUploadAborted(signal);
+    const begun = await command("fileUploadBegin", {
+      tabId,
+      totalBytes,
+      files: files.map(({ chunkCount, name, size, type }) => ({ chunkCount, name, size, type }))
+    }, { signal });
+    transferId = begun?.transferId;
+    if (typeof transferId !== "string" || transferId.length < 8 || transferId.length > 128) {
+      throw new Error("bridge returned an invalid upload transfer id");
+    }
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+      const file = files[fileIndex];
+      let position = 0;
+      for (let chunkIndex = 0; chunkIndex < file.chunkCount; chunkIndex += 1) {
+        throwIfUploadAborted(signal);
+        const expected = Math.min(chunkBytes, file.size - position);
+        const buffer = Buffer.allocUnsafe(expected);
+        const { bytesRead } = await file.handle.read(buffer, 0, expected, position);
+        if (bytesRead !== expected) throw new Error(`upload file changed while reading: ${file.name}`);
+        await command("fileUploadChunk", {
+          transferId,
+          fileIndex,
+          chunkIndex,
+          data: buffer.toString("base64")
+        }, { signal });
+        position += bytesRead;
+      }
+    }
+    throwIfUploadAborted(signal);
+    return await command("fileUploadCommit", { transferId, tabId, ref }, { signal });
+  } catch (error) {
+    if (transferId) {
+      try { await command("fileUploadAbort", { transferId }); } catch {}
+    }
+    throw error;
+  } finally {
+    await Promise.all(files.map((file) => file.handle.close().catch(() => {})));
+  }
+}
+
+function assertUploadPathWithin(workspace, resolved, inputPath) {
+  const relative = path.relative(workspace, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`upload path escapes outside the workspace: ${inputPath}`);
+  }
+}
+
+function throwIfUploadAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("file upload was cancelled");
 }
 
 function requireArtifactDirectoryWhenRequested(args) {

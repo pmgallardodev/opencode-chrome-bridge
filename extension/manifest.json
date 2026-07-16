@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OpenCode Chrome Bridge",
   "description": "Let OpenCode inspect and control Chrome through a local native bridge.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "minimum_chrome_version": "116",
   "author": "pmgallardodev",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuLDFMcQxfXiSJfCvfZQ7tZWFYXphw1jvoD6jsiHNUeg77dZz3S44sXRxeWRQ4yxAYZKViTKAEWEeuyduSrBdERBwZ/LGidlBOPXgHiksLEZu4BP0pnInZ2k++G6BodGBE9OkiZyLqVXlFOS5zmDvL/5MGCYGJGgFm6A3BLyd2m+XJ93UqjH2B8w3dXyrPqu9pfqmV1iTVr3uRPou2bT879MgcY24mRn2ILEZM6yWCi4CrBmOqQYWgY5+O/ve/AgASvJAPWnJGXXAyszTi/v+UC4QfDrz076Qs1RV8v5wuTO6cOgBDE18dmZ5oZdLuurg0yXUWor76+V73KfnuomOrwIDAQAB",
@@ -46,10 +46,12 @@
     "downloads.ui",
     "history",
     "nativeMessaging",
+    "notifications",
     "scripting",
     "storage",
     "tabGroups",
-    "tabs"
+    "tabs",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"

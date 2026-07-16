@@ -3,7 +3,7 @@ import os from "node:os";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin, { TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin, { ALL_TOOL_REQUIRED_CAPABILITIES, TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
 import * as pluginModule from "../src/opencode-plugin.js";
 import { writeDataUrlToFile } from "../src/bridge-client.js";
 import { createLauncher, isSupportedNodeVersion, nativeHostLayout } from "../scripts/lib/platform-support.mjs";
@@ -20,6 +20,7 @@ test("extension manifest exposes required browser permissions and blocks extensi
     "downloads.ui",
     "history",
     "nativeMessaging",
+    "notifications",
     "scripting",
     "storage",
     "tabGroups",
@@ -29,7 +30,7 @@ test("extension manifest exposes required browser permissions and blocks extensi
   for (const permission of expectedPermissions) {
     assert.ok(manifest.permissions.includes(permission), `missing permission ${permission}`);
   }
-  for (const permission of ["favicon", "notifications", "readingList", "sessions", "topSites"]) {
+  for (const permission of ["favicon", "readingList", "sessions", "topSites"]) {
     assert.ok(!manifest.permissions.includes(permission), `unused permission ${permission} must be removed`);
   }
 
@@ -80,6 +81,29 @@ test("popup action opens OpenCode installation documentation", async () => {
   assert.match(popupScript, /https:\/\/github\.com\/pmgallardodev/u);
   assert.match(popupScript, /chrome\.tabs\.create/u);
   assert.match(popupScript, /getManifest\(\)\.version/u);
+});
+
+test("popup exposes actionable repair states without rendering bridge secrets", async () => {
+  const popup = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
+  const popupScript = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
+  for (const code of ["EXTENSION_DISCONNECTED", "HOST_HANDSHAKE_MISSING", "PROTOCOL_INCOMPATIBLE", "MISSING_CAPABILITIES", "DISABLED_PERMISSIONS"]) {
+    assert.match(popupScript, new RegExp(code, "u"), `popup is missing ${code}`);
+  }
+  assert.match(popup, /repairCommand/u);
+  assert.match(popup, /repairLink/u);
+  assert.match(popupScript, /npm run install:native/u);
+  assert.match(popupScript, /chrome:\/\/extensions/u);
+  assert.match(popupScript, /chrome\.permissions\.contains/u);
+  assert.doesNotMatch(`${popup}\n${popupScript}`, /state\.json|bearer token|OPENCODE_SERVER_PASSWORD/iu);
+});
+
+test("native pong publishes the current sorted extension capability requirements", async () => {
+  const nativeHost = await readFile(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"), "utf8");
+  assert.match(nativeHost, /HOST_REQUIRED_EXTENSION_CAPABILITIES/u);
+  assert.match(nativeHost, /hostHandshake\([\s\S]*requiredCapabilities/u);
+  for (const capability of ALL_TOOL_REQUIRED_CAPABILITIES) {
+    assert.ok(nativeHost.includes(`"${capability}"`), `native popup contract is missing ${capability}`);
+  }
 });
 
 test("background supports full CDP commands plus browser history and bookmarks", async () => {
@@ -229,6 +253,9 @@ test("native host validates local bridge command requests before forwarding to C
   assert.match(nativeHost, /if \(!subscriber\.write/u, "slow SSE subscribers must be disconnected instead of buffering indefinitely");
   assert.match(nativeHost, /server\.headersTimeout/u, "local HTTP headers must have a finite timeout");
   assert.match(nativeHost, /type:\s*"cancel",\s*id/u, "timed-out commands must cancel extension work");
+  assert.match(nativeHost, /res\.once\("close", cancelOnDisconnect\)/u, "disconnected HTTP command clients must cancel extension work");
+  assert.match(nativeHost, /if \(!res\.writableEnded\) cancelPendingCommand/u, "normal completed responses must not be cancelled on close");
+  assert.match(nativeHost, /pending\.delete\(id\)/u, "native cancellation must settle each pending command only once");
   assert.match(nativeHost, /Math\.min\(parsed,\s*125000\)/u, "host timeout must leave five seconds for extension cleanup");
   assert.match(nativeHost, /"Cache-Control": "no-store"/u, "JSON responses containing browser data must not be cached");
   assert.match(nativeHost, /"X-Content-Type-Options": "nosniff"/u, "JSON responses must disable MIME sniffing");
@@ -238,6 +265,7 @@ test("bridge client aborts stalled local HTTP requests", async () => {
   const source = await readFile(path.join(repoRoot, "src", "bridge-client.js"), "utf8");
 
   assert.match(source, /AbortController/u, "bridge client must create an AbortController for fetch");
+  assert.match(source, /http\.request/u, "externally cancellable bridge commands must use an HTTP request that destroys its socket on abort");
   assert.match(source, /setTimeout/u, "bridge client must enforce a client-side timeout");
   assert.match(source, /clearTimeout/u, "bridge client must clear the timeout after fetch settles");
   assert.match(source, /MAX_REQUEST_TIMEOUT_MS\s*=\s*126000/u, "client timeout must outlive the maximum native-host command timeout");
@@ -423,6 +451,29 @@ test("OpenCode plugin exposes session, cleanup, cursor, and favicon tools", asyn
   }
 });
 
+test("managed resumable sessions expose one capability-gated resume tool", async () => {
+  const pluginModule = await import("../src/opencode-plugin.js");
+  const plugin = await pluginModule.default({ client: {} });
+  assert.ok(plugin.tool.chrome_resume_session, "chrome_resume_session tool missing");
+  assert.match(plugin.tool.chrome_resume_session.description, /resume|handoff|session/iu);
+  assert.deepEqual(
+    [...pluginModule.TOOL_CAPABILITY_REQUIREMENTS.chrome_resume_session],
+    ["bridge.handshake", "browser.tab-groups", "browser.tabs", "session.resume"].sort()
+  );
+  assert.match(await readFile(path.join(repoRoot, "extension", "background.js"), "utf8"), /onCreatedNavigationTarget/u);
+});
+
+test("managed sessions and v1.3 add only webNavigation and notifications to the verified permission set", async () => {
+  const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
+  assert.ok(manifest.permissions.includes("webNavigation"));
+  assert.ok(manifest.permissions.includes("notifications"));
+  for (const permission of ["sessions", "unlimitedStorage"]) {
+    assert.equal(manifest.permissions.includes(permission), false, `${permission} must not be added`);
+  }
+  const verify = await readFile(path.join(repoRoot, "scripts", "verify.mjs"), "utf8");
+  assert.match(verify, /"webNavigation"/u);
+});
+
 test("OpenCode plugin chrome_drag accepts a points array and performs press-move-release", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
 
@@ -463,7 +514,7 @@ test("OpenCode plugin chrome_screenshot accepts optional tabId", async () => {
 test("OpenCode plugin resolves screenshot output paths against real project paths", async () => {
   const source = await readFile(path.join(repoRoot, "src", "opencode-plugin.js"), "utf8");
 
-  assert.match(source, /import \{ lstat, realpath \} from "node:fs\/promises"/u, "plugin must inspect real filesystem paths");
+  assert.match(source, /import \{ lstat, open, realpath \} from "node:fs\/promises"/u, "plugin must inspect and stream real filesystem paths");
   assert.match(source, /await resolveProjectOutputPath\(context\.directory/u, "screenshot tools must await path validation");
   assert.match(source, /nearestExistingAncestor/u, "plugin must validate existing symlink ancestors");
   assert.match(source, /assertPathWithin/u, "plugin must reject paths outside the project");
@@ -554,6 +605,63 @@ test("OpenCode plugin exposes one typed deterministic wait tool and capability",
   for (const type of ["url", "navigation", "text", "ref", "selector", "networkIdle", "download"]) {
     assert.match(source, new RegExp(`"${type}"`, "u"), `missing wait condition ${type}`);
   }
+});
+
+test("OpenCode plugin exposes strict bounded network summaries with an explicit capability", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const network = plugin.tool.chrome_network_requests;
+  assert.ok(network, "chrome_network_requests tool missing");
+  assert.match(network.description, /network|request/iu);
+  assert.match(network.description, /bod|cookie|authorization|redact/iu);
+  assert.deepEqual(
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_network_requests],
+    ["bridge.handshake", "browser.cdp", "browser.network", "browser.tabs"]
+  );
+
+  const valid = {
+    tabId: 7,
+    methods: ["GET", "POST"],
+    resourceTypes: ["Fetch", "Document"],
+    statusMin: 200,
+    statusMax: 399,
+    urlContains: "/api/",
+    failuresOnly: false,
+    since: 0,
+    limit: 100,
+    clear: false,
+    autoAttach: true
+  };
+  for (const [name, value] of Object.entries(valid)) {
+    assert.equal(network.args[name].safeParse(value).success, true, `valid ${name} rejected`);
+  }
+  for (const [name, value] of Object.entries({
+    methods: "GET",
+    resourceTypes: Array.from({ length: 21 }, () => "Fetch"),
+    urlContains: "x".repeat(501),
+    limit: 501,
+    since: -1,
+    clear: "false",
+    autoAttach: 1
+  })) {
+    assert.equal(network.args[name].safeParse(value).success, false, `invalid ${name} accepted`);
+  }
+});
+
+test("OpenCode plugin exposes page assets and bounded branded notifications", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  assert.ok(plugin.tool.chrome_page_assets);
+  assert.ok(plugin.tool.chrome_notify);
+  assert.deepEqual([...TOOL_CAPABILITY_REQUIREMENTS.chrome_page_assets], [
+    "bridge.handshake", "browser.assets", "browser.cdp", "browser.tabs"
+  ]);
+  assert.deepEqual([...TOOL_CAPABILITY_REQUIREMENTS.chrome_notify], [
+    "bridge.handshake", "browser.notifications"
+  ]);
+  assert.equal(plugin.tool.chrome_page_assets.args.tabId.safeParse(7).success, true);
+  assert.equal(plugin.tool.chrome_page_assets.args.outputDirectory.safeParse("artifacts/assets").success, true);
+  assert.equal(plugin.tool.chrome_page_assets.args.maxTotalBytes.safeParse(10 * 1024 * 1024 + 1).success, false);
+  assert.equal(plugin.tool.chrome_notify.args.title.safeParse("x".repeat(121)).success, false);
+  assert.equal(plugin.tool.chrome_notify.args.message.safeParse("x".repeat(1001)).success, false);
 });
 
 test("wait condition schemas are strict discriminated unions for every condition type", async () => {
@@ -708,7 +816,9 @@ test("background implements getConsoleLogs with a per-tab buffer and persistent 
   assert.match(background, /consoleLogAttached/u, "missing consoleLogAttached set");
   assert.match(background, /CONSOLE_LOG_METHODS/u, "missing CONSOLE_LOG_METHODS constant");
   assert.match(background, /enableCdpDomains/u, "ensureConsoleLogDebugger must enable CDP domains");
-  assert.match(background, /"Console", "Log", "Runtime"/u, "ensureConsoleLogDebugger must enable Console, Log, and Runtime domains");
+  assert.match(background, /"Page", "Runtime"/u, "console capture must enable Page and Runtime for exact document provenance");
+  assert.match(background, /Runtime\.consoleAPICalled/u, "console capture must use identity-bearing Runtime events");
+  assert.match(background, /documentId[\s\S]{0,300}loaderId/u, "console provenance must bind document and loader identity");
   assert.match(background, /appendConsoleLog/u, "missing appendConsoleLog helper");
   assert.match(background, /normalizeConsoleLog/u, "missing normalizeConsoleLog helper");
 });

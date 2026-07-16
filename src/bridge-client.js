@@ -1,5 +1,7 @@
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { open, writeFile } from "node:fs/promises";
 import { decodeSupportedImageDataUrl } from "./workspace-artifacts.js";
 
@@ -10,12 +12,22 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 const MAX_REQUEST_TIMEOUT_MS = 126000;
 const MAX_CAPABILITY_HEADER_CHARS = 10_000;
 const NATIVE_HOST_NAME = "com.opencode.chrome_bridge";
-export const BRIDGE_CLIENT_VERSION = "1.2.0";
+export const BRIDGE_CLIENT_VERSION = "1.3.0";
 export const BRIDGE_PROTOCOL_MIN = "1.0.0";
 export const BRIDGE_PROTOCOL_MAX = "1.0.0";
 const DEFAULT_REQUIRED_CAPABILITIES = Object.freeze(["bridge.handshake"]);
 const VERSION_RE = /^\d+\.\d+\.\d+$/u;
 const CAPABILITY_RE = /^[a-z][a-z0-9.-]{0,99}$/u;
+const pageScopeContext = new AsyncLocalStorage();
+const ORIGIN_SCOPED_BRIDGE_METHODS = new Set([
+  "accessibilityTree", "activateTab", "back", "browserBatch", "cdpCommand", "click", "clickElement",
+  "closeTab", "domContent", "doubleClick", "evaluate", "fileUploadCommit", "fillElement",
+  "findElements", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
+  "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
+  "pageAssets",
+  "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
+  "setViewport", "subscribeCdpEvents", "tabContext", "type", "unsubscribeCdpEvents", "waitFor"
+]);
 
 export async function readBridgeState() {
   const stateFile = await open(STATE_PATH, "r");
@@ -189,12 +201,32 @@ function isLegacyBridgeStatus(payload) {
 }
 
 export async function bridgeCommand(method, params = {}, options = {}) {
+  const scope = pageScopeContext.getStore();
+  if (scope && ORIGIN_SCOPED_BRIDGE_METHODS.has(method)) {
+    params = {
+      expectedBindings: scope.expectedBindings,
+      expectedScopes: scope.expectedScopes,
+      method,
+      params
+    };
+    method = "scopedCommand";
+  }
   const response = await request("POST", "/command", {
     method,
     params,
     timeoutMs: options.timeoutMs
-  });
+  }, {}, options.signal);
   return response.result;
+}
+
+export function withBridgePageScopes(expectedScopes, operation, expectedBindings = []) {
+  if (!Array.isArray(expectedScopes) || expectedScopes.length === 0) {
+    throw new Error("withBridgePageScopes requires at least one expected page scope");
+  }
+  return pageScopeContext.run({
+    expectedBindings: Array.isArray(expectedBindings) ? expectedBindings.map((entry) => ({ ...entry })) : [],
+    expectedScopes: [...expectedScopes]
+  }, operation);
 }
 
 export async function pollEvents(since = 0) {
@@ -210,22 +242,28 @@ export async function writeDataUrlToFile(dataUrl, outputPath) {
   return { bytes: data.length, mimeType, path: outputPath };
 }
 
-async function request(method, pathname, body, extraHeaders = {}) {
+async function request(method, pathname, body, extraHeaders = {}, externalSignal) {
   const state = await readBridgeState();
   const url = `http://${state.host}:${state.port}${pathname}`;
   const timeoutMs = requestTimeoutMs(body);
+  const headers = {
+    Authorization: `Bearer ${state.token}`,
+    ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    ...extraHeaders
+  };
+  if (externalSignal) {
+    return abortableHttpRequest({ body, headers, method, signal: externalSignal, timeoutMs, url });
+  }
   const controller = new AbortController();
+  const onExternalAbort = () => controller.abort(externalSignal.reason);
+  externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
     response = await fetch(url, {
       method,
       signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${state.token}`,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-        ...extraHeaders
-      },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body)
     });
   } catch (error) {
@@ -235,12 +273,54 @@ async function request(method, pathname, body, extraHeaders = {}) {
     throw error;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
   }
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.ok === false) {
     throw new Error(payload?.error ?? `Bridge request failed with HTTP ${response.status}`);
   }
   return payload;
+}
+
+function abortableHttpRequest({ body, headers, method, signal, timeoutMs, url }) {
+  const serialized = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Bridge request was cancelled"));
+      return;
+    }
+    const req = http.request(url, {
+      headers: {
+        ...headers,
+        ...(serialized === undefined ? {} : { "Content-Length": Buffer.byteLength(serialized) })
+      },
+      method,
+      signal
+    }, (res) => {
+      const chunks = [];
+      let bytes = 0;
+      res.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024 * 1024) req.destroy(new Error("Bridge response is too large"));
+        else chunks.push(chunk);
+      });
+      res.on("end", () => {
+        let payload;
+        try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { payload = null; }
+        if ((res.statusCode ?? 500) >= 400 || payload?.ok === false) {
+          reject(new Error(payload?.error ?? `Bridge request failed with HTTP ${res.statusCode}`));
+          return;
+        }
+        resolve(payload);
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Bridge request timed out after ${timeoutMs}ms`)));
+    req.on("error", (error) => {
+      reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    });
+    if (serialized !== undefined) req.end(serialized);
+    else req.end();
+  });
 }
 
 function validatePeer(value, label) {
