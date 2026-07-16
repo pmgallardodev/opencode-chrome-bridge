@@ -94,6 +94,110 @@ test("path grants honor segment boundaries and never cross scheme or port", () =
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:444/app"), false);
 });
 
+test("evaluate asks once for the origin root and a prior path grant does not cover it", async () => {
+  pluginModule.clearPageOriginSessionGrants();
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-public", id: 7, navigationGeneration: 1, url: "https://example.com/public"
+    };
+    if (method === "pageText") return { text: "public" };
+    if (method === "evaluate") return "evaluated";
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_page_text.execute({
+      maxChars: 100, originGrant: "session", tabId: 7
+    }, context(asks, "root-scope-session"));
+    await plugin.tool.chrome_evaluate.execute({
+      expression: "document.cookie", originGrant: "session", tabId: 7
+    }, context(asks, "root-scope-session"));
+  } finally {
+    bridge.restore();
+  }
+  const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
+  assert.deepEqual(originAsks.map((entry) => entry.patterns), [
+    ["https://example.com:443/public"],
+    ["https://example.com:443/"]
+  ]);
+  assert.equal(originAsks.filter((entry) => entry.patterns[0] === "https://example.com:443/").length, 1);
+  const evaluateCall = bridge.calls.find((entry) => entry.method === "evaluate");
+  assert.deepEqual(evaluateCall.expectedScopes, ["https://example.com:443/public"]);
+  assert.equal(evaluateCall.expectedBindings[0].documentId, "document-public");
+});
+
+test("wizard click-only stays path-scoped while expression mode asks one origin root", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-public", id: 7, navigationGeneration: 1, url: "https://example.com/public"
+    };
+    if (method === "click") return { clicked: true };
+    if (method === "evaluate") return "evaluated";
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_wizard_step.execute({ tabId: 7, waitMs: 0, x: 1, y: 2 }, context(asks, "wizard-path"));
+    await plugin.tool.chrome_wizard_step.execute({
+      expression: "document.cookie", tabId: 7, waitMs: 0, x: 1, y: 2
+    }, context(asks, "wizard-root"));
+  } finally {
+    bridge.restore();
+  }
+  const originPatterns = asks.filter((entry) => entry.permission === "browser.origin").map((entry) => entry.patterns);
+  assert.deepEqual(originPatterns, [
+    ["https://example.com:443/public"],
+    ["https://example.com:443/"]
+  ]);
+});
+
+test("raw CDP Runtime object followups ask once for the current origin root", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-public", id: 7, navigationGeneration: 1, url: "https://example.com/public"
+    };
+    if (method === "cdpCommand") return { result: { value: 1 } };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_cdp.execute({
+      commandParams: { objectId: "remote-object-1" }, method: "Runtime.getProperties", tabId: 7
+    }, context(asks));
+  } finally {
+    bridge.restore();
+  }
+  const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
+  assert.deepEqual(originAsks.map((entry) => entry.patterns), [["https://example.com:443/"]]);
+});
+
+test("raw Page.navigate asks for the current origin root and exact destination without duplicates", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-public", id: 7, navigationGeneration: 1, url: "https://example.com/public"
+    };
+    if (method === "cdpCommand") return { frameId: "frame-7" };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_cdp.execute({
+      commandParams: { url: "https://next.example/landing" }, method: "Page.navigate", tabId: 7
+    }, context(asks));
+  } finally {
+    bridge.restore();
+  }
+  const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
+  assert.deepEqual(originAsks.map((entry) => entry.patterns), [[
+    "https://example.com:443/",
+    "https://next.example:443/landing"
+  ]]);
+});
+
 test("open asks for its normalized destination and exposes the same scope as an always rule", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];
@@ -449,7 +553,7 @@ test("wizard stops after a click changes scope before eval or screenshot", async
   const plugin = await OpenCodeChromeBridgePlugin();
   const wizardContext = context([]);
   wizardContext.ask = async (request) => {
-    if (request.permission === "browser.origin" && request.patterns.includes("https://redirect.example:443/next")) {
+    if (request.permission === "browser.origin" && request.patterns.includes("https://redirect.example:443/")) {
       throw new Error("redirect denied");
     }
   };
@@ -536,7 +640,7 @@ test("wizard re-resolves an asynchronous navigation committed during wait withou
     bridge.restore();
   }
   assert.equal(bridge.calls.filter((entry) => entry.method === "click").length, 1);
-  assert.ok(asks.some((request) => request.permission === "browser.origin" && request.patterns.includes("https://b.example:443/finish")));
+  assert.ok(asks.some((request) => request.permission === "browser.origin" && request.patterns.includes("https://b.example:443/")));
   assert.equal(bridge.calls.find((entry) => entry.method === "evaluate").expectedBindings[0].documentId, "document-b");
 });
 

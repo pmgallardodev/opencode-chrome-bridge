@@ -8,8 +8,9 @@ All notable changes to this project are documented in this file.
 
 - **Resumable session control.** Managed per-window tab groups, child-tab adoption, and
   `chrome_resume_session` preserve explicit handoff/deliverable work across restarts.
-- **Origin-scoped approvals.** Page tools bind grants to canonical scheme, effective
-  port, and path prefixes; session grants stay isolated and batches preflight origins.
+- **Origin-scoped approvals.** Page-local tools bind grants to canonical scheme, effective
+  port, and path prefixes. Arbitrary JavaScript and raw CDP require origin-root approval to
+  match the browser same-origin model; session grants stay isolated and batches preflight origins.
 - **Safe workspace uploads.** `chrome_upload_files` stages bounded file chunks and
   commits only after every real workspace file and live input ref is verified.
 - **Private network summaries.** `chrome_network_requests` exposes bounded lifecycle
@@ -33,6 +34,8 @@ All notable changes to this project are documented in this file.
   extension capabilities instead of treating one permission as representative.
 - Browser origin authorization is recomputed after navigation and redirect; stale page
   provenance, partial uploads, and recovery failures all fail closed.
+- Network summaries accept events only from the proven current top-level frame and loader;
+  attachment seeds that binding before Network capture and navigation rotates it fail closed.
 
 ## v1.2.0 — 2026-07-15
 

@@ -1250,14 +1250,26 @@ function requireApprovals(tools, schema) {
         const pageMetadata = new Map();
         const beforeScopes = await resolvePageScopes(name, executionArgs, pageMetadata);
         const beforeBindings = await resolvePageBindings(name, executionArgs, pageMetadata);
-        await authorizePageScopes(beforeScopes, args?.originGrant, context, describe(args), callGrants);
+        await authorizePageScopes(
+          approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
+          args?.originGrant,
+          context,
+          describe(args),
+          callGrants
+        );
         const executionContext = {
           ...context,
           authorizePageTransition: async (scope) => {
-            await authorizePageScopes([scope], args?.originGrant, context, {
-              ...describe(args),
-              action: `Authorize page transition during ${name}`
-            }, callGrants);
+            await authorizePageScopes(
+              approvalScopesForTool(name, executionArgs, [scope], "transition"),
+              args?.originGrant,
+              context,
+              {
+                ...describe(args),
+                action: `Authorize page transition during ${name}`
+              },
+              callGrants
+            );
             return Number.isInteger(executionArgs.tabId)
               ? (await resolvePageBindings(name, executionArgs))[0]
               : undefined;
@@ -1274,7 +1286,7 @@ function requireApprovals(tools, schema) {
           ...pageScopesFromReturnedResult(name, executionArgs, result),
           ...await resolvePostExecutionPageScopes(name, executionArgs, result)
         ];
-        await authorizePageScopes(afterScopes, args?.originGrant, context, {
+        await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
           ...describe(args),
           action: `Re-authorize page scope after ${name}`
         }, callGrants);
@@ -1375,6 +1387,23 @@ export function pageScopeCovers(grant, requested) {
   if (target.path === granted.path) return true;
   const prefix = granted.path.endsWith("/") ? granted.path.slice(0, -1) : granted.path;
   return target.path.startsWith(`${prefix}/`);
+}
+
+function approvalScopesForTool(name, args, scopes, phase) {
+  const exact = [...new Set(scopes.map(canonicalPageScope))];
+  const needsOriginRoot = name === "chrome_evaluate"
+    || (name === "chrome_wizard_step" && typeof args?.expression === "string" && args.expression.length > 0);
+  if (needsOriginRoot) return exact.map(originRootPageScope);
+  if (name !== "chrome_cdp") return exact;
+  if (args?.method === "Page.navigate") {
+    if (phase !== "before" || exact.length === 0) return exact;
+    return [originRootPageScope(exact[0]), ...exact.slice(1)];
+  }
+  return exact.map(originRootPageScope);
+}
+
+function originRootPageScope(scope) {
+  return `${splitPageScope(canonicalPageScope(scope)).origin}/`;
 }
 
 export function clearPageOriginSessionGrants() {

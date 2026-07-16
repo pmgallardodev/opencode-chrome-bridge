@@ -2187,6 +2187,85 @@ test("network request summaries merge lifecycle events and redact sensitive URLs
   assert.equal(JSON.stringify(withDataUrl).includes("private-body-content"), false);
 });
 
+test("network capture seeds an already-loaded main loader and rejects unproven frame provenance", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Page.getFrameTree"
+      ? { frameTree: { frame: { id: "main-frame", loaderId: "main-loader", url: "https://example.com/" } } }
+      : {},
+    fillNetworkProvenance: false
+  });
+  await harness.execute("networkRequests", { tabId: 7 });
+  for (const event of [
+    {
+      frameId: "main-frame", loaderId: "main-loader", requestId: "main",
+      request: { method: "GET", url: "https://example.com/api" }, timestamp: 1, type: "Fetch"
+    },
+    {
+      frameId: "iframe", loaderId: "iframe-loader", requestId: "iframe",
+      request: { method: "GET", url: "https://third.example/private" }, timestamp: 2, type: "Fetch"
+    },
+    {
+      frameId: "main-frame", loaderId: "stale-loader", requestId: "stale",
+      request: { method: "GET", url: "https://stale.example/private" }, timestamp: 3, type: "Fetch"
+    },
+    {
+      frameId: "main-frame", requestId: "missing-loader",
+      request: { method: "GET", url: "https://missing.example/private" }, timestamp: 4, type: "Fetch"
+    }
+  ]) {
+    await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", event);
+  }
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(JSON.stringify(result.requests.map((entry) => entry.requestId)), JSON.stringify(["main"]));
+  assert.doesNotMatch(JSON.stringify(result), /third\.example|stale\.example|missing\.example/iu);
+  const methods = harness.calls.debuggerCommands.map((entry) => entry.method);
+  assert.ok(methods.indexOf("Page.getFrameTree") < methods.indexOf("Network.enable"));
+});
+
+test("network capture fails closed when the current main loader cannot be proven", async () => {
+  const harness = createBackgroundHarness({ fillNetworkProvenance: false });
+  await assert.rejects(
+    harness.execute("networkRequests", { tabId: 7 }),
+    /proven.*top-level.*loader|main-frame loader/iu
+  );
+  assert.equal(harness.calls.debuggerCommands.some((entry) => entry.method === "Network.enable"), false);
+  assert.equal(harness.networkTrackerState(7), null);
+});
+
+test("top-level navigation clears network history until the new main loader is proven", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Page.getFrameTree"
+      ? { frameTree: { frame: { id: "frame-a", loaderId: "loader-a", url: "https://example.com/" } } }
+      : {},
+    fillNetworkProvenance: false
+  });
+  await harness.execute("networkRequests", { tabId: 7 });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    frameId: "frame-a", loaderId: "loader-a", requestId: "old",
+    request: { method: "GET", url: "https://example.com/old" }, timestamp: 1, type: "Fetch"
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-7", frameId: 0, tabId: 7, timeStamp: 2, url: "https://next.example/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    frameId: "frame-a", loaderId: "loader-a", requestId: "late-old",
+    request: { method: "GET", url: "https://example.com/private" }, timestamp: 3, type: "Fetch"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-b", loaderId: "loader-b", url: "https://next.example/" }
+  });
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-b", frameId: 0, tabId: 7, timeStamp: 4, url: "https://next.example/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Network.requestWillBeSent", {
+    frameId: "frame-b", loaderId: "loader-b", requestId: "current",
+    request: { method: "GET", url: "https://next.example/current" }, timestamp: 5, type: "Fetch"
+  });
+  const result = await harness.execute("networkRequests", { tabId: 7, autoAttach: false });
+  assert.equal(JSON.stringify(result.requests.map((entry) => entry.requestId)), JSON.stringify(["current"]));
+  assert.doesNotMatch(JSON.stringify(result), /private|late-old|example\.com\/old/iu);
+});
+
 test("network request cursors advance on every lifecycle mutation", async () => {
   const harness = createBackgroundHarness();
   await harness.execute("networkRequests", { tabId: 7 });
@@ -3801,6 +3880,7 @@ function createBackgroundHarness({
   storageSet = async () => {},
   debuggerAttach = async () => {},
   debuggerSendCommand = async () => ({}),
+  fillNetworkProvenance = true,
   consoleError = () => {},
   downloadsSearch = async () => [],
   downloadsShowDefaultFolder = async () => {},
@@ -3830,7 +3910,15 @@ function createBackgroundHarness({
   let debuggerTargets = [];
   const events = {
     debuggerOnDetach: createEvent(),
-    debuggerOnEvent: createEvent(),
+    debuggerOnEvent: createEvent((args) => {
+      if (!fillNetworkProvenance || args[1] !== "Network.requestWillBeSent") return args;
+      const tabId = args[0]?.tabId;
+      return [args[0], args[1], {
+        frameId: args[2]?.frameId ?? `main-frame-${tabId}`,
+        loaderId: args[2]?.loaderId ?? `main-loader-${tabId}`,
+        ...args[2]
+      }];
+    }),
     nativeOnDisconnect: createEvent(),
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
@@ -3877,7 +3965,16 @@ function createBackgroundHarness({
       onEvent: events.debuggerOnEvent,
       sendCommand: async (target, method, params) => {
         calls.debuggerCommands.push({ target, method, params });
-        return debuggerSendCommand(target, method, params);
+        const result = await debuggerSendCommand(target, method, params);
+        if (fillNetworkProvenance && method === "Page.getFrameTree" && !result?.frameTree?.frame) {
+          const tab = await tabsGet(target.tabId);
+          return { frameTree: { frame: {
+            id: `main-frame-${target.tabId}`,
+            loaderId: `main-loader-${target.tabId}`,
+            url: tab.url
+          } } };
+        }
+        return result;
       }
     },
     downloads: {
@@ -4037,14 +4134,15 @@ function createBackgroundHarness({
   };
 }
 
-function createEvent() {
+function createEvent(transform = null) {
   const listeners = [];
   return {
     addListener(listener) {
       listeners.push(listener);
     },
     async emit(...args) {
-      await Promise.all(listeners.map((listener) => listener(...args)));
+      const emitted = transform ? transform(args) : args;
+      await Promise.all(listeners.map((listener) => listener(...emitted)));
     }
   };
 }

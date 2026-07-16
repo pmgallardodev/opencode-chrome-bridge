@@ -416,10 +416,14 @@ tabs and keeps handoff state intact when recovery must be retried.
 | `chrome_page_assets` | Inventory deduplicated DOM/CDP resources and optionally save an atomic workspace bundle |
 | `chrome_notify` | Show a branded Chrome notification with a title up to 120 characters and message up to 1,000 characters |
 
-Page tools request canonical `scheme://host:effective-port/path` scopes. Grants preserve
-scheme, effective port, and configured path boundaries; navigation and redirects are
-recomputed, session grants are isolated by OpenCode session, and batch preflight denies
-the whole action list before side effects when any origin is refused.
+Page-local tools request canonical `scheme://host:effective-port/path` scopes. Their grants
+preserve scheme, effective port, and configured path boundaries; navigation and redirects
+are recomputed, session grants are isolated by OpenCode session, and batch preflight denies
+the whole action list before side effects when any origin is refused. Arbitrary JavaScript
+(`chrome_evaluate` and wizard expressions) and raw `chrome_cdp` instead require approval
+for the complete origin root because the browser same-origin model lets code on `/public`
+reach same-origin resources such as `/admin`; a path approval does not isolate those tools.
+`Page.navigate` additionally requires its destination scope.
 
 `chrome_upload_files` resolves and opens every file below the real workspace before
 staging bytes. Directories, symlink escapes, identity swaps, stale refs, and partial
@@ -549,6 +553,11 @@ Treat that token as a full local browser-control capability. Any local process t
 The extension requests only the browser permissions used by its implemented tools: `alarms`, `bookmarks`, `debugger`, `downloads`, `downloads.ui`, `history`, `nativeMessaging`, `notifications`, `scripting`, `storage`, `tabGroups`, `tabs`, and `webNavigation`. It also requests `<all_urls>` host access so it can inject the local cursor overlay into controlled pages. The extension-page CSP blocks network connections; only the Node plugin talks to the authenticated local HTTP bridge, while the extension communicates with the native host through Chrome native messaging.
 
 `chrome_cdp` is intentionally powerful. It is equivalent to enabling full CDP access for OpenCode — it can inspect and control sensitive Chrome internals in the connected profile. Keep this extension loaded only in Chrome profiles where OpenCode is allowed to inspect browser state.
+
+Arbitrary JavaScript and raw CDP approvals are therefore origin-wide rather than
+path-prefix grants. Execution remains bound to the exact approved live document, but
+Chrome's same-origin model means approving these tools on `/public` cannot isolate
+same-origin `/admin` data.
 
 ### Tool approval prompts
 

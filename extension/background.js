@@ -2438,6 +2438,7 @@ function registerBrowserEventListeners() {
     if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
     navigationSequences.set(details.tabId, (navigationSequences.get(details.tabId) ?? 0) + 1);
     invalidateProvenanceForNavigationAttempt(details.tabId, details);
+    awaitProvenNetworkMainFrame(details.tabId, safeCanonicalPermissionScope(details.url));
   });
   chrome.webNavigation.onCommitted?.addListener((details) => {
     if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
@@ -2462,6 +2463,7 @@ function registerBrowserEventListeners() {
     });
     executionContextScopes.delete(details.tabId);
     tabMainFrameEpochs.delete(details.tabId);
+    awaitProvenNetworkMainFrame(details.tabId, pageScope);
     reconcileMainFrameEpoch(details.tabId, { discardMismatch: true });
     consoleLogBuffers.delete(details.tabId);
     consoleLogBufferChars.delete(details.tabId);
@@ -2712,6 +2714,9 @@ function reconcileMainFrameEpoch(tabId, { discardMismatch = false } = {}) {
     documentId: current.documentId,
     navigationGeneration: current.navigationGeneration
   });
+  if (networkTrackerAttached.has(tabId)) {
+    rotateNetworkStateToEpoch(tabId, tabMainFrameEpochs.get(tabId));
+  }
 }
 
 function invalidateProvenanceForNavigationAttempt(tabId, details) {
@@ -4322,21 +4327,24 @@ async function assertNavigationAllowed(url) {
 }
 
 async function acquireNetworkWaitTracker(tabId) {
+  await refreshTabPageProvenance(tabId);
   const target = { tabId };
   await withDebuggerLock(debuggerKey(target), async () => {
     const consumers = networkWaitConsumers.get(tabId) ?? 0;
     if (consumers > 0) {
+      await seedNetworkRequestProvenance(tabId, target);
       networkWaitConsumers.set(tabId, consumers + 1);
       return;
     }
     const reused = isPersistentDebuggerAttached(tabId);
+    const hadPageDomain = cdpEnabledDomains.get(tabId)?.has("Page") === true;
     let attachedHere = false;
     try {
       if (!reused) {
         await chrome.debugger.attach(target, DEBUGGER_VERSION);
         attachedHere = true;
       }
-      ensureNetworkRequestState(tabId);
+      await seedNetworkRequestProvenance(tabId, target);
       networkTrackerAttached.add(tabId);
       networkWaitConsumers.set(tabId, 1);
       await enableRequiredCdpDomain(target, "Network");
@@ -4344,6 +4352,12 @@ async function acquireNetworkWaitTracker(tabId) {
       networkWaitConsumers.delete(tabId);
       networkTrackerAttached.delete(tabId);
       networkRequestStates.delete(tabId);
+      const enabled = cdpEnabledDomains.get(tabId);
+      if (!attachedHere && !hadPageDomain && enabled?.has("Page")) {
+        await chrome.debugger.sendCommand(target, "Page.disable", {}).catch(() => {});
+        enabled.delete("Page");
+        if (enabled.size === 0) cdpEnabledDomains.delete(tabId);
+      }
       if (attachedHere) {
         cdpEnabledDomains.delete(tabId);
         await chrome.debugger.detach(target).catch(() => {});
@@ -4378,11 +4392,18 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
     throwIfAborted(signal);
     const hadNetworkCapture = networkCaptureAttached.has(tabId);
     if (hadNetworkCapture && cdpEnabledDomains.get(tabId)?.has("Network") === true) {
-      throwIfAborted(signal);
-      return { attached: true, alreadyAttached: true, tabId };
+      try {
+        await seedNetworkRequestProvenance(tabId, target, signal);
+        throwIfAborted(signal);
+        return { attached: true, alreadyAttached: true, tabId };
+      } catch (error) {
+        networkRequestStates.delete(tabId);
+        throw error;
+      }
     }
     const reused = isPersistentDebuggerAttached(tabId);
     const hadNetworkDomain = cdpEnabledDomains.get(tabId)?.has("Network") === true;
+    const hadPageDomain = cdpEnabledDomains.get(tabId)?.has("Page") === true;
     const hadNetworkState = networkRequestStates.has(tabId);
     const hadNetworkTracker = networkTrackerAttached.has(tabId);
     let attachedHere = false;
@@ -4393,7 +4414,7 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
         attachedHere = true;
         throwIfAborted(signal);
       }
-      ensureNetworkRequestState(tabId);
+      await seedNetworkRequestProvenance(tabId, target, signal);
       networkTrackerAttached.add(tabId);
       networkCaptureAttached.add(tabId);
       throwIfAborted(signal);
@@ -4408,6 +4429,11 @@ async function ensureNetworkCaptureDebugger(tabId, signal) {
       if (!attachedHere && !hadNetworkDomain && enabled?.has("Network")) {
         await chrome.debugger.sendCommand(target, "Network.disable", {}).catch(() => {});
         enabled.delete("Network");
+        if (enabled.size === 0) cdpEnabledDomains.delete(tabId);
+      }
+      if (!attachedHere && !hadPageDomain && enabled?.has("Page")) {
+        await chrome.debugger.sendCommand(target, "Page.disable", {}).catch(() => {});
+        enabled.delete("Page");
         if (enabled.size === 0) cdpEnabledDomains.delete(tabId);
       }
       if (attachedHere) {
@@ -4431,13 +4457,59 @@ function ensureNetworkRequestState(tabId) {
     nextCursor: 1,
     overflowed: false,
     awaitingTopLevelDocument: false,
+    documentId: null,
+    frameId: null,
     loaderId: null,
+    navigationGeneration: null,
     pageScope: tabPageProvenance.get(tabId)?.pageScope ?? null,
     requests: new Map(),
     trackingSince
   };
   networkRequestStates.set(tabId, state);
   return state;
+}
+
+async function seedNetworkRequestProvenance(tabId, target, signal) {
+  throwIfAborted(signal);
+  await enableRequiredCdpDomain(target, "Page", signal);
+  const epoch = await seedMainFrameEpoch(tabId, target);
+  const current = tabPageProvenance.get(tabId);
+  if (!epoch || !current
+    || epoch.documentId !== current.documentId
+    || epoch.navigationGeneration !== current.navigationGeneration
+    || epoch.pageScope !== current.pageScope) {
+    throw new Error("network capture requires a proven current top-level main-frame loader");
+  }
+  rotateNetworkStateToEpoch(tabId, epoch);
+}
+
+function rotateNetworkStateToEpoch(tabId, epoch) {
+  const existing = networkRequestStates.get(tabId);
+  if (existing
+    && existing.awaitingTopLevelDocument === false
+    && existing.documentId === epoch.documentId
+    && existing.navigationGeneration === epoch.navigationGeneration
+    && existing.frameId === epoch.frameId
+    && existing.loaderId === epoch.loaderId) return existing;
+  networkRequestStates.delete(tabId);
+  const state = ensureNetworkRequestState(tabId);
+  Object.assign(state, {
+    awaitingTopLevelDocument: false,
+    documentId: epoch.documentId,
+    frameId: epoch.frameId,
+    loaderId: epoch.loaderId,
+    navigationGeneration: epoch.navigationGeneration,
+    pageScope: epoch.pageScope
+  });
+  return state;
+}
+
+function awaitProvenNetworkMainFrame(tabId, pageScope) {
+  if (!networkTrackerAttached.has(tabId)) return;
+  networkRequestStates.delete(tabId);
+  const state = ensureNetworkRequestState(tabId);
+  state.awaitingTopLevelDocument = true;
+  state.pageScope = pageScope ?? null;
 }
 
 async function enableRequiredCdpDomain(target, domain, signal) {
@@ -4458,17 +4530,14 @@ function trackNetworkEvent(tabId, method, params) {
   const requestId = typeof params?.requestId === "string" ? params.requestId : "";
   if (!state || requestId.length === 0 || requestId.length > 500) return;
   const now = Date.now();
-  state.lastActivityAt = now;
 
   if (method === "Network.requestWillBeSent") {
-    if (state.awaitingTopLevelDocument) {
-      const requestScope = safeCanonicalPermissionScope(params?.request?.url);
-      if (params?.type !== "Document" || requestScope !== state.pageScope) return;
-      state.awaitingTopLevelDocument = false;
-      state.loaderId = typeof params?.loaderId === "string" ? params.loaderId : params.requestId;
-    } else if (state.loaderId && typeof params?.loaderId === "string" && params.loaderId !== state.loaderId) {
-      return;
-    }
+    if (state.awaitingTopLevelDocument
+      || typeof state.loaderId !== "string"
+      || typeof state.frameId !== "string"
+      || params?.loaderId !== state.loaderId
+      || params?.frameId !== state.frameId) return;
+    state.lastActivityAt = now;
     const cursor = state.nextCursor++;
     const previous = state.requests.get(requestId);
     let entry = previous;
@@ -4506,6 +4575,7 @@ function trackNetworkEvent(tabId, method, params) {
 
   const entry = state.requests.get(requestId);
   if (!entry) return;
+  state.lastActivityAt = now;
   state.bufferChars -= entry.bufferChars ?? 0;
   entry.cursor = state.nextCursor++;
   if (method === "Network.responseReceived") {
@@ -4753,13 +4823,19 @@ async function ensureCdpEventDebugger(tabId, methods) {
 
 async function seedMainFrameEpoch(tabId, target) {
   const current = tabPageProvenance.get(tabId);
-  if (!current) return;
+  if (!current) return null;
+  const existing = tabMainFrameEpochs.get(tabId);
+  if (existing
+    && existing.documentId === current.documentId
+    && existing.navigationGeneration === current.navigationGeneration
+    && existing.pageScope === current.pageScope) return existing;
   let frame;
-  try { frame = (await chrome.debugger.sendCommand(target, "Page.getFrameTree", {}))?.frameTree?.frame; } catch { return; }
-  if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return;
+  try { frame = (await chrome.debugger.sendCommand(target, "Page.getFrameTree", {}))?.frameTree?.frame; } catch { return null; }
+  if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return null;
   const pageScope = safeCanonicalPermissionScope(frame.url);
-  if (!pageScope || pageScope !== current.pageScope) return;
+  if (!pageScope || pageScope !== current.pageScope) return null;
   observeMainFrame(tabId, { frameId: frame.id, loaderId: frame.loaderId, pageScope });
+  return tabMainFrameEpochs.get(tabId) ?? null;
 }
 
 async function enableCdpDomains(target, domains) {

@@ -209,6 +209,13 @@ test("README documents deny-by-default browser approvals", async () => {
   assert.doesNotMatch(readme, /gate falls back/iu);
 });
 
+test("README distinguishes path-local approvals from origin-wide JavaScript and raw CDP", async () => {
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  assert.match(readme, /page-local tools[\s\S]*path boundaries/iu);
+  assert.match(readme, /arbitrary JavaScript[\s\S]*raw.*CDP[\s\S]*origin root/iu);
+  assert.match(readme, /same-origin[\s\S]*\/public[\s\S]*\/admin/iu);
+});
+
 test("README explains that extension pages cannot access the HTTP bridge", async () => {
   const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
   assert.match(readme, /extension-page CSP blocks network connections/iu);
