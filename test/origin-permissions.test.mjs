@@ -783,6 +783,40 @@ test("every public tool has an explicit page or browser origin classification", 
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
 });
 
+test("WebMCP discovery is document-bound while invocation requires exact current-origin approval", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-webmcp", id: 7, navigationGeneration: 4, url: "https://shop.example/cart"
+    };
+    if (method === "webMcpList") return { supported: true, source: "document", tools: [] };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_webmcp_list.execute({ tabId: 7 }, context(asks));
+    await assert.rejects(() => plugin.tool.chrome_webmcp_invoke.execute({
+      input: {}, originGrant: "once", tabId: 7, timeoutMs: 1_000, toolName: "cart.add"
+    }, {
+      ...context(asks),
+      ask: async (request) => {
+        asks.push(request);
+        if (request.permission === "browser.origin") throw new Error("WebMCP origin denied");
+      }
+    }), /WebMCP origin denied/u);
+  } finally {
+    bridge.restore();
+  }
+  assert.deepEqual(asks.map((entry) => entry.permission), [
+    "chrome_webmcp_list", "chrome_webmcp_invoke", "browser.origin"
+  ]);
+  assert.deepEqual(asks.at(-1).patterns, ["https://shop.example:443/cart"]);
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["getTab", "webMcpList", "getTab", "getTab"]);
+  const listCall = bridge.calls.find((entry) => entry.method === "webMcpList");
+  assert.equal(listCall.scoped, true);
+  assert.equal(listCall.expectedBindings[0].documentId, "document-webmcp");
+});
+
 test("origin-bearing events drop internal page metadata before exposure", () => {
   const sanitized = pluginModule.sanitizeOriginBearingEvents({
     events: [

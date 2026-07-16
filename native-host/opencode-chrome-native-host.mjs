@@ -44,6 +44,7 @@ const HOST_REQUIRED_EXTENSION_CAPABILITIES = Object.freeze([
   "browser.tab-groups",
   "browser.tabs",
   "browser.wait",
+  "browser.webmcp",
   "browser.windows",
   "browser.workflows",
   "session.resume",

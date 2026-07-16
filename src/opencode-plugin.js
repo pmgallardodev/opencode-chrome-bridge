@@ -37,7 +37,7 @@ const TAB_SCOPED_TOOLS = new Set([
   "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
   "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
   "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step", "chrome_cursor_state",
-  "chrome_favicon_badge"
+  "chrome_favicon_badge", "chrome_webmcp_invoke", "chrome_webmcp_list"
 ]);
 const PAGE_SCOPED_TOOLS = new Set([
   ...DESTINATION_SCOPED_TOOLS,
@@ -144,6 +144,8 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
   chrome_wait_for: capabilities("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
+  chrome_webmcp_invoke: capabilities("browser.tabs", "browser.webmcp"),
+  chrome_webmcp_list: capabilities("browser.tabs", "browser.webmcp"),
   chrome_workflow_cancel: capabilities("browser.workflows"),
   chrome_workflow_delete: capabilities("browser.workflows"),
   chrome_workflow_get: capabilities("browser.workflows"),
@@ -1195,6 +1197,32 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("accessibilityTree", args), null, 2);
         }
       }),
+      chrome_webmcp_list: tool({
+        description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter only reads feature-detected document.modelContext or navigator.modelContext APIs in Chrome's MAIN world.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id whose exact current document will be bound to this discovery call.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("webMcpList", args, { signal: context.abort }), null, 2);
+        }
+      }),
+      chrome_webmcp_invoke: tool({
+        description: "Invoke one exact WebMCP tool exposed by the current document, with bounded JSON input, output, and execution time. The current origin requires explicit approval.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id whose current origin has been explicitly approved."),
+          toolName: schema.string().min(1).max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u).describe("Exact WebMCP tool name returned by chrome_webmcp_list."),
+          input: schema.any().optional().describe("Losslessly JSON-serializable input, limited to 64 KiB."),
+          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("Page tool timeout in milliseconds.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("webMcpInvoke", {
+            input: Object.hasOwn(args, "input") ? args.input : {},
+            tabId: args.tabId,
+            timeoutMs: args.timeoutMs,
+            toolName: args.toolName
+          }, { signal: context.abort, timeoutMs: Math.min(35_000, args.timeoutMs + 5_000) }), null, 2);
+        }
+      }),
       chrome_click_element: tool({
         description: "Click an element in a Chrome tab by its accessibility-tree reference. Scrolls the element into view and clicks its center through CDP. Capture chrome_accessibility_tree first to obtain refs.",
         args: {
@@ -1392,6 +1420,7 @@ export default async function OpenCodeChromeBridgePlugin() {
 // they do not yet have custom prompt metadata. Only the local bridge status probe is
 // safe to run without access to browser data.
 const APPROVAL_EXEMPT_TOOLS = new Set(["chrome_status"]);
+const ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS = new Set(["chrome_webmcp_list"]);
 
 const APPROVAL_METADATA = {
   chrome_batch: (args) => ({
@@ -1421,6 +1450,8 @@ const APPROVAL_METADATA = {
   chrome_tab_context: (args) => ({ action: "Read bounded page context and selection", tabId: args.tabId, outputDirectory: args.outputDirectory }),
   chrome_read_page: (args) => ({ action: "Read page context, accessibility, and optional screenshot", tabId: args.tabId, includeScreenshot: args.includeScreenshot, outputDirectory: args.outputDirectory }),
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
+  chrome_webmcp_list: (args) => ({ action: "List declarative WebMCP tools exposed by the current page", tabId: args.tabId }),
+  chrome_webmcp_invoke: (args) => ({ action: "Invoke one declarative WebMCP page tool", tabId: args.tabId, toolName: args.toolName, timeoutMs: args.timeoutMs }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
   chrome_upload_files: (args) => ({ action: "Upload workspace files to a page file input", tabId: args.tabId, ref: args.ref, files: args.paths?.length }),
@@ -1481,7 +1512,7 @@ function requireApprovals(tools, schema) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
-    if (PAGE_SCOPED_TOOLS.has(name)) {
+    if (PAGE_SCOPED_TOOLS.has(name) && !ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
       definition.args.originGrant = schema.enum(["once", "session"]).default("once")
         .describe("Use once for this call, or explicitly cache approved page scopes only for the current OpenCode session.");
     }
@@ -1513,13 +1544,15 @@ function requireApprovals(tools, schema) {
         const pageMetadata = new Map();
         const beforeScopes = await resolvePageScopes(name, executionArgs, pageMetadata);
         const beforeBindings = await resolvePageBindings(name, executionArgs, pageMetadata);
-        await authorizePageScopes(
-          approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
-          args?.originGrant,
-          context,
-          describe(args),
-          callGrants
-        );
+        if (!ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
+          await authorizePageScopes(
+            approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
+            args?.originGrant,
+            context,
+            describe(args),
+            callGrants
+          );
+        }
         const executionContext = {
           ...context,
           authorizePageTransition: async (scope) => {
@@ -1549,10 +1582,12 @@ function requireApprovals(tools, schema) {
           ...pageScopesFromReturnedResult(name, executionArgs, result),
           ...await resolvePostExecutionPageScopes(name, executionArgs, result)
         ];
-        await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
-          ...describe(args),
-          action: `Re-authorize page scope after ${name}`
-        }, callGrants);
+        if (!ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
+          await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
+            ...describe(args),
+            action: `Re-authorize page scope after ${name}`
+          }, callGrants);
+        }
         return result;
       }
     };

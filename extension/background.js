@@ -22,6 +22,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.tab-groups",
   "browser.tabs",
   "browser.wait",
+  "browser.webmcp",
   "browser.windows",
   "browser.workflows",
   "session.resume",
@@ -61,6 +62,19 @@ const MIN_WAIT_TIMEOUT_MS = 50;
 const MAX_WAIT_POLL_MS = 1_000;
 const MIN_WAIT_POLL_MS = 10;
 const MAX_WAIT_VALUE_CHARS = 2_000;
+const MAX_WEBMCP_TOOLS = 100;
+const MAX_WEBMCP_NAME_CHARS = 100;
+const MAX_WEBMCP_DESCRIPTION_CHARS = 2_000;
+const MAX_WEBMCP_INPUT_BYTES = 64 * 1024;
+const MAX_WEBMCP_OUTPUT_BYTES = 512 * 1024;
+const MAX_WEBMCP_SCHEMA_BYTES = 64 * 1024;
+const MAX_WEBMCP_ENVELOPE_BYTES = 768 * 1024;
+const MAX_WEBMCP_JSON_DEPTH = 20;
+const MAX_WEBMCP_JSON_NODES = 5_000;
+const MIN_WEBMCP_TIMEOUT_MS = 50;
+const MAX_WEBMCP_TIMEOUT_MS = 30_000;
+const DEFAULT_WEBMCP_TIMEOUT_MS = 10_000;
+const WEBMCP_TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u;
 const MAX_NETWORK_REQUEST_STATES = 1_000;
 const MAX_NETWORK_BUFFER_CHARS = 2_000_000;
 const MAX_NETWORK_RESULT_LIMIT = 500;
@@ -156,6 +170,7 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "fileUploadCommit", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
   "pageAssets",
+  "webMcpList", "webMcpInvoke",
   "workflowRun",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
@@ -685,6 +700,10 @@ async function executeCommandCore(method, params, options = {}) {
       return findElements(params, options.signal);
     case "waitFor":
       return waitFor(params, options);
+    case "webMcpList":
+      return listWebMcpTools(params, options.signal);
+    case "webMcpInvoke":
+      return invokeWebMcpTool(params, options.signal);
     case "browserBatch":
       return browserBatch(params, options);
     case "clickElement":
@@ -2225,6 +2244,357 @@ function tabInfo(tab) {
 function requireTabId(params) {
   if (!Number.isInteger(params.tabId)) throw new Error("tabId must be an integer");
   return params.tabId;
+}
+
+async function listWebMcpTools(params, signal) {
+  assertWebMcpFields(params, ["tabId"], "WebMCP list");
+  const envelope = await runWebMcpMainAdapter(requireTabId(params), "list", {}, signal);
+  if (envelope.supported === false) {
+    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED"].includes(envelope.error?.code)) {
+      throw new Error(`WebMCP metadata is invalid: ${sanitizeWebMcpError(envelope.error?.message)}`);
+    }
+    return {
+      error: validateWebMcpError(envelope.error),
+      source: null,
+      supported: false,
+      tools: []
+    };
+  }
+  if (envelope.supported !== true || !["document", "navigator"].includes(envelope.source)) {
+    throw new Error("WebMCP metadata response is invalid");
+  }
+  return {
+    source: envelope.source,
+    supported: true,
+    tools: validateWebMcpTools(envelope.tools)
+  };
+}
+
+async function invokeWebMcpTool(params, signal) {
+  assertWebMcpFields(params, ["input", "tabId", "timeoutMs", "toolName"], "WebMCP invoke");
+  const tabId = requireTabId(params);
+  const toolName = requireWebMcpToolName(params.toolName);
+  const timeoutMs = strictBatchInteger(
+    params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+    DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+  );
+  const input = cloneBoundedWebMcpJson(
+    Object.hasOwn(params, "input") ? params.input : {},
+    "WebMCP input",
+    MAX_WEBMCP_INPUT_BYTES
+  );
+  const envelope = await runWebMcpMainAdapter(tabId, "invoke", { input, timeoutMs, toolName }, signal);
+  if (!isRecord(envelope)) throw new Error("WebMCP invocation response is invalid");
+  if (envelope.ok === false) {
+    const error = validateWebMcpError(envelope.error);
+    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_INVOCATION_UNSUPPORTED",
+      "WEBMCP_TOOL_NOT_FOUND", "WEBMCP_TOOL_ERROR", "WEBMCP_TIMEOUT",
+      "WEBMCP_OUTPUT_INVALID", "WEBMCP_OUTPUT_TOO_LARGE"].includes(error.code)) {
+      throw new Error("WebMCP invocation returned an invalid error code");
+    }
+    return {
+      error,
+      ok: false,
+      source: ["document", "navigator"].includes(envelope.source) ? envelope.source : null,
+      supported: envelope.supported === true,
+      toolName
+    };
+  }
+  if (envelope.ok !== true || envelope.supported !== true
+    || !["document", "navigator"].includes(envelope.source)
+    || !["executeTool", "invokeTool", "callTool"].includes(envelope.invocation)
+    || envelope.toolName !== toolName) {
+    throw new Error("WebMCP invocation response is invalid");
+  }
+  return {
+    invocation: envelope.invocation,
+    ok: true,
+    result: cloneBoundedWebMcpJson(envelope.result, "WebMCP output", MAX_WEBMCP_OUTPUT_BYTES),
+    source: envelope.source,
+    supported: true,
+    toolName
+  };
+}
+
+async function runWebMcpMainAdapter(tabId, operation, payload, signal) {
+  throwIfAborted(signal);
+  let results;
+  try {
+    results = await abortableChromeOperation(chrome.scripting.executeScript({
+      args: [operation, payload],
+      func: webMcpMainAdapter,
+      target: { tabId },
+      world: "MAIN"
+    }), signal);
+  } catch (error) {
+    throwIfAborted(signal);
+    return operation === "list"
+      ? webMcpUnsupportedList("The page or browser does not expose an executable MAIN-world WebMCP context")
+      : webMcpInvocationError("WEBMCP_UNSUPPORTED", "The page or browser does not expose an executable MAIN-world WebMCP context", false);
+  }
+  throwIfAborted(signal);
+  if (!Array.isArray(results) || results.length !== 1 || typeof results[0]?.result !== "string") {
+    throw new Error("WebMCP MAIN-world adapter returned an invalid envelope");
+  }
+  const serialized = results[0].result;
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WEBMCP_ENVELOPE_BYTES) {
+    if (operation === "invoke") {
+      return webMcpInvocationError("WEBMCP_OUTPUT_TOO_LARGE", "WebMCP output exceeded the bounded response size", true);
+    }
+    throw new Error("WebMCP metadata response is too large");
+  }
+  try {
+    return JSON.parse(serialized);
+  } catch {
+    throw new Error("WebMCP MAIN-world adapter returned invalid JSON");
+  }
+}
+
+// This function is serialized by chrome.scripting and executes once in the page's
+// MAIN world. Keep every dependency local and return only a JSON string so page
+// functions, prototypes, and object identities never cross into the extension.
+async function webMcpMainAdapter(operation, payload) {
+  const maxTools = 100;
+  const maxDescriptionChars = 2_000;
+  const maxSchemaBytes = 64 * 1024;
+  const maxOutputBytes = 512 * 1024;
+  const maxDepth = 20;
+  const maxNodes = 5_000;
+  const namePattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u;
+
+  const byteLength = (text) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length
+        && text.charCodeAt(index + 1) >= 0xdc00 && text.charCodeAt(index + 1) <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    }
+    return bytes;
+  };
+  const cloneJson = (value, label, maxBytes) => {
+    const ancestors = new Set();
+    let nodes = 0;
+    const visit = (current, depth) => {
+      nodes += 1;
+      if (nodes > maxNodes || depth > maxDepth) throw new Error(`${label} is not bounded JSON`);
+      if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+      if (typeof current === "number") {
+        if (!Number.isFinite(current)) throw new Error(`${label} contains a non-finite number`);
+        return current;
+      }
+      if (typeof current !== "object") throw new Error(`${label} contains a non-JSON value`);
+      if (ancestors.has(current)) throw new Error(`${label} contains a cycle`);
+      ancestors.add(current);
+      let copy;
+      if (Array.isArray(current)) {
+        copy = current.map((entry) => visit(entry, depth + 1));
+      } else {
+        copy = {};
+        for (const key of Object.keys(current)) copy[key] = visit(current[key], depth + 1);
+      }
+      ancestors.delete(current);
+      return copy;
+    };
+    const copy = visit(value, 0);
+    const serialized = JSON.stringify(copy);
+    if (typeof serialized !== "string") throw new Error(`${label} is not serializable JSON`);
+    if (byteLength(serialized) > maxBytes) throw new Error(`${label} is too large`);
+    return JSON.parse(serialized);
+  };
+  const errorEnvelope = (code, message, supported, source = null) => ({
+    error: { code, message: String(message || code).slice(0, 500) },
+    ok: false,
+    source,
+    supported
+  });
+  const serialize = (value) => {
+    try { return JSON.stringify(value); } catch { return "{\"ok\":false,\"supported\":false,\"source\":null,\"error\":{\"code\":\"WEBMCP_OUTPUT_INVALID\",\"message\":\"WebMCP adapter could not serialize its result\"}}"; }
+  };
+
+  try {
+    const documentContext = typeof document === "object" && document ? document.modelContext : null;
+    const navigatorContext = typeof navigator === "object" && navigator ? navigator.modelContext : null;
+    const context = documentContext && typeof documentContext === "object"
+      ? documentContext
+      : navigatorContext && typeof navigatorContext === "object" ? navigatorContext : null;
+    const source = context === documentContext ? "document" : context === navigatorContext ? "navigator" : null;
+    if (!context) {
+      return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_UNSUPPORTED", message: "This page does not expose WebMCP" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_UNSUPPORTED", "This page does not expose WebMCP", false));
+    }
+
+    let discovered;
+    if (typeof context.getTools === "function") discovered = await context.getTools();
+    else if (typeof context.listTools === "function") discovered = await context.listTools();
+    else if (Array.isArray(context.tools)) discovered = context.tools;
+    else {
+      return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
+    }
+    const rawTools = Array.isArray(discovered) ? discovered : discovered && Array.isArray(discovered.tools) ? discovered.tools : null;
+    if (!rawTools) throw new Error("WebMCP discovery returned an invalid tool list");
+    if (rawTools.length > maxTools) throw new Error("WebMCP tool list is too large");
+    const seen = new Set();
+    const tools = rawTools.map((raw) => {
+      if (!raw || typeof raw !== "object" || !namePattern.test(raw.name)) throw new Error("WebMCP tool name is invalid");
+      if (seen.has(raw.name)) throw new Error("WebMCP tool names contain a duplicate");
+      seen.add(raw.name);
+      const description = raw.description == null ? "" : raw.description;
+      if (typeof description !== "string" || description.length > maxDescriptionChars) throw new Error("WebMCP tool description is invalid or too large");
+      let schema = raw.inputSchema ?? raw.input_schema ?? {};
+      if (typeof schema === "string") {
+        try { schema = JSON.parse(schema); } catch { throw new Error("WebMCP input schema is invalid JSON"); }
+      }
+      return { description, inputSchema: cloneJson(schema, "WebMCP input schema", maxSchemaBytes), name: raw.name, raw };
+    });
+    if (operation === "list") {
+      return serialize({ source, supported: true, tools: tools.map(({ description, inputSchema, name }) => ({ description, inputSchema, name })) });
+    }
+    if (operation !== "invoke" || !payload || typeof payload !== "object" || !namePattern.test(payload.toolName)) {
+      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation request is invalid", true, source));
+    }
+    const matches = tools.filter((tool) => tool.name === payload.toolName);
+    if (matches.length !== 1) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
+    let invocation;
+    let execution;
+    if (typeof context.executeTool === "function") {
+      invocation = "executeTool";
+      execution = () => context.executeTool(matches[0].raw, JSON.stringify(payload.input));
+    } else if (typeof context.invokeTool === "function") {
+      invocation = "invokeTool";
+      execution = () => context.invokeTool(payload.toolName, payload.input);
+    } else if (typeof context.callTool === "function") {
+      invocation = "callTool";
+      execution = () => context.callTool(payload.toolName, payload.input);
+    } else {
+      return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
+    }
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("WebMCP tool timed out");
+        error.webMcpCode = "WEBMCP_TIMEOUT";
+        reject(error);
+      }, payload.timeoutMs);
+    });
+    let rawResult;
+    try {
+      rawResult = await Promise.race([Promise.resolve().then(execution), timeout]);
+    } catch (error) {
+      return serialize(errorEnvelope(error?.webMcpCode === "WEBMCP_TIMEOUT" ? "WEBMCP_TIMEOUT" : "WEBMCP_TOOL_ERROR", error?.message, true, source));
+    } finally {
+      clearTimeout(timer);
+    }
+    let result;
+    try {
+      result = cloneJson(rawResult, "WebMCP output", maxOutputBytes);
+    } catch (error) {
+      const message = String(error?.message || error);
+      return serialize(errorEnvelope(message.includes("too large") ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source));
+    }
+    return serialize({ invocation, ok: true, result, source, supported: true, toolName: payload.toolName });
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (operation === "list") {
+      return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
+    }
+    return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true));
+  }
+}
+
+function assertWebMcpFields(value, allowed, label) {
+  if (!isRecord(value)) throw new Error(`${label} params must be an object`);
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`${label} contains unsupported fields: ${extra.join(", ")}`);
+}
+
+function requireWebMcpToolName(value) {
+  if (typeof value !== "string" || value.length > MAX_WEBMCP_NAME_CHARS || !WEBMCP_TOOL_NAME_RE.test(value)) {
+    throw new Error("WebMCP toolName must be an exact bounded tool name");
+  }
+  return value;
+}
+
+function cloneBoundedWebMcpJson(value, label, maxBytes) {
+  const ancestors = new Set();
+  let nodes = 0;
+  function visit(current, depth) {
+    nodes += 1;
+    if (nodes > MAX_WEBMCP_JSON_NODES || depth > MAX_WEBMCP_JSON_DEPTH) throw new Error(`${label} is not bounded JSON`);
+    if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new Error(`${label} contains a non-finite number`);
+      return current;
+    }
+    if (typeof current !== "object") throw new Error(`${label} contains a value that is not JSON serializable`);
+    if (ancestors.has(current)) throw new Error(`${label} contains a cycle and is not JSON serializable`);
+    ancestors.add(current);
+    let copy;
+    if (Array.isArray(current)) copy = current.map((entry) => visit(entry, depth + 1));
+    else {
+      copy = {};
+      for (const key of Object.keys(current)) copy[key] = visit(current[key], depth + 1);
+    }
+    ancestors.delete(current);
+    return copy;
+  }
+  const copy = visit(value, 0);
+  const serialized = JSON.stringify(copy);
+  if (typeof serialized !== "string") throw new Error(`${label} is not JSON serializable`);
+  if (new TextEncoder().encode(serialized).byteLength > maxBytes) throw new Error(`${label} is too large for the bounded WebMCP bridge`);
+  return JSON.parse(serialized);
+}
+
+function validateWebMcpTools(value) {
+  if (!Array.isArray(value) || value.length > MAX_WEBMCP_TOOLS) throw new Error("WebMCP tool list is invalid or too large");
+  const seen = new Set();
+  return value.map((tool) => {
+    if (!isRecord(tool) || Object.keys(tool).some((field) => !["description", "inputSchema", "name"].includes(field))) {
+      throw new Error("WebMCP tool metadata is invalid");
+    }
+    const name = requireWebMcpToolName(tool.name);
+    if (seen.has(name)) throw new Error("WebMCP tool metadata contains a duplicate name");
+    seen.add(name);
+    if (typeof tool.description !== "string" || tool.description.length > MAX_WEBMCP_DESCRIPTION_CHARS) {
+      throw new Error("WebMCP tool description is invalid or too large");
+    }
+    return {
+      description: tool.description,
+      inputSchema: cloneBoundedWebMcpJson(tool.inputSchema, "WebMCP input schema", MAX_WEBMCP_SCHEMA_BYTES),
+      name
+    };
+  });
+}
+
+function sanitizeWebMcpError(error) {
+  const raw = typeof error === "string" ? error : error?.message ?? String(error ?? "WebMCP error");
+  return truncateString(raw, 500)
+    .replace(/https?:\/\/[^\s]+/giu, "[redacted-url]")
+    .replace(/(?:token|secret|password|authorization|cookie)\s*[=:]\s*[^\s,;]+/giu, "$1=[redacted]")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .trim();
+}
+
+function validateWebMcpError(value) {
+  if (!isRecord(value) || typeof value.code !== "string" || value.code.length > 100) {
+    throw new Error("WebMCP error response is invalid");
+  }
+  return { code: value.code, message: sanitizeWebMcpError(value.message) };
+}
+
+function webMcpUnsupportedList(message) {
+  return { error: { code: "WEBMCP_UNSUPPORTED", message }, source: null, supported: false, tools: [] };
+}
+
+function webMcpInvocationError(code, message, supported) {
+  return { error: { code, message }, ok: false, source: null, supported };
 }
 
 async function activateTab(tabId, signal) {

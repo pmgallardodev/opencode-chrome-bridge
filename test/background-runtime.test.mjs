@@ -4945,6 +4945,208 @@ test("scheduled execution fails closed and sanitizes bounded history and notific
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
 });
 
+function webMcpMainWorld({ documentContext, navigatorContext, onRun } = {}) {
+  return async (details) => {
+    assert.equal(details.world, "MAIN");
+    assert.equal(Array.isArray(details.files), false);
+    onRun?.();
+    const page = vm.createContext({
+      clearTimeout,
+      document: documentContext === undefined ? {} : { modelContext: documentContext },
+      Error,
+      JSON,
+      navigator: navigatorContext === undefined ? {} : { modelContext: navigatorContext },
+      Promise,
+      setTimeout
+    });
+    const injected = vm.runInContext(`(${details.func.toString()})`, page);
+    return [{ result: await injected(...(details.args ?? [])) }];
+  };
+}
+
+function webMcpEnvelope(method, params, origin = "https://example.com:443/") {
+  return {
+    expectedBindings: [pageBinding(7, origin)],
+    expectedScopes: [origin],
+    method,
+    params: { tabId: 7, ...params }
+  };
+}
+
+test("WebMCP list reports unsupported page and unsupported discovery shape structurally", async () => {
+  for (const [documentContext, expectedCode] of [[undefined, "WEBMCP_UNSUPPORTED"], [{}, "WEBMCP_DISCOVERY_UNSUPPORTED"]]) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext }) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, false);
+    assert.equal(result.error.code, expectedCode);
+    assert.equal(result.tools.length, 0);
+  }
+});
+
+test("WebMCP list supports bounded document and navigator discovery variants", async () => {
+  const variants = [
+    { source: "document", documentContext: { getTools: async () => [{ name: "cart.add", description: "Add item", inputSchema: { type: "object" } }] } },
+    { source: "navigator", navigatorContext: { listTools: async () => ({ tools: [{ name: "cart.remove", description: "Remove item", inputSchema: "{\"type\":\"object\"}" }] }) } },
+    { source: "navigator", navigatorContext: { tools: [{ name: "cart.read", description: "Read cart" }] } }
+  ];
+  for (const variant of variants) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld(variant) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, true);
+    assert.equal(result.source, variant.source);
+    assert.equal(result.tools.length, 1);
+    assert.match(result.tools[0].name, /^cart\./u);
+    assert.equal(typeof result.tools[0].inputSchema, "object");
+  }
+});
+
+test("WebMCP list rejects duplicate, unserializable, and oversized page tool metadata", async () => {
+  const cycle = {};
+  cycle.self = cycle;
+  const cases = [
+    [{ name: "duplicate", description: "a" }, { name: "duplicate", description: "b" }],
+    [{ name: "bad space", description: "bad" }],
+    [{ name: "cycle", description: "bad", inputSchema: cycle }],
+    Array.from({ length: 101 }, (_, index) => ({ name: `tool-${index}`, description: "x" })),
+    [{ name: "huge", description: "x".repeat(2001) }]
+  ];
+  for (const tools of cases) {
+    const harness = createBackgroundHarness({
+      scriptingExecuteScript: webMcpMainWorld({ documentContext: { getTools: async () => tools } })
+    });
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {})),
+      /WebMCP.*(?:invalid|bounded|duplicate|serializ|large|name|description)/iu
+    );
+  }
+});
+
+test("WebMCP invoke supports exact executeTool, invokeTool, and callTool variants", async () => {
+  const invocations = [];
+  const variants = [
+    { documentContext: {
+      getTools: async () => [{ name: "cart.add", description: "Add" }],
+      executeTool: async (tool, input) => { invocations.push(["executeTool", tool.name, typeof input]); return { received: JSON.parse(input) }; }
+    } },
+    { navigatorContext: {
+      getTools: async () => [{ name: "cart.add", description: "Add" }],
+      invokeTool: async (name, input) => { invocations.push(["invokeTool", name, typeof input]); return { received: input }; }
+    } },
+    { navigatorContext: {
+      tools: [{ name: "cart.add", description: "Add" }],
+      callTool: async (name, input) => { invocations.push(["callTool", name, typeof input]); return { received: input }; }
+    } }
+  ];
+  for (const variant of variants) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld(variant) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+      input: { sku: "A1" }, timeoutMs: 1000, toolName: "cart.add"
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(result.toolName, "cart.add");
+    assert.equal(result.result.received.sku, "A1");
+  }
+  assert.deepEqual(invocations.map((entry) => entry[0]), ["executeTool", "invokeTool", "callTool"]);
+  assert.equal(invocations[0][2], "string");
+  assert.equal(invocations[1][2], "object");
+});
+
+test("WebMCP invoke returns bounded structured page errors and timeouts", async () => {
+  const thrown = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "explode", description: "Explode" }],
+    executeTool: async () => { throw new Error("page exploded token=secret"); }
+  } }) });
+  const thrownResult = await thrown.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1000, toolName: "explode"
+  }));
+  assert.equal(thrownResult.ok, false);
+  assert.equal(thrownResult.error.code, "WEBMCP_TOOL_ERROR");
+  assert.equal(thrownResult.error.message.includes("secret"), false);
+
+  const timed = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "wait", description: "Wait" }],
+    executeTool: async () => new Promise(() => {})
+  } }) });
+  const timedResult = await timed.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "wait"
+  }));
+  assert.equal(timedResult.ok, false);
+  assert.equal(timedResult.error.code, "WEBMCP_TIMEOUT");
+});
+
+test("WebMCP invoke rejects invalid inputs and page outputs without lossy serialization", async () => {
+  let pageRuns = 0;
+  const context = {
+    getTools: async () => [{ name: "echo", description: "Echo" }],
+    executeTool: async (_tool, input) => JSON.parse(input)
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: webMcpMainWorld({ documentContext: context, onRun: () => { pageRuns += 1; } })
+  });
+  const cycle = {};
+  cycle.self = cycle;
+  for (const input of [cycle, { value: () => 1 }, { value: 1n }, { value: "x".repeat(70_000) }]) {
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input, timeoutMs: 1000, toolName: "echo" })),
+      /WebMCP input.*(?:JSON|serializ|large|bounded)/iu
+    );
+  }
+  assert.equal(pageRuns, 0);
+
+  const badOutputs = [() => 1, (() => { const value = {}; value.self = value; return value; })(), "x".repeat(600_000)];
+  for (const output of badOutputs) {
+    const outputHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "bad", description: "Bad" }], executeTool: async () => output
+    } }) });
+    const result = await outputHarness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+      input: {}, timeoutMs: 1000, toolName: "bad"
+    }));
+    assert.equal(result.ok, false);
+    assert.match(result.error.code, /^WEBMCP_OUTPUT_/u);
+  }
+});
+
+test("WebMCP invocation discards output on cancellation and navigation races", async () => {
+  let currentUrl = "https://example.com";
+  let release;
+  let started;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const began = new Promise((resolve) => { started = resolve; });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "slow", description: "Slow" }],
+      executeTool: async () => { started(); await pending; return { done: true }; }
+    } })
+  });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1000, toolName: "slow"
+  }), { signal: controller.signal });
+  const reachedPage = await Promise.race([
+    began.then(() => true),
+    run.then(() => false, () => false),
+    new Promise((resolve) => setTimeout(() => resolve(false), 500))
+  ]);
+  assert.equal(reachedPage, true, "WebMCP invocation must reach the page without hanging the test");
+  controller.abort(new Error("cancel WebMCP"));
+  release();
+  await assert.rejects(run, /cancel WebMCP/u);
+
+  currentUrl = "https://example.com";
+  const navigated = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: webMcpMainWorld({
+      documentContext: { getTools: async () => [{ name: "go", description: "Go" }], executeTool: async () => ({ done: true }) },
+      onRun: () => { currentUrl = "https://attacker.example/"; }
+    })
+  });
+  await assert.rejects(
+    () => navigated.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input: {}, timeoutMs: 1000, toolName: "go" })),
+    /scope.*changed|not authorized|document/iu
+  );
+});
+
 function createBackgroundHarness({
   alarmsClear = async () => true,
   alarmsCreate = async () => {},

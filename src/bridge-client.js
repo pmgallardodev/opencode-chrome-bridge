@@ -25,6 +25,7 @@ const ORIGIN_SCOPED_BRIDGE_METHODS = new Set([
   "findElements", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
   "pageAssets",
+  "webMcpList", "webMcpInvoke",
   "workflowRun",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "type", "unsubscribeCdpEvents", "waitFor"
