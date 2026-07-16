@@ -113,3 +113,93 @@ test("page asset manifests propagate inventory overflow and never persist signed
   assert.doesNotMatch(`${manifest}\n${(await readdir(bundle.path)).join("\n")}`, /user|password|AKIA-SECRET|raw-token|#private/iu);
   assert.match(manifest, /X-Amz-Credential=%5BREDACTED%5D/iu);
 });
+
+test("page asset staging rejects a path swap before the first retained file is opened", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-open-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-open-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  let originalStaging;
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [{ url: "https://example.com/private.js", content: "private page bytes" }],
+    beforeBundleFileOpen: async ({ stagingPath }) => {
+      originalStaging = `${stagingPath}.moved`;
+      await rename(stagingPath, originalStaging);
+      await symlink(outside, stagingPath);
+    }
+  }), /staging|identity|changed/iu);
+  assert.deepEqual(await readdir(outside), []);
+  assert.deepEqual(await readdir(originalStaging), []);
+});
+
+test("page asset staging zeroes every retained file when its directory inode moves outside", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-move-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-move-outside-"));
+  t.after(() => Promise.all([
+    rm(projectDirectory, { recursive: true, force: true }),
+    rm(outside, { recursive: true, force: true })
+  ]));
+  const stolen = path.join(outside, "stolen-bundle");
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [
+      { url: "https://example.com/one.js", content: "first private page bytes" },
+      { url: "https://example.com/two.js", content: "second private page bytes" }
+    ],
+    afterBundleFilesWritten: async ({ stagingPath }) => {
+      await rename(stagingPath, stolen);
+    }
+  }), /staging|identity|changed/iu);
+  const stolenFiles = await readdir(stolen);
+  assert.equal(stolenFiles.length, 3);
+  for (const filename of stolenFiles) {
+    assert.equal((await readFile(path.join(stolen, filename))).length, 0, filename);
+  }
+});
+
+test("page asset cleanup never deletes an unrelated staging-path replacement", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-cleanup-"));
+  const owned = path.join(projectDirectory, "owned-moved-aside");
+  t.after(() => rm(projectDirectory, { recursive: true, force: true }));
+  let replacement;
+  await assert.rejects(() => materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [{ url: "https://example.com/private.js", content: "private page bytes" }],
+    afterBundleFilesWritten: async () => { throw new Error("injected publish failure"); },
+    beforeBundleCleanup: async ({ stagingPath }) => {
+      replacement = stagingPath;
+      await rename(stagingPath, owned);
+      await mkdir(stagingPath);
+      await writeFile(path.join(stagingPath, "unrelated-sentinel.txt"), "keep me");
+    }
+  }), /injected publish failure/iu);
+  assert.equal(await readFile(path.join(replacement, "unrelated-sentinel.txt"), "utf8"), "keep me");
+  for (const filename of await readdir(owned)) {
+    assert.equal((await readFile(path.join(owned, filename))).length, 0, filename);
+  }
+});
+
+test("page asset bundles cap retained content files and describe every omitted resource", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-fd-cap-"));
+  t.after(() => rm(projectDirectory, { recursive: true, force: true }));
+  const bundle = await materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: Array.from({ length: 130 }, (_, index) => ({
+      url: `https://example.com/${index}.js`,
+      content: String(index)
+    }))
+  });
+  const manifest = JSON.parse(await readFile(path.join(bundle.path, "manifest.json"), "utf8"));
+  assert.equal(manifest.assets.length, 130);
+  assert.equal(manifest.assets.filter((asset) => asset.filename !== null).length, 127);
+  assert.equal(manifest.assets.filter((asset) => /omitted/iu.test(asset.error ?? "")).length, 3);
+  assert.equal(manifest.truncated, true);
+  assert.equal((await readdir(bundle.path)).length, 128);
+});

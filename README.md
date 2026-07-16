@@ -432,7 +432,10 @@ publication is atomic and realpath/symlink containment checks reject workspace e
 Asset URLs redact credentials, fragments, and sensitive signed-query values before they
 enter a response, filename, or manifest. This release never fetches cross-origin content:
 cross-origin iframe and subresource URLs remain redacted inventory metadata with an
-explicit skipped-content error.
+explicit skipped-content error. Bundle publication retains identity-checked file handles
+through final verification and caps materialized content at 127 resource files plus the
+manifest; any additional inventory entries remain in the manifest with an explicit
+omission error and set its truncation flag.
 
 The `notifications` permission is used only by `chrome_notify`; notification text is
 bounded and the packaged OpenCode icon is used. No bridge credential is displayed.

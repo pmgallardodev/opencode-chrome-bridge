@@ -27,6 +27,8 @@ All notable changes to this project are documented in this file.
   collision-safe filenames, and rejects realpath/symlink escapes before atomic publish.
 - Asset URLs redact credentials and signed query values; cross-origin resource content
   is inventory-only and is never fetched or bundled in this release.
+- Asset staging keeps identity-pinned file handles through publication, zeroes retained
+  files on identity failure, and limits bundles to 127 content files plus the manifest.
 - Popup health checks compare the full manifest permission/origin grant and the current
   extension capabilities instead of treating one permission as representative.
 - Browser origin authorization is recomputed after navigation and redirect; stale page

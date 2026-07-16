@@ -8,9 +8,9 @@ import {
   open,
   realpath,
   rename,
+  rmdir,
   rm,
-  unlink,
-  writeFile
+  unlink
 } from "node:fs/promises";
 
 const MAX_OUTPUT_DIRECTORY_CHARS = 500;
@@ -21,6 +21,7 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png"]);
 const ARTIFACT_IDENTITY = Symbol("workspaceArtifactIdentity");
 const MAX_PAGE_ASSET_BYTES = 10 * 1024 * 1024;
 const MAX_PAGE_ASSETS = 2_000;
+const MAX_PAGE_ASSET_BUNDLE_FILES = 128;
 const SENSITIVE_PAGE_ASSET_QUERY_KEYS = new Set([
   "access", "accesstoken", "apikey", "assertion", "auth", "authorization", "authorizationcode",
   "authtoken", "bearer", "clientsecret", "code", "cookie", "credential", "credentials", "idtoken",
@@ -35,7 +36,10 @@ const SENSITIVE_PAGE_ASSET_QUERY_FRAGMENTS = Object.freeze([
 ]);
 
 export async function materializePageAssetBundle({
+  afterBundleFilesWritten = async () => {},
   assets,
+  beforeBundleCleanup = async () => {},
+  beforeBundleFileOpen = async () => {},
   inventoryTruncated = false,
   outputDirectory,
   projectDirectory,
@@ -49,11 +53,11 @@ export async function materializePageAssetBundle({
     throw new Error(`page asset total byte limit must be between 1 and ${MAX_PAGE_ASSET_BYTES}`);
   }
   const decoded = [];
-  let totalBytes = 0;
+  let decodedBytes = 0;
   for (let index = 0; index < assets.length; index += 1) {
     const asset = normalizePageAsset(assets[index], index);
-    totalBytes += asset.data?.length ?? 0;
-    if (!Number.isSafeInteger(totalBytes) || totalBytes > totalByteLimit) {
+    decodedBytes += asset.data?.length ?? 0;
+    if (!Number.isSafeInteger(decodedBytes) || decodedBytes > totalByteLimit) {
       throw new Error(`page assets exceed the ${totalByteLimit} total byte limit`);
     }
     decoded.push(asset);
@@ -65,10 +69,23 @@ export async function materializePageAssetBundle({
   const stagingPath = path.join(directory.projectRoot, `.opencode-page-assets-${suffix}.tmp`);
   const finalPath = path.join(directory.resolvedDirectory, `page-assets-${suffix}`);
   await mkdir(stagingPath, { mode: 0o700 });
+  const stagingInfo = await lstat(stagingPath);
+  if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) {
+    throw new Error("page asset staging bundle identity is invalid");
+  }
+  const stagingIdentity = identityOf(stagingInfo);
+  const stagingDirectoryHandle = await open(stagingPath, directoryNoFollowFlags());
+  const directoryHandleInfo = await stagingDirectoryHandle.stat();
+  if (!directoryHandleInfo.isDirectory() || identityOf(directoryHandleInfo) !== stagingIdentity) {
+    await stagingDirectoryHandle.close().catch(() => {});
+    throw new Error("page asset staging directory handle identity is invalid");
+  }
   let published = false;
-  let stagingIdentity = null;
+  const retainedFiles = [];
   try {
     const manifestAssets = [];
+    let bundledBytes = 0;
+    let bundleFileLimitReached = false;
     for (const asset of decoded) {
       const entry = {
         url: asset.url,
@@ -78,13 +95,34 @@ export async function materializePageAssetBundle({
         error: asset.error
       };
       if (asset.data) {
-        const filename = pageAssetFilename(asset, manifestAssets.length);
-        await writeFile(path.join(stagingPath, filename), asset.data, { flag: "wx", mode: 0o600 });
-        Object.assign(entry, {
-          filename,
-          sha256: createHash("sha256").update(asset.data).digest("hex"),
-          size: asset.data.length
-        });
+        if (retainedFiles.length >= MAX_PAGE_ASSET_BUNDLE_FILES - 1) {
+          bundleFileLimitReached = true;
+          Object.assign(entry, {
+            error: entry.error ?? `Content omitted after ${MAX_PAGE_ASSET_BUNDLE_FILES - 1} bundled resources`,
+            filename: null,
+            sha256: null,
+            size: 0,
+            truncated: true
+          });
+        } else {
+          const filename = pageAssetFilename(asset, manifestAssets.length);
+          await writeRetainedBundleFile({
+            beforeBundleFileOpen,
+            data: asset.data,
+            directory,
+            filename,
+            retainedFiles,
+            stagingDirectoryHandle,
+            stagingIdentity,
+            stagingPath
+          });
+          bundledBytes += asset.data.length;
+          Object.assign(entry, {
+            filename,
+            sha256: createHash("sha256").update(asset.data).digest("hex"),
+            size: asset.data.length
+          });
+        }
       } else {
         Object.assign(entry, { filename: null, sha256: null, size: 0 });
       }
@@ -93,43 +131,105 @@ export async function materializePageAssetBundle({
     const manifest = {
       schemaVersion: 1,
       createdAt: new Date().toISOString(),
-      totalBytes,
+      totalBytes: bundledBytes,
       inventoryTruncated: inventoryTruncated === true,
-      truncated: inventoryTruncated === true || manifestAssets.some((asset) => asset.truncated === true),
+      truncated: inventoryTruncated === true || bundleFileLimitReached
+        || manifestAssets.some((asset) => asset.truncated === true),
       assets: manifestAssets
     };
-    await writeFile(path.join(stagingPath, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
-      flag: "wx",
-      mode: 0o600
+    await writeRetainedBundleFile({
+      beforeBundleFileOpen,
+      data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"),
+      directory,
+      filename: "manifest.json",
+      retainedFiles,
+      stagingDirectoryHandle,
+      stagingIdentity,
+      stagingPath
     });
-    const stagingInfo = await lstat(stagingPath);
-    if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) {
-      throw new Error("page asset staging bundle identity is invalid");
-    }
-    stagingIdentity = identityOf(stagingInfo);
+    await afterBundleFilesWritten({ stagingPath });
+    await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
     await assertWorkspaceDirectoryIdentity(directory);
     await renameBundle(stagingPath, finalPath);
     published = true;
-    await validatePublishedBundle(finalPath, stagingIdentity, directory);
+    await validatePublishedBundle(finalPath, stagingIdentity, directory, retainedFiles, stagingDirectoryHandle);
+    await closeRetainedBundleFiles(retainedFiles);
+    await stagingDirectoryHandle.close();
     return {
       ...manifest,
       path: finalPath,
       relativePath: path.relative(directory.projectRoot, finalPath)
     };
   } catch (error) {
-    if (published && stagingIdentity) {
-      await removeBundleIfIdentityMatches(finalPath, stagingIdentity).catch(() => {});
-    } else {
-      await rm(stagingPath, { recursive: true, force: true }).catch(() => {});
-    }
+    await beforeBundleCleanup({ finalPath, stagingPath }).catch(() => {});
+    await zeroAndCloseRetainedBundleFiles(retainedFiles);
+    await stagingDirectoryHandle.close().catch(() => {});
+    const cleanupPath = published ? finalPath : stagingPath;
+    await quarantineAndRemoveOwnedBundle(cleanupPath, stagingIdentity, retainedFiles, directory)
+      .catch(() => {});
     throw error;
   }
 }
 
-async function validatePublishedBundle(finalPath, stagingIdentity, directory) {
+async function writeRetainedBundleFile({
+  beforeBundleFileOpen,
+  data,
+  directory,
+  filename,
+  retainedFiles,
+  stagingDirectoryHandle,
+  stagingIdentity,
+  stagingPath
+}) {
+  await beforeBundleFileOpen({ filename, stagingPath });
+  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
+  const filePath = path.join(stagingPath, filename);
+  const handle = await open(filePath, exclusiveNoFollowWriteFlags(), 0o600);
+  const record = { filename, handle, identity: null };
+  retainedFiles.push(record);
+  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
+  const handleInfo = await handle.stat();
+  const pathInfo = await lstat(filePath);
+  if (!handleInfo.isFile() || !pathInfo.isFile() || pathInfo.isSymbolicLink()
+    || identityOf(handleInfo) !== identityOf(pathInfo)) {
+    throw new Error("page asset staging file identity is invalid");
+  }
+  record.identity = identityOf(handleInfo);
+  await handle.writeFile(data);
+  await handle.sync();
+  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
+}
+
+async function assertStagingDirectoryIdentity(stagingPath, expectedIdentity, directoryHandle, directory) {
+  try {
+    await assertProjectRootIdentity(directory);
+    const handleInfo = await directoryHandle.stat();
+    const pathInfo = await lstat(stagingPath);
+    const currentRealPath = await realpath(stagingPath);
+    if (!handleInfo.isDirectory() || !pathInfo.isDirectory() || pathInfo.isSymbolicLink()
+      || identityOf(handleInfo) !== expectedIdentity || identityOf(pathInfo) !== expectedIdentity
+      || !samePath(currentRealPath, stagingPath)) {
+      throw new Error();
+    }
+    assertPathWithin(directory.projectRoot, currentRealPath);
+  } catch {
+    throw new Error("page asset staging directory changed during publication");
+  }
+}
+
+async function assertProjectRootIdentity(directory) {
+  const projectInfo = await lstat(directory.projectRoot);
+  if (!projectInfo.isDirectory() || projectInfo.isSymbolicLink()
+    || identityOf(projectInfo) !== directory.projectIdentity) {
+    throw new Error("project directory changed during page asset publication");
+  }
+}
+
+async function validatePublishedBundle(finalPath, stagingIdentity, directory, retainedFiles, stagingDirectoryHandle) {
   const publishedInfo = await lstat(finalPath);
+  const handleInfo = await stagingDirectoryHandle.stat();
   if (!publishedInfo.isDirectory() || publishedInfo.isSymbolicLink()
-    || identityOf(publishedInfo) !== stagingIdentity) {
+    || identityOf(publishedInfo) !== stagingIdentity || identityOf(handleInfo) !== stagingIdentity) {
     throw new Error("published page asset bundle identity does not match staging");
   }
   await assertWorkspaceDirectoryIdentity(directory);
@@ -139,6 +239,19 @@ async function validatePublishedBundle(finalPath, stagingIdentity, directory) {
     throw new Error("page asset bundle escaped its verified output directory");
   }
   await assertWorkspaceDirectoryIdentity(directory);
+  for (const record of retainedFiles) {
+    const fileInfo = await lstat(path.join(finalPath, record.filename));
+    const retainedInfo = await record.handle.stat();
+    if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || record.identity === null
+      || identityOf(fileInfo) !== record.identity || identityOf(retainedInfo) !== record.identity) {
+      throw new Error("published page asset file identity does not match staging");
+    }
+  }
+  await assertWorkspaceDirectoryIdentity(directory);
+  const verifiedRealPath = await realpath(finalPath);
+  if (!samePath(path.dirname(verifiedRealPath), directory.resolvedDirectory)) {
+    throw new Error("published page asset bundle parent changed during verification");
+  }
   const finalInfo = await lstat(finalPath);
   if (!finalInfo.isDirectory() || finalInfo.isSymbolicLink()
     || identityOf(finalInfo) !== stagingIdentity) {
@@ -146,11 +259,40 @@ async function validatePublishedBundle(finalPath, stagingIdentity, directory) {
   }
 }
 
-async function removeBundleIfIdentityMatches(candidatePath, expectedIdentity) {
+async function zeroAndCloseRetainedBundleFiles(records) {
+  for (const record of records) {
+    await record.handle.truncate(0).catch(() => {});
+    await record.handle.sync().catch(() => {});
+  }
+  await closeRetainedBundleFiles(records);
+}
+
+async function closeRetainedBundleFiles(records) {
+  for (const record of records) await record.handle.close().catch(() => {});
+}
+
+async function quarantineAndRemoveOwnedBundle(candidatePath, expectedIdentity, records, directory) {
   try {
+    await assertProjectRootIdentity(directory);
     const info = await lstat(candidatePath);
     if (!info.isDirectory() || info.isSymbolicLink() || identityOf(info) !== expectedIdentity) return;
-    await rm(candidatePath, { recursive: true, force: false });
+    const quarantinePath = path.join(
+      directory.projectRoot,
+      `.opencode-page-assets-quarantine-${randomBytes(12).toString("hex")}`
+    );
+    await rename(candidatePath, quarantinePath);
+    await assertProjectRootIdentity(directory);
+    const quarantineInfo = await lstat(quarantinePath);
+    if (!quarantineInfo.isDirectory() || quarantineInfo.isSymbolicLink()
+      || identityOf(quarantineInfo) !== expectedIdentity) return;
+    for (const record of records) {
+      if (record.identity) await unlinkIfIdentityMatches(path.join(quarantinePath, record.filename), record.identity);
+    }
+    const finalInfo = await lstat(quarantinePath);
+    if (finalInfo.isDirectory() && !finalInfo.isSymbolicLink()
+      && identityOf(finalInfo) === expectedIdentity) {
+      await rmdir(quarantinePath).catch(() => {});
+    }
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -610,6 +752,12 @@ async function rollbackWorkspaceArtifact(artifact) {
 function exclusiveNoFollowWriteFlags() {
   const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
   return fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow;
+}
+
+function directoryNoFollowFlags() {
+  const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
+  const directory = Number.isInteger(fsConstants.O_DIRECTORY) ? fsConstants.O_DIRECTORY : 0;
+  return fsConstants.O_RDONLY | directory | noFollow;
 }
 
 function identityOf(info) {
