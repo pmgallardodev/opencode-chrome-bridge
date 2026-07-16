@@ -2397,7 +2397,7 @@ function registerBrowserEventListeners() {
   chrome.webNavigation.onBeforeNavigate?.addListener((details) => {
     if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
     navigationSequences.set(details.tabId, (navigationSequences.get(details.tabId) ?? 0) + 1);
-    invalidateProvenanceForNavigationAttempt(details.tabId, details.url);
+    invalidateProvenanceForNavigationAttempt(details.tabId, details);
   });
   chrome.webNavigation.onCommitted?.addListener((details) => {
     if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
@@ -2426,6 +2426,9 @@ function registerBrowserEventListeners() {
     consoleLogBuffers.delete(details.tabId);
     consoleLogBufferChars.delete(details.tabId);
   });
+  chrome.webNavigation.onErrorOccurred?.addListener((details) =>
+    recoverProvenanceAfterNavigationError(details).catch(() => {})
+  );
   chrome.webNavigation.onCreatedNavigationTarget.addListener((details) =>
     adoptCreatedNavigationTarget(details).catch(reportLeasePersistenceError)
   );
@@ -2671,9 +2674,12 @@ function reconcileMainFrameEpoch(tabId, { discardMismatch = false } = {}) {
   });
 }
 
-function invalidateProvenanceForNavigationAttempt(tabId, url) {
+function invalidateProvenanceForNavigationAttempt(tabId, details) {
+  const activeAttempt = tabNavigationAttempts.get(tabId);
+  const previousPage = tabPageProvenance.get(tabId) ?? activeAttempt?.previousPage;
+  const previousEpoch = tabMainFrameEpochs.get(tabId) ?? activeAttempt?.previousEpoch;
   const retired = retiredMainFrameLoaders.get(tabId) ?? new Set();
-  const currentLoaderId = tabMainFrameEpochs.get(tabId)?.loaderId ?? observedMainFrames.get(tabId)?.loaderId;
+  const currentLoaderId = previousEpoch?.loaderId ?? observedMainFrames.get(tabId)?.loaderId;
   if (typeof currentLoaderId === "string") {
     retired.add(currentLoaderId);
     while (retired.size > 20) retired.delete(retired.values().next().value);
@@ -2685,10 +2691,61 @@ function invalidateProvenanceForNavigationAttempt(tabId, url) {
   consoleLogBuffers.delete(tabId);
   consoleLogBufferChars.delete(tabId);
   tabNavigationAttempts.set(tabId, {
-    destinationScope: safeCanonicalPermissionScope(url),
+    beforeDocumentId: typeof details?.documentId === "string" ? details.documentId : previousPage?.documentId,
+    destinationScope: safeCanonicalPermissionScope(details?.url),
     phase: "pending",
+    previousEpoch: previousEpoch ? { ...previousEpoch } : null,
+    previousPage: previousPage ? { ...previousPage } : null,
+    startedAt: Number.isFinite(details?.timeStamp) ? details.timeStamp : null,
     token: navigationAttemptSequence++
   });
+}
+
+async function recoverProvenanceAfterNavigationError(details) {
+  if (details?.frameId !== 0 || !Number.isInteger(details?.tabId)) return;
+  const tabId = details.tabId;
+  const attempt = tabNavigationAttempts.get(tabId);
+  if (!attempt || attempt.phase !== "pending") return;
+  const errorScope = safeCanonicalPermissionScope(details.url);
+  if (attempt.destinationScope && errorScope !== attempt.destinationScope) return;
+  if (attempt.startedAt !== null && Number.isFinite(details.timeStamp) && details.timeStamp < attempt.startedAt) return;
+  const token = attempt.token;
+  let current;
+  try { current = await currentPageBinding(tabId); } catch { current = null; }
+  const currentAttempt = tabNavigationAttempts.get(tabId);
+  if (currentAttempt?.token !== token || currentAttempt.phase !== "pending") return;
+  const previousPage = attempt.previousPage;
+  const previousEpoch = attempt.previousEpoch;
+  const proven = Boolean(current
+    && previousPage
+    && previousEpoch
+    && current.documentId === previousPage.documentId
+    && current.pageScope === previousPage.pageScope);
+  if (!proven) {
+    tabNavigationAttempts.delete(tabId);
+    executionContextScopes.delete(tabId);
+    tabMainFrameEpochs.delete(tabId);
+    observedMainFrames.delete(tabId);
+    await releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
+    return;
+  }
+  tabNavigationAttempts.delete(tabId);
+  const retired = retiredMainFrameLoaders.get(tabId);
+  retired?.delete(previousEpoch.loaderId);
+  if (retired?.size === 0) retiredMainFrameLoaders.delete(tabId);
+  tabPageProvenance.set(tabId, {
+    documentId: current.documentId,
+    navigationGeneration: current.navigationGeneration,
+    pageScope: current.pageScope
+  });
+  observedMainFrames.set(tabId, {
+    attemptToken: null,
+    frameId: previousEpoch.frameId,
+    loaderId: previousEpoch.loaderId,
+    pageScope: previousEpoch.pageScope
+  });
+  executionContextScopes.delete(tabId);
+  reconcileMainFrameEpoch(tabId);
 }
 
 function permissionOrigin(value) {

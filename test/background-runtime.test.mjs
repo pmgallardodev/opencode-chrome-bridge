@@ -720,6 +720,167 @@ test("same-scope CDP frame before commit stays pending and drops every precommit
   assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a2-after-commit");
 });
 
+test("aborted top-frame navigation restores only the proven A1 loader and requires a fresh context", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: "document-a1", frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 801, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "initial-a1" }], executionContextId: 801, type: "log"
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-a1", frameId: 0, tabId: 7, timeStamp: 10, url: "https://next.example/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "late-old-a1" }], executionContextId: 801, type: "log"
+  });
+  await harness.events.webNavigationOnErrorOccurred.emit({
+    documentId: "document-a1", error: "net::ERR_ABORTED", frameId: 0,
+    tabId: 7, timeStamp: 11, url: "https://next.example/"
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 802, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-a1-after-abort" }], executionContextId: 802, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a1-after-abort");
+});
+
+test("stale and subframe errors cannot recover a superseded top-frame attempt", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: "document-a1", frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-a1", frameId: 0, tabId: 7, timeStamp: 10, url: "https://next.example/"
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-a1", frameId: 0, tabId: 7, timeStamp: 20, url: "https://next.example/"
+  });
+  await harness.events.webNavigationOnErrorOccurred.emit({
+    error: "net::ERR_ABORTED", frameId: 0, tabId: 7, timeStamp: 15, url: "https://next.example/"
+  });
+  await harness.events.webNavigationOnErrorOccurred.emit({
+    error: "net::ERR_ABORTED", frameId: 3, tabId: 7, timeStamp: 21, url: "https://next.example/"
+  });
+  await harness.events.webNavigationOnErrorOccurred.emit({
+    error: "net::ERR_ABORTED", frameId: 0, tabId: 7, timeStamp: 22, url: "https://next.example/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 803, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-a1-after-latest-abort" }], executionContextId: 803, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a1-after-latest-abort");
+});
+
+test("unproven navigation failure clears debugger provenance before auto-attach reseeds", async () => {
+  let currentDocumentId = "document-a1";
+  let currentUrl = "https://example.com/app";
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: currentDocumentId, frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: currentUrl }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 804, origin: "https://example.com" }
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-a1", frameId: 0, tabId: 7, timeStamp: 30, url: "https://next.example/"
+  });
+  currentDocumentId = "document-b";
+  currentUrl = "https://next.example/";
+  await harness.events.webNavigationOnErrorOccurred.emit({
+    error: "net::ERR_FAILED", frameId: 0, tabId: 7, timeStamp: 31, url: currentUrl
+  });
+  assert.equal(harness.calls.debuggerDetach.length, 1);
+  assert.deepEqual(harness.persistentDebuggerState(7), {
+    console: false, domains: [], events: false, network: false, subscriptions: []
+  });
+
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  assert.equal(harness.calls.debuggerAttach.length, 2);
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-b", url: currentUrl }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 805, origin: "https://next.example" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "late-a1" }], executionContextId: 804, type: "log"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-b" }], executionContextId: 805, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-b");
+});
+
+test("a committed navigation wins an in-flight error recovery for the same attempt", async () => {
+  let blockFrameLookup = false;
+  let releaseFrameLookup;
+  let signalFrameLookup;
+  const frameLookupStarted = new Promise((resolve) => { signalFrameLookup = resolve; });
+  const frameLookupGate = new Promise((resolve) => { releaseFrameLookup = resolve; });
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => {
+      if (blockFrameLookup) {
+        signalFrameLookup();
+        await frameLookupGate;
+      }
+      return { documentId: "document-a1", frameId: 0 };
+    }
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.webNavigationOnBeforeNavigate.emit({
+    documentId: "document-a1", frameId: 0, tabId: 7, timeStamp: 40, url: "https://next.example/"
+  });
+  blockFrameLookup = true;
+  const failedNavigation = harness.events.webNavigationOnErrorOccurred.emit({
+    error: "net::ERR_ABORTED", frameId: 0, tabId: 7, timeStamp: 41, url: "https://next.example/"
+  });
+  await frameLookupStarted;
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-b", frameId: 0, tabId: 7, timeStamp: 42, url: "https://next.example/"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-b", url: "https://next.example/" }
+  });
+  releaseFrameLookup();
+  await failedNavigation;
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 806, origin: "https://next.example" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-b-after-commit" }], executionContextId: 806, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-b-after-commit");
+});
+
 test("top-level B to A navigation cannot expose old or late B network entries", async () => {
   const harness = createBackgroundHarness();
   await harness.execute("networkRequests", { tabId: 7, autoAttach: true });
@@ -3566,6 +3727,7 @@ function createBackgroundHarness({
     tabsOnUpdated: createEvent(),
     webNavigationOnCommitted: createEvent(),
     webNavigationOnBeforeNavigate: createEvent(),
+    webNavigationOnErrorOccurred: createEvent(),
     webNavigationOnCreatedNavigationTarget: createEvent()
   };
   const nativePort = {
@@ -3663,6 +3825,7 @@ function createBackgroundHarness({
       getFrame: webNavigationGetFrame,
       onBeforeNavigate: events.webNavigationOnBeforeNavigate,
       onCommitted: events.webNavigationOnCommitted,
+      onErrorOccurred: events.webNavigationOnErrorOccurred,
       onCreatedNavigationTarget: events.webNavigationOnCreatedNavigationTarget
     }
   };
