@@ -85,6 +85,65 @@ test("canonical page scopes include effective ports and normalized IDN paths", (
   }
 });
 
+test("schedule creation requires a dedicated exact persistent approval after the generic tool grant", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const approval = {
+    version: 1,
+    pattern: `v1:${"a".repeat(64)}`,
+    scheduleId: "schedule-1",
+    workflowSchemaVersion: 1,
+    workflowId: "workflow-1",
+    workflowFingerprint: "b".repeat(64),
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    recurrenceFingerprint: "c".repeat(64),
+    notificationPolicy: "failure",
+    requiredOrigins: ["https://example.com"],
+    managedTabs: [{ tabId: 7, sessionId: "session-a", leaseId: "lease-a" }]
+  };
+  const bridge = installBridge(async (command) => {
+    if (command.method === "scheduleApprovalPreview") return approval;
+    throw new Error(`unexpected mutating bridge call ${command.method}`);
+  });
+  const asks = [];
+  try {
+    await assert.rejects(() => plugin.tool.chrome_schedule_create.execute({
+      enabled: true,
+      name: "Daily",
+      notify: "failure",
+      recurrence: { kind: "daily", hour: 9, minute: 30 },
+      requiredOrigins: ["https://example.com"],
+      workflowId: "workflow-1"
+    }, {
+      directory: path.resolve(import.meta.dirname, ".."),
+      sessionID: "session-a",
+      ask: async (request) => {
+        asks.push(request);
+        if (request.permission === "browser.schedule-unattended") throw new Error("dedicated approval denied");
+      }
+    }), /dedicated approval denied/u);
+  } finally {
+    bridge.restore();
+  }
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["scheduleApprovalPreview"]);
+  assert.equal(asks.length, 2);
+  assert.equal(asks[0].permission, "chrome_schedule_create");
+  assert.equal(asks[1].permission, "browser.schedule-unattended");
+  assert.deepEqual(asks[1].patterns, [approval.pattern]);
+  assert.deepEqual(asks[1].always, [approval.pattern]);
+  assert.deepEqual(asks[1].metadata, {
+    action: "Approve unattended browser workflow schedule",
+    notificationPolicy: "failure",
+    originCount: 1,
+    origins: ["https://example.com"],
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    scheduleId: "schedule-1",
+    workflowFingerprint: "b".repeat(64),
+    workflowId: "workflow-1",
+    workflowSchemaVersion: 1
+  });
+  assert.equal(JSON.stringify(asks[1]).includes("lease-a"), false);
+});
+
 test("path grants honor segment boundaries and never cross scheme or port", () => {
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:443/app"), true);
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:443/app/orders"), true);

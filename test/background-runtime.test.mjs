@@ -4548,26 +4548,253 @@ test("schedule recurrence uses local calendar boundaries without monthly, annual
   assert.deepEqual(parts(harness.nextScheduleRun(leap, new Date(2027, 1, 28, 8, 15).getTime())), [2028, 2, 29, 8, 15]);
 });
 
-test("schedules create named alarms, restore them, and deduplicate one occurrence", async () => {
-  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
-    schemaVersion: 1, id: "workflow-1", name: "Workflow", shortcut: "workflow",
-    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
-    steps: [{ method: "getTab", params: { tabId: 7 } }],
-    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
-  }] } };
-  const harness = createBackgroundHarness({
-    storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; }
-  });
-  const schedule = await harness.execute("scheduleCreate", {
-    enabled: true, name: "Daily workflow", notify: "success",
+function managedScheduleState(steps = [{ method: "getTab", params: { tabId: 7 } }]) {
+  return {
+    local: { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+      schemaVersion: 1, id: "workflow-managed", name: "Managed", shortcut: "managed",
+      requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"], steps,
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+    }] } },
+    session: { opencodeTabLeases: { "7": {
+      claimedAt: 1, groupId: 3, leaseId: "lease-a", origin: "agent", sessionId: "session-a",
+      state: "active", tabId: 7, turnId: "turn-a", windowId: 1
+    } } }
+  };
+}
+
+function scheduleDraft(overrides = {}) {
+  return {
+    enabled: true, name: "Managed daily", notify: "failure",
     recurrence: { kind: "daily", hour: 9, minute: 30 },
-    requiredOrigins: ["https://example.com"], unattendedApproved: true, workflowId: "workflow-1"
+    requiredOrigins: ["https://example.com"], workflowId: "workflow-managed",
+    ...overrides
+  };
+}
+
+async function createApprovedSchedule(harness, draft = scheduleDraft()) {
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  return harness.execute("scheduleCreate", { ...draft, approval });
+}
+
+test("schedule approval is an exact canonical fingerprint and every policy change needs reapproval", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
   });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  assert.match(approval.pattern, /^v1:[a-f0-9]{64}$/u);
+  assert.match(approval.scheduleId, /^[0-9a-f-]{36}$/iu);
+  assert.equal(approval.workflowId, "workflow-managed");
+  assert.equal(approval.workflowSchemaVersion, 1);
+  assert.match(approval.workflowFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(approval.managedTabs.length, 1);
+  assert.equal(approval.managedTabs[0].leaseId, "lease-a");
+  assert.equal(approval.managedTabs[0].sessionId, "session-a");
+  assert.equal(approval.managedTabs[0].tabId, 7);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval: { ...approval, notificationPolicy: "always" } }),
+    /approval.*exact|fingerprint/iu
+  );
+  const schedule = await harness.execute("scheduleCreate", { ...draft, approval });
+  assert.equal(schedule.id, approval.scheduleId);
+  assert.equal(schedule.approval.pattern, approval.pattern);
+  assert.equal(Object.hasOwn(schedule, "unattendedApproved"), false);
+
+  await assert.rejects(
+    () => harness.execute("scheduleUpdate", { id: schedule.id, recurrence: { kind: "daily", hour: 10, minute: 0 } }),
+    /dedicated.*approval|approval.*required/iu
+  );
+  const update = { id: schedule.id, notify: "always" };
+  const updatedApproval = await harness.execute("scheduleApprovalPreview", update);
+  const updated = await harness.execute("scheduleUpdate", { ...update, approval: updatedApproval });
+  assert.notEqual(updated.approval.pattern, approval.pattern);
+});
+
+test("scheduled workflows reject incognito tabs and recycled managed-tab identities before effects", async () => {
+  const state = managedScheduleState([{ method: "activateTab", params: { tabId: 7 } }]);
+  let incognito = false;
+  let effects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, incognito, url: "https://example.com/app", windowId: 1 }),
+    windowsUpdate: async (windowId) => { effects += 1; return { id: windowId }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  incognito = true;
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal(effects, 0);
+
+  incognito = false;
+  state.session.opencodeTabLeases["7"].leaseId = "lease-recycled";
+  await harness.reloadTabLeases();
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal(effects, 0);
+});
+
+test("scheduled workflows reject a deleted and reimported workflow with the same id", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.screenshots", "browser.tabs", "browser.windows"];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).at(-1).ok, false);
+});
+
+test("manual schedule cancellation reaches workflow playback and starts no later effect", async () => {
+  const state = managedScheduleState([
+    { method: "activateTab", params: { tabId: 7 } },
+    { method: "activateTab", params: { tabId: 8 } }
+  ]);
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.tabs", "browser.windows"];
+  state.session.opencodeTabLeases["8"] = {
+    ...state.session.opencodeTabLeases["7"], leaseId: "lease-b", tabId: 8
+  };
+  let release;
+  let started;
+  const firstEffectStarted = new Promise((resolve) => { started = resolve; });
+  const firstEffectBlocked = new Promise((resolve) => { release = resolve; });
+  let windowEffects = 0;
+  let tabEffects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => {
+      windowEffects += 1;
+      started();
+      await firstEffectBlocked;
+      return { id: windowId };
+    },
+    tabsUpdate: async (tabId) => { tabEffects += 1; return { active: true, id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const controller = new AbortController();
+  const run = harness.execute("scheduleRunNow", { id: schedule.id }, { signal: controller.signal });
+  await firstEffectStarted;
+  controller.abort(new Error("manual schedule cancelled"));
+  release();
+  await assert.rejects(run, /manual schedule cancelled/u);
+  assert.equal(windowEffects, 1);
+  assert.equal(tabEffects, 0);
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 0);
+});
+
+test("failed alarm creation leaves a durable create journal that restart commits", async () => {
+  const state = managedScheduleState();
+  let failCreate = true;
+  const harness = createBackgroundHarness({
+    alarmsCreate: async () => { if (failCreate) throw new Error("alarm create failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  await assert.rejects(() => harness.execute("scheduleCreate", { ...draft, approval }), /alarm create failed/u);
+  assert.equal(state.local.opencodeSchedules.schedules.length, 0);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  failCreate = false;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.schedules.length, 1);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+});
+
+test("failed alarm clear keeps the prior enabled schedule until restart commits disable", async () => {
+  const state = managedScheduleState();
+  let failClear = false;
+  const harness = createBackgroundHarness({
+    alarmsClear: async () => { if (failClear) throw new Error("alarm clear failed"); return true; },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const update = { id: schedule.id, enabled: false };
+  const approval = await harness.execute("scheduleApprovalPreview", update);
+  failClear = true;
+  await assert.rejects(() => harness.execute("scheduleUpdate", { ...update, approval }), /alarm clear failed/u);
+  assert.equal(state.local.opencodeSchedules.schedules[0].enabled, true);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  failClear = false;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.schedules[0].enabled, false);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+});
+
+test("failed completion rearm journals the completed history and restart arms it once", async () => {
+  const state = managedScheduleState();
+  let failCreate = false;
+  const harness = createBackgroundHarness({
+    alarmsCreate: async () => { if (failCreate) throw new Error("completion rearm failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  failCreate = true;
+  await harness.events.alarmsOnAlarm.emit({
+    name: `opencode-workflow-schedule:${schedule.id}`,
+    scheduledTime: schedule.nextRunAt
+  });
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 0);
+  failCreate = false;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 1);
+});
+
+test("restart converts a claimed alarm into one sanitized interrupted audit entry without replay", async () => {
+  const state = managedScheduleState();
+  let effects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => { effects += 1; return { id: windowId }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  state.local.opencodeSchedules.schedules[0].executionClaim = {
+    executionId: "execution-a", phase: "workflow", scheduledFor: schedule.nextRunAt,
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+  await harness.events.runtimeOnStartup.emit();
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].executionId, "execution-a");
+  assert.equal(history[0].phase, "workflow");
+  assert.equal(history[0].status, "interrupted");
+  assert.equal(effects, 0);
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 1);
+});
+
+test("schedules create named alarms, restore them, and deduplicate one occurrence", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft({
+    enabled: true, name: "Daily workflow", notify: "success",
+    recurrence: { kind: "daily", hour: 9, minute: 30 }
+  });
+  const schedule = await createApprovedSchedule(harness, draft);
   assert.match(harness.calls.alarmsCreate[0].name, /^opencode-workflow-schedule:/u);
   assert.equal(harness.calls.alarmsCreate[0].info.when, schedule.nextRunAt);
 
-  stored.opencodeSchedules.schedules[0].lastScheduledFor = schedule.nextRunAt;
+  state.local.opencodeSchedules.schedules[0].lastScheduledFor = schedule.nextRunAt;
   harness.calls.alarmsCreate.length = 0;
   await harness.events.runtimeOnStartup.emit();
   assert.equal(harness.calls.alarmsCreate.length, 1);
@@ -4575,8 +4802,8 @@ test("schedules create named alarms, restore them, and deduplicate one occurrenc
   const restored = (await harness.execute("scheduleList"))[0];
   assert.equal(restored.nextRunAt, harness.calls.alarmsCreate[0].info.when);
   assert.equal(restored.historyCount, 0);
-  stored.opencodeSchedules.schedules[0].lastScheduledFor = null;
-  stored.opencodeSchedules.schedules[0].nextRunAt = schedule.nextRunAt;
+  state.local.opencodeSchedules.schedules[0].lastScheduledFor = null;
+  state.local.opencodeSchedules.schedules[0].nextRunAt = schedule.nextRunAt;
   await harness.events.alarmsOnAlarm.emit({
     name: `opencode-workflow-schedule:${schedule.id}`,
     scheduledTime: schedule.nextRunAt - 60_000
@@ -4591,30 +4818,27 @@ test("schedules create named alarms, restore them, and deduplicate one occurrenc
 });
 
 test("scheduled execution fails closed and sanitizes bounded history and notifications", async () => {
-  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
-    schemaVersion: 1, id: "workflow-locked", name: "Workflow", shortcut: "workflow-locked",
-    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
-    steps: [{ method: "getTab", params: { tabId: 7 } }],
-    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
-  }] } };
+  const state = managedScheduleState();
   let currentUrl = "https://example.com/app";
   const harness = createBackgroundHarness({
-    storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
     tabsGet: async (tabId) => {
       if (currentUrl === "throw") throw new Error("locked https://private.example/?token=top-secret");
       return { active: true, id: tabId, url: currentUrl, windowId: 1 };
     }
   });
-  const schedule = await harness.execute("scheduleCreate", {
+  const schedule = await createApprovedSchedule(harness, scheduleDraft({
     enabled: true, name: "Locked workflow", notify: "failure",
-    recurrence: { kind: "weekly", weekday: 1, hour: 8, minute: 0 },
-    requiredOrigins: ["https://example.com"], unattendedApproved: true, workflowId: "workflow-locked"
-  });
+    recurrence: { kind: "weekly", weekday: 1, hour: 8, minute: 0 }
+  }));
 
-  stored.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.screenshots", "browser.tabs", "browser.windows"];
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
-  stored.opencodeWorkflows.workflows[0].steps = [{ method: "getTab", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "getTab", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.tabs"];
   currentUrl = "https://changed.example/app";
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
   currentUrl = "chrome://settings";
@@ -4629,10 +4853,11 @@ test("scheduled execution fails closed and sanitizes bounded history and notific
   assert.equal(JSON.stringify(history).includes("private.example"), false);
   assert.ok(harness.calls.notifications.length >= 1);
 
-  stored.opencodeSchedules.schedules[0].unattendedApproved = false;
+  const originalPattern = state.local.opencodeSchedules.schedules[0].approval.pattern;
+  state.local.opencodeSchedules.schedules[0].approval.pattern = `v1:${"d".repeat(64)}`;
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
-  stored.opencodeSchedules.schedules[0].unattendedApproved = true;
-  stored.opencodeWorkflows.workflows = [];
+  state.local.opencodeSchedules.schedules[0].approval.pattern = originalPattern;
+  state.local.opencodeWorkflows.workflows = [];
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
 });
 

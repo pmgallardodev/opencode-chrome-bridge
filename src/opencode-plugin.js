@@ -20,6 +20,7 @@ const MAX_UPLOAD_FILES = 20;
 const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
 const PAGE_ORIGIN_PERMISSION = "browser.origin";
+const SCHEDULE_UNATTENDED_PERMISSION = "browser.schedule-unattended";
 const MAX_ORIGIN_GRANT_SESSIONS = 100;
 const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
 const pageOriginSessionGrants = new Map();
@@ -343,7 +344,6 @@ export default async function OpenCodeChromeBridgePlugin() {
     workflowId: schema.string().min(1).max(100),
     recurrence: scheduleRecurrence,
     requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
-    unattendedApproved: schema.literal(true).describe("Explicitly approve unattended execution for exactly these persisted origins."),
     enabled: schema.boolean().default(true),
     notify: schema.enum(["none", "success", "failure", "always"]).default("none")
   };
@@ -1304,8 +1304,9 @@ export default async function OpenCodeChromeBridgePlugin() {
       chrome_schedule_create: tool({
         description: "Create a bounded local-calendar schedule for one workflow using explicit persistent unattended origin grants.",
         args: scheduleCreateArgs,
-        async execute(args) {
-          return JSON.stringify(await bridgeCommand("scheduleCreate", args), null, 2);
+        async execute(args, context) {
+          const approval = await requestScheduleUnattendedApproval(args, context);
+          return JSON.stringify(await bridgeCommand("scheduleCreate", { ...args, approval }), null, 2);
         }
       }),
       chrome_schedules: tool({
@@ -1322,12 +1323,12 @@ export default async function OpenCodeChromeBridgePlugin() {
           name: schema.string().min(1).max(120).optional(),
           recurrence: scheduleRecurrence.optional(),
           requiredOrigins: schema.array(schema.string().url().max(2000)).max(100).optional(),
-          unattendedApproved: schema.boolean().optional(),
           enabled: schema.boolean().optional(),
           notify: schema.enum(["none", "success", "failure", "always"]).optional()
         },
-        async execute(args) {
-          return JSON.stringify(await bridgeCommand("scheduleUpdate", args), null, 2);
+        async execute(args, context) {
+          const approval = await requestScheduleUnattendedApproval(args, context);
+          return JSON.stringify(await bridgeCommand("scheduleUpdate", { ...args, approval }), null, 2);
         }
       }),
       chrome_schedule_delete: tool({
@@ -1340,8 +1341,11 @@ export default async function OpenCodeChromeBridgePlugin() {
       chrome_schedule_run_now: tool({
         description: "Run one schedule now through the same unattended fail-closed capability and origin preflight.",
         args: { id: schema.string().min(1).max(100) },
-        async execute(args) {
-          return JSON.stringify(await bridgeCommand("scheduleRunNow", args, { timeoutMs: 126000 }), null, 2);
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("scheduleRunNow", args, {
+            signal: context.abort,
+            timeoutMs: 126000
+          }), null, 2);
         }
       }),
       chrome_schedule_history: tool({
@@ -1438,6 +1442,40 @@ const APPROVAL_METADATA = {
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })
 };
+
+async function requestScheduleUnattendedApproval(args, context) {
+  const approval = await bridgeCommand("scheduleApprovalPreview", args);
+  if (!approval || typeof approval !== "object" || Array.isArray(approval)
+    || approval.version !== 1
+    || typeof approval.pattern !== "string"
+    || !/^v1:[a-f0-9]{64}$/u.test(approval.pattern)
+    || typeof approval.scheduleId !== "string"
+    || typeof approval.workflowId !== "string"
+    || !Number.isInteger(approval.workflowSchemaVersion)
+    || !approval.recurrence || typeof approval.recurrence !== "object" || Array.isArray(approval.recurrence)
+    || typeof approval.notificationPolicy !== "string"
+    || !Array.isArray(approval.requiredOrigins)
+    || !Array.isArray(approval.managedTabs)) {
+    throw new Error("Schedule approval preview is invalid");
+  }
+  await context.ask({
+    permission: SCHEDULE_UNATTENDED_PERMISSION,
+    patterns: [approval.pattern],
+    always: [approval.pattern],
+    metadata: {
+      action: "Approve unattended browser workflow schedule",
+      notificationPolicy: approval.notificationPolicy,
+      originCount: approval.requiredOrigins.length,
+      origins: [...approval.requiredOrigins],
+      recurrence: { ...approval.recurrence },
+      scheduleId: approval.scheduleId,
+      workflowFingerprint: approval.workflowFingerprint,
+      workflowId: approval.workflowId,
+      workflowSchemaVersion: approval.workflowSchemaVersion
+    }
+  });
+  return approval;
+}
 
 function requireApprovals(tools, schema) {
   const guarded = { ...tools };

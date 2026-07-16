@@ -16,14 +16,13 @@ test("plugin publishes approval-gated schedule tools with explicit capabilities"
   }
 });
 
-test("schedule schemas require explicit unattended grants and bounded calendar recurrences", async () => {
+test("schedule schemas leave unattended proof to a dedicated human approval", async () => {
   const { tool } = await OpenCodeChromeBridgePlugin();
   const create = tool.chrome_schedule_create.args;
-  for (const field of ["name", "workflowId", "recurrence", "requiredOrigins", "unattendedApproved", "enabled", "notify"]) {
+  for (const field of ["name", "workflowId", "recurrence", "requiredOrigins", "enabled", "notify"]) {
     assert.ok(create[field], `missing schedule create field ${field}`);
   }
-  assert.equal(create.unattendedApproved.safeParse(true).success, true);
-  assert.equal(create.unattendedApproved.safeParse(false).success, false);
+  assert.equal(Object.hasOwn(create, "unattendedApproved"), false);
   assert.equal(create.requiredOrigins.safeParse(Array.from({ length: 101 }, (_, index) => `https://${index}.example`)).success, false);
   for (const recurrence of [
     { kind: "daily", hour: 9, minute: 30 },
@@ -35,4 +34,9 @@ test("schedule schemas require explicit unattended grants and bounded calendar r
   }
   assert.equal(create.recurrence.safeParse({ kind: "daily", hour: 24, minute: 0 }).success, false);
   assert.equal(Object.hasOwn(create, "skipPermissions"), false);
+});
+
+test("manual schedule runs forward the OpenCode abort signal", async () => {
+  const source = await import("node:fs/promises").then(({ readFile }) => readFile(new URL("../src/opencode-plugin.js", import.meta.url), "utf8"));
+  assert.match(source, /scheduleRunNow[\s\S]{0,300}signal:\s*context\.abort/u);
 });
