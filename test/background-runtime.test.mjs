@@ -582,6 +582,61 @@ test("A1 to B to A3 drops URL-only late console data and accepts only the curren
   assert.ok(current.navigationGeneration >= 2);
 });
 
+test("Runtime origin-only contexts retain the exact current pathname scope", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: "document-app", frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-app", loaderId: "loader-app", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: {
+      auxData: { frameId: "frame-app", isDefault: true, type: "default" },
+      id: 404, origin: "https://example.com", uniqueId: "context-app"
+    }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-app" }], executionContextId: 404, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-app");
+});
+
+test("Page frame before webNavigation commit reconciles to the committed exact document", async () => {
+  const harness = createBackgroundHarness();
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await emitCurrentRuntimeConsole(harness, "old-a");
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "frame-b", loaderId: "loader-b", url: "https://b.example/redirected" }
+  });
+  await harness.events.tabsOnUpdated.emit(7, { status: "loading", url: "https://b.example/redirected" }, {
+    active: true, id: 7, url: "https://b.example/redirected", windowId: 1
+  });
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-b", frameId: 0, tabId: 7, url: "https://b.example/redirected"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: {
+      auxData: { frameId: "frame-b", isDefault: true, type: "default" },
+      id: 505, origin: "https://b.example", uniqueId: "context-b"
+    }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-b" }], executionContextId: 505, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-b");
+  const current = harness.calls.nativeMessages
+    .filter((message) => message.type === "event" && message.event?.category === "cdp")
+    .map((message) => message.event)
+    .find((event) => JSON.stringify(event.params ?? "").includes("current-b"));
+  assert.equal(current.documentId, "document-b");
+  assert.equal(current.pageScope, "https://b.example:443/redirected");
+  assert.ok(current.navigationGeneration > 0);
+});
+
 test("top-level B to A navigation cannot expose old or late B network entries", async () => {
   const harness = createBackgroundHarness();
   await harness.execute("networkRequests", { tabId: 7, autoAttach: true });

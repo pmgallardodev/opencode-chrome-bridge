@@ -161,6 +161,7 @@ const scopedDebuggerTargets = new Map();
 const tabPageProvenance = new Map();
 const executionContextScopes = new Map();
 const tabMainFrameEpochs = new Map();
+const observedMainFrames = new Map();
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
@@ -2287,6 +2288,7 @@ async function releaseDebuggers(params = {}) {
       cdpEnabledDomains.delete(tabId);
       tabMainFrameEpochs.delete(tabId);
       executionContextScopes.delete(tabId);
+      observedMainFrames.delete(tabId);
       consoleLogBuffers.delete(tabId);
       consoleLogBufferChars.delete(tabId);
       if (attached) await chrome.debugger.detach(target).catch(() => {});
@@ -2403,6 +2405,9 @@ function registerBrowserEventListeners() {
     });
     executionContextScopes.delete(details.tabId);
     tabMainFrameEpochs.delete(details.tabId);
+    reconcileMainFrameEpoch(details.tabId, { discardMismatch: true });
+    consoleLogBuffers.delete(details.tabId);
+    consoleLogBufferChars.delete(details.tabId);
   });
   chrome.webNavigation.onCreatedNavigationTarget.addListener((details) =>
     adoptCreatedNavigationTarget(details).catch(reportLeasePersistenceError)
@@ -2415,6 +2420,7 @@ function registerBrowserEventListeners() {
       updateTabPageProvenanceFromTab(tabId, tab, navigationGeneration);
       executionContextScopes.delete(tabId);
       tabMainFrameEpochs.delete(tabId);
+      reconcileMainFrameEpoch(tabId, { discardMismatch: true });
       consoleLogBuffers.delete(tabId);
       consoleLogBufferChars.delete(tabId);
       networkRequestStates.delete(tabId);
@@ -2431,6 +2437,7 @@ function registerBrowserEventListeners() {
     tabPageProvenance.delete(tabId);
     executionContextScopes.delete(tabId);
     tabMainFrameEpochs.delete(tabId);
+    observedMainFrames.delete(tabId);
     const persistence = removeClosedTabLease(tabId);
     persistence.catch(reportLeasePersistenceError);
     void releaseDebuggers({ tabIds: [tabId] }).catch(() => {});
@@ -2496,6 +2503,7 @@ function registerBrowserEventListeners() {
       cdpEnabledDomains.delete(tabId);
       executionContextScopes.delete(tabId);
       tabMainFrameEpochs.delete(tabId);
+      observedMainFrames.delete(tabId);
       sendEvent({ category: "cdp", type: "cdpDetached", tabId, reason });
     }
   });
@@ -2552,13 +2560,13 @@ function recordExecutionContextScope(tabId, method, params) {
     || context?.auxData?.frameId !== epoch.frameId
     || epoch.documentId !== current.documentId
     || epoch.navigationGeneration !== current.navigationGeneration
-    || pageScope !== current.pageScope) return;
+    || permissionOrigin(pageScope) !== permissionOrigin(current.pageScope)) return;
   let contexts = executionContextScopes.get(tabId);
   if (!contexts) {
     contexts = new Map();
     executionContextScopes.set(tabId, contexts);
   }
-  contexts.set(context.id, { ...epoch, pageScope, tabId });
+  contexts.set(context.id, { ...epoch, contextOrigin: permissionOrigin(pageScope), tabId });
 }
 
 function cdpEventPageProvenance(tabId, method, params) {
@@ -2595,16 +2603,41 @@ function recordMainFrameEpoch(tabId, method, params) {
   if (method !== "Page.frameNavigated") return;
   const frame = params?.frame;
   if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return;
-  const current = tabPageProvenance.get(tabId);
   const pageScope = safeCanonicalPermissionScope(frame.url);
-  if (!current || !pageScope || pageScope !== current.pageScope) return;
-  tabMainFrameEpochs.set(tabId, {
-    documentId: current.documentId,
+  if (!pageScope) return;
+  observedMainFrames.set(tabId, {
     frameId: frame.id,
     loaderId: frame.loaderId,
-    navigationGeneration: current.navigationGeneration,
     pageScope
   });
+  reconcileMainFrameEpoch(tabId);
+}
+
+function reconcileMainFrameEpoch(tabId, { discardMismatch = false } = {}) {
+  const current = tabPageProvenance.get(tabId);
+  const observed = observedMainFrames.get(tabId);
+  if (!current || !observed || observed.pageScope !== current.pageScope) {
+    tabMainFrameEpochs.delete(tabId);
+    if (discardMismatch && current && observed && observed.pageScope !== current.pageScope) {
+      observedMainFrames.delete(tabId);
+    }
+    return;
+  }
+  tabMainFrameEpochs.set(tabId, {
+    ...observed,
+    documentId: current.documentId,
+    navigationGeneration: current.navigationGeneration
+  });
+}
+
+function permissionOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    return `${parsed.protocol}//${parsed.hostname}:${port}`;
+  } catch {
+    return null;
+  }
 }
 
 const CDP_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/u;
@@ -4307,13 +4340,12 @@ async function seedMainFrameEpoch(tabId, target) {
   if (!frame || frame.parentId != null || typeof frame.id !== "string" || typeof frame.loaderId !== "string") return;
   const pageScope = safeCanonicalPermissionScope(frame.url);
   if (!pageScope || pageScope !== current.pageScope) return;
-  tabMainFrameEpochs.set(tabId, {
-    documentId: current.documentId,
+  observedMainFrames.set(tabId, {
     frameId: frame.id,
     loaderId: frame.loaderId,
-    navigationGeneration: current.navigationGeneration,
     pageScope
   });
+  reconcileMainFrameEpoch(tabId);
 }
 
 async function enableCdpDomains(target, domains) {
