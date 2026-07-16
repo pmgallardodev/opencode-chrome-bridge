@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.4.1 — 2026-07-16
+
+### Fixed
+
+- Agent tab claims no longer race the navigation commit: a tab created with
+  `chrome.tabs.create({url})` reports an empty `url` while the target URL is still in
+  `pendingUrl`, which made `claimTab` fail as a "Chrome internal tab". Claimability now
+  falls back to `pendingUrl` only while no URL has committed; a committed internal page
+  stays unclaimable even while it navigates elsewhere.
+- The installed smoke sends its WebMCP expected bindings with the `pageScope` reported by
+  `getTab`, matching what the OpenCode plugin sends, so `npm run smoke:installed` passes
+  against a real Chrome runtime.
+- Non-string page scopes fail with a clear "must be a string URL" error instead of a
+  misleading "ambiguous encoded separator or traversal" message.
+
 ## v1.4.0 — 2026-07-16
 
 ### Added

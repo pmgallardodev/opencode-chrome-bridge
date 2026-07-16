@@ -49,7 +49,7 @@ async function renderPopup({ grantedPermissions, grantedOrigins }) {
   const containsCalls = [];
   const manifest = {
     name: "OpenCode Chrome Bridge",
-    version: "1.4.0",
+    version: "1.4.1",
     permissions: requiredPermissions,
     host_permissions: requiredOrigins
   };
