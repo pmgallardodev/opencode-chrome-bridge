@@ -22,6 +22,7 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.tabs",
   "browser.wait",
   "browser.windows",
+  "browser.workflows",
   "session.resume",
   "session.tab-leases"
 ]);
@@ -99,6 +100,28 @@ const MAX_BATCH_ACTION_TIMEOUT_MS = 30_000;
 const MAX_BATCH_TOTAL_TIMEOUT_MS = 120_000;
 const DEFAULT_BATCH_ACTION_TIMEOUT_MS = 10_000;
 const DEFAULT_BATCH_TOTAL_TIMEOUT_MS = 60_000;
+const WORKFLOW_SCHEMA_VERSION = 1;
+const WORKFLOW_STORAGE_KEY = "opencodeWorkflows";
+const MAX_WORKFLOWS = 100;
+const MAX_WORKFLOW_STEPS = 100;
+const MAX_WORKFLOW_STORAGE_BYTES = 500_000;
+const MAX_WORKFLOW_NAME_CHARS = 120;
+const MAX_WORKFLOW_SHORTCUT_CHARS = 80;
+const DEFAULT_WORKFLOW_STEP_TIMEOUT_MS = 10_000;
+const DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS = 60_000;
+const WORKFLOW_STEP_METHODS = Object.freeze({
+  activateTab: { capability: ["browser.tabs", "browser.windows"], type: "activateTab" },
+  back: { capability: ["browser.navigation", "browser.tabs"], type: "back" },
+  clickElement: { capability: ["browser.accessibility", "browser.cdp", "browser.tabs"], type: "clickElement" },
+  findElements: { capability: ["browser.find", "browser.tabs"], type: "findElements" },
+  forward: { capability: ["browser.navigation", "browser.tabs"], type: "forward" },
+  getTab: { capability: ["browser.tabs"], type: "getTab" },
+  navigate: { capability: ["browser.navigation", "browser.tabs"], type: "navigate" },
+  reload: { capability: ["browser.navigation", "browser.tabs"], type: "reload" },
+  screenshot: { capability: ["browser.screenshots", "browser.tabs", "browser.windows"], type: null },
+  tabContext: { capability: ["browser.page-context", "browser.tabs"], type: "tabContext" },
+  waitFor: { capability: ["browser.tabs", "browser.wait"], type: "waitFor" }
+});
 const BATCH_ACTION_METHODS = Object.freeze({
   activateTab: "activateTab",
   back: "back",
@@ -178,6 +201,7 @@ let navigationAttemptSequence = 1;
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
+let activeWorkflowRecording = null;
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
 chrome.runtime.onStartup.addListener(connectNativeHost);
@@ -428,6 +452,12 @@ function postNativeResponse(message) {
 }
 
 async function executeCommand(method, params, options = {}) {
+  const result = await executeCommandCore(method, params, options);
+  if (options.workflowInternal !== true) await recordSuccessfulWorkflowStep(method, params);
+  return result;
+}
+
+async function executeCommandCore(method, params, options = {}) {
   switch (method) {
     case "scopedCommand":
       return executeScopedPageCommand(params, options);
@@ -590,11 +620,367 @@ async function executeCommand(method, params, options = {}) {
       return clickElement(params, options.signal, options.pageGuard);
     case "fillElement":
       return fillElement(params, options.signal, options.pageGuard);
+    case "workflowStartRecording":
+      return startWorkflowRecording(params);
+    case "workflowStopRecording":
+      return stopWorkflowRecording();
+    case "workflowCancelRecording":
+      return cancelWorkflowRecording();
+    case "workflowList":
+      return listWorkflows();
+    case "workflowGet":
+      return getWorkflow(params);
+    case "workflowImport":
+      return importWorkflow(params);
+    case "workflowDelete":
+      return deleteWorkflow(params);
+    case "workflowRun":
+      return runWorkflow(params, options);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
       throw new Error(`Unsupported command: ${method}`);
   }
+}
+
+function startWorkflowRecording(params) {
+  if (activeWorkflowRecording) throw new Error("A workflow recording is already active");
+  if (!isRecord(params)) throw new Error("workflow recording params must be an object");
+  const name = requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "name");
+  const shortcut = normalizeWorkflowShortcut(params.shortcut ?? name);
+  activeWorkflowRecording = {
+    name,
+    shortcut,
+    requiredCapabilities: new Set(),
+    requiredOrigins: new Set(),
+    steps: [],
+    startedAt: new Date().toISOString()
+  };
+  return { name, recording: true, shortcut };
+}
+
+async function stopWorkflowRecording() {
+  if (!activeWorkflowRecording) throw new Error("No workflow recording is active");
+  if (activeWorkflowRecording.steps.length === 0) throw new Error("A workflow must contain at least one recorded step");
+  const recording = activeWorkflowRecording;
+  const collection = await loadWorkflowCollection();
+  if (collection.workflows.some((entry) => entry.shortcut === recording.shortcut)) {
+    throw new Error(`Workflow shortcut ${recording.shortcut} already exists and must be unique`);
+  }
+  if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+  const now = new Date().toISOString();
+  const workflow = await validateWorkflowSchema({
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    id: crypto.randomUUID(),
+    name: recording.name,
+    shortcut: recording.shortcut,
+    requiredCapabilities: [...recording.requiredCapabilities].sort(),
+    requiredOrigins: [...recording.requiredOrigins].sort(),
+    steps: recording.steps,
+    createdAt: recording.startedAt,
+    updatedAt: now
+  });
+  await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+  activeWorkflowRecording = null;
+  return workflow;
+}
+
+function cancelWorkflowRecording() {
+  if (!activeWorkflowRecording) throw new Error("No workflow recording is active");
+  activeWorkflowRecording = null;
+  return { cancelled: true };
+}
+
+async function recordSuccessfulWorkflowStep(method, params) {
+  if (!activeWorkflowRecording) return;
+  let recordedMethod = method;
+  let recordedParams = params;
+  let expectedOrigins = [];
+  if (method === "scopedCommand") {
+    if (!isRecord(params)) return;
+    recordedMethod = params.method;
+    recordedParams = params.params;
+    expectedOrigins = Array.isArray(params.expectedScopes) ? params.expectedScopes : [];
+  }
+  if (!Object.hasOwn(WORKFLOW_STEP_METHODS, recordedMethod) || containsSensitiveWorkflowField(recordedParams)) return;
+  if (activeWorkflowRecording.steps.length >= MAX_WORKFLOW_STEPS) {
+    throw new Error(`Workflow recording is limited to ${MAX_WORKFLOW_STEPS} steps`);
+  }
+  const step = await validateWorkflowStep({ method: recordedMethod, params: cloneWorkflowValue(recordedParams) });
+  activeWorkflowRecording.steps.push(step);
+  for (const capability of WORKFLOW_STEP_METHODS[recordedMethod].capability) {
+    activeWorkflowRecording.requiredCapabilities.add(capability);
+  }
+  for (const scope of expectedOrigins) activeWorkflowRecording.requiredOrigins.add(workflowOrigin(scope));
+  if (recordedMethod === "navigate") activeWorkflowRecording.requiredOrigins.add(workflowOrigin(recordedParams.url));
+}
+
+function containsSensitiveWorkflowField(value, key = "") {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/gu, "");
+  if (["text", "expression", "data", "base64", "body", "content", "headers", "password", "passwd", "secret", "token", "credential", "cookie", "authorization", "path", "paths", "files"].some((term) => normalized.includes(term))) {
+    return true;
+  }
+  if (normalized === "url" && typeof value === "string") {
+    try {
+      const parsed = new URL(value);
+      if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(isSensitiveQueryKey)) return true;
+    } catch {
+      return true;
+    }
+  }
+  if (Array.isArray(value)) return value.some((entry) => containsSensitiveWorkflowField(entry));
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([field, entry]) => containsSensitiveWorkflowField(entry, field));
+}
+
+async function listWorkflows() {
+  const { workflows } = await loadWorkflowCollection();
+  return workflows.map(({ steps, ...workflow }) => ({ ...workflow, stepCount: steps.length }));
+}
+
+async function getWorkflow(params) {
+  return resolveWorkflow(await loadWorkflowCollection(), params);
+}
+
+async function importWorkflow(params) {
+  if (!isRecord(params) || !isRecord(params.workflow)) throw new Error("workflowImport requires a workflow object");
+  const collection = await loadWorkflowCollection();
+  const workflow = await validateWorkflowSchema(params.workflow);
+  if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+  if (collection.workflows.some((entry) => entry.id === workflow.id || entry.name === workflow.name || entry.shortcut === workflow.shortcut)) {
+    throw new Error("Imported workflow id, name, and shortcut must be unique");
+  }
+  await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+  return workflow;
+}
+
+async function deleteWorkflow(params) {
+  const collection = await loadWorkflowCollection();
+  const workflow = resolveWorkflow(collection, params);
+  await saveWorkflowCollection({
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    workflows: collection.workflows.filter((entry) => entry.id !== workflow.id)
+  });
+  return { deleted: true, id: workflow.id };
+}
+
+async function runWorkflow(params, options = {}) {
+  if (!isRecord(params)) throw new Error("workflowRun params must be an object");
+  const totalTimeoutMs = strictBatchInteger(params.totalTimeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_TOTAL_TIMEOUT_MS, DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS, "totalTimeoutMs");
+  const collection = await loadWorkflowCollection();
+  const workflow = resolveWorkflow(collection, params);
+  const missingCapabilities = workflow.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
+  if (missingCapabilities.length > 0) throw new Error(`Workflow capability preflight failed: ${missingCapabilities.join(", ")}`);
+  if (!Array.isArray(params.expectedOrigins)) throw new Error("Workflow origin preflight requires expectedOrigins");
+  const expectedOrigins = new Set(params.expectedOrigins.map(workflowOrigin));
+  const missingOrigins = workflow.requiredOrigins.filter((origin) => !expectedOrigins.has(origin));
+  if (missingOrigins.length > 0) throw new Error(`Workflow origin preflight failed; origins are not authorized: ${missingOrigins.join(", ")}`);
+  // Validate every step before any browser effect. This also rejects meta/recursive
+  // commands and malformed values that may have reached persisted storage.
+  const steps = await Promise.all(workflow.steps.map(validateWorkflowStep));
+  const runtimeOrigins = await resolveWorkflowRuntimeOrigins(steps);
+  const unauthorizedRuntimeOrigins = runtimeOrigins.filter((origin) => !expectedOrigins.has(origin));
+  if (unauthorizedRuntimeOrigins.length > 0) {
+    throw new Error(`Workflow origin preflight failed; current tab origins are not authorized: ${unauthorizedRuntimeOrigins.join(", ")}`);
+  }
+  const startedAt = Date.now();
+  const deadline = startedAt + totalTimeoutMs;
+  const results = [];
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    const remainingMs = deadline - Date.now();
+    if (remainingMs < MIN_BATCH_TIMEOUT_MS) throw new Error(`Workflow total timeout after ${totalTimeoutMs}ms at step ${index}`);
+    try {
+      const value = await executeWorkflowStep(step, Math.min(step.timeoutMs, remainingMs), options.signal);
+      results.push({ index, method: step.method, ok: true, value });
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, method: step.method, ok: false });
+      return { completed: results.length, elapsedMs: Date.now() - startedAt, ok: false, results, stoppedAt: index, totalSteps: steps.length, workflowId: workflow.id };
+    }
+  }
+  return { completed: results.length, elapsedMs: Date.now() - startedAt, ok: true, results, stoppedAt: null, totalSteps: steps.length, workflowId: workflow.id };
+}
+
+async function resolveWorkflowRuntimeOrigins(steps) {
+  const tabIds = [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))];
+  const origins = await Promise.all(tabIds.map(async (tabId) => {
+    const tab = await chrome.tabs.get(tabId);
+    if (typeof tab?.url !== "string") throw new Error(`Workflow origin preflight could not resolve tab ${tabId}`);
+    return workflowOrigin(tab.url);
+  }));
+  return [...new Set(origins)].sort();
+}
+
+function executeWorkflowStep(step, timeoutMs, parentSignal) {
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(parentSignal.reason);
+  parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  let rejectOnAbort;
+  const abortPromise = new Promise((_, reject) => {
+    rejectOnAbort = () => reject(controller.signal.reason ?? new Error("Workflow step was cancelled"));
+    controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
+  });
+  const timer = setTimeout(() => controller.abort(new Error(`Workflow step ${step.method} timed out after ${timeoutMs}ms`)), timeoutMs);
+  const execution = Promise.resolve().then(() => executeCommand(step.method, cloneWorkflowValue(step.params), { signal: controller.signal, workflowInternal: true }));
+  return Promise.race([execution, abortPromise]).finally(() => {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", onParentAbort);
+    controller.signal.removeEventListener("abort", rejectOnAbort);
+  });
+}
+
+async function loadWorkflowCollection() {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(WORKFLOW_STORAGE_KEY);
+  } catch (error) {
+    throw new Error(`Could not read workflow local storage: ${error?.message ?? String(error)}`);
+  }
+  const raw = stored?.[WORKFLOW_STORAGE_KEY];
+  if (raw == null) return { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [] };
+  if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
+    throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
+  }
+  if (!isRecord(raw) || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION || !Array.isArray(raw.workflows) || raw.workflows.length > MAX_WORKFLOWS) {
+    throw new Error("Persisted workflow collection schema is invalid or unsupported");
+  }
+  let migrated = false;
+  const workflows = await Promise.all(raw.workflows.map(async (entry) => {
+    if (entry?.schemaVersion === 0) migrated = true;
+    return validateWorkflowSchema(migrateWorkflow(entry));
+  }));
+  assertUniqueWorkflows(workflows);
+  const collection = { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows };
+  if (migrated) await saveWorkflowCollection(collection);
+  return collection;
+}
+
+async function saveWorkflowCollection(collection) {
+  assertUniqueWorkflows(collection.workflows);
+  const serialized = JSON.stringify(collection);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
+    throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
+  }
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_STORAGE_KEY]: collection });
+  } catch (error) {
+    throw new Error(`Could not write workflow local storage: ${error?.message ?? String(error)}`);
+  }
+}
+
+function migrateWorkflow(value) {
+  if (!isRecord(value) || value.schemaVersion !== 0) return value;
+  if (!Array.isArray(value.steps)) throw new Error("Legacy workflow steps must be an array");
+  return {
+    ...value,
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    steps: value.steps.map((step) => {
+      if (!isRecord(step) || typeof step.command !== "string" || Object.hasOwn(step, "method")) {
+        throw new Error("Legacy workflow step schema cannot be migrated safely");
+      }
+      const { command, ...rest } = step;
+      return { ...rest, method: command };
+    })
+  };
+}
+
+async function validateWorkflowSchema(value) {
+  if (!isRecord(value) || value.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Workflow schemaVersion is unsupported");
+  const allowed = ["schemaVersion", "id", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "createdAt", "updatedAt"];
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Workflow contains unsupported fields: ${extra.join(", ")}`);
+  const id = requireBoundedWorkflowString(value.id, 100, "id");
+  const name = requireBoundedWorkflowString(value.name, MAX_WORKFLOW_NAME_CHARS, "name");
+  const shortcut = normalizeWorkflowShortcut(value.shortcut);
+  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_WORKFLOW_STEPS) throw new Error(`Workflow steps must contain 1 to ${MAX_WORKFLOW_STEPS} entries`);
+  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > BRIDGE_CAPABILITIES.length) throw new Error("Workflow requiredCapabilities is invalid");
+  const requiredCapabilities = [...new Set(value.requiredCapabilities.map((entry) => requireBoundedWorkflowString(entry, 100, "capability")))].sort();
+  const unsupportedCapabilities = requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
+  if (unsupportedCapabilities.length > 0) throw new Error(`Workflow capabilities are not allowed or unsupported: ${unsupportedCapabilities.join(", ")}`);
+  if (!Array.isArray(value.requiredOrigins) || value.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Workflow requiredOrigins is invalid");
+  const requiredOrigins = [...new Set(value.requiredOrigins.map(workflowOrigin))].sort();
+  const steps = await Promise.all(value.steps.map(validateWorkflowStep));
+  for (const step of steps) {
+    for (const capability of WORKFLOW_STEP_METHODS[step.method].capability) {
+      if (!requiredCapabilities.includes(capability)) throw new Error(`Workflow requiredCapabilities is missing ${capability}`);
+    }
+    if (step.method === "navigate") {
+      const destinationOrigin = workflowOrigin(step.params.url);
+      if (!requiredOrigins.includes(destinationOrigin)) throw new Error(`Workflow requiredOrigins is missing ${destinationOrigin}`);
+    }
+  }
+  const createdAt = requireWorkflowTimestamp(value.createdAt, "createdAt");
+  const updatedAt = requireWorkflowTimestamp(value.updatedAt, "updatedAt");
+  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins, steps, createdAt, updatedAt };
+}
+
+async function validateWorkflowStep(value) {
+  if (!isRecord(value) || typeof value.method !== "string" || !Object.hasOwn(WORKFLOW_STEP_METHODS, value.method)) {
+    throw new Error("Workflow step method is not allowed; recursive and meta commands are prohibited");
+  }
+  const extra = Object.keys(value).filter((field) => !["method", "params", "timeoutMs"].includes(field));
+  if (extra.length > 0 || !isRecord(value.params) || containsSensitiveWorkflowField(value.params)) throw new Error("Workflow step contains unsupported or sensitive fields");
+  const timeoutMs = strictBatchInteger(value.timeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_ACTION_TIMEOUT_MS, DEFAULT_WORKFLOW_STEP_TIMEOUT_MS, "workflow step timeoutMs");
+  let params;
+  if (value.method === "screenshot") {
+    const allowed = ["format", "quality", "tabId"];
+    assertBatchFields(value.params, allowed, "workflow screenshot");
+    requireTabId(value.params);
+    if (value.params.format != null && !["png", "jpeg"].includes(value.params.format)) throw new Error("workflow screenshot format must be png or jpeg");
+    if (value.params.quality != null) strictBatchInteger(value.params.quality, 1, 100, 80, "workflow screenshot quality");
+    params = { ...value.params };
+  } else {
+    const type = WORKFLOW_STEP_METHODS[value.method].type;
+    params = (await validateBatchAction({ type, params: value.params, timeoutMs }, 0)).params;
+  }
+  return { method: value.method, params: cloneWorkflowValue(params), timeoutMs };
+}
+
+function resolveWorkflow(collection, params) {
+  if (!isRecord(params)) throw new Error("Workflow selector must be an object");
+  const selectors = ["id", "name", "shortcut"].filter((field) => params[field] != null);
+  if (selectors.length !== 1) throw new Error("Select exactly one workflow by id, name, or shortcut");
+  const field = selectors[0];
+  const needle = field === "shortcut" ? normalizeWorkflowShortcut(params[field]) : requireBoundedWorkflowString(params[field], 120, field);
+  const workflow = collection.workflows.find((entry) => entry[field] === needle);
+  if (!workflow) throw new Error(`Workflow ${field} was not found`);
+  return workflow;
+}
+
+function assertUniqueWorkflows(workflows) {
+  for (const field of ["id", "name", "shortcut"]) {
+    const values = workflows.map((entry) => entry[field]);
+    if (new Set(values).size !== values.length) throw new Error(`Workflow ${field} values must be unique`);
+  }
+}
+
+function normalizeWorkflowShortcut(value) {
+  const raw = requireBoundedWorkflowString(value, MAX_WORKFLOW_SHORTCUT_CHARS, "shortcut");
+  const normalized = raw.toLowerCase().trim().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "");
+  if (normalized.length === 0 || normalized.length > MAX_WORKFLOW_SHORTCUT_CHARS) throw new Error("Workflow shortcut is invalid");
+  return normalized;
+}
+
+function workflowOrigin(value) {
+  if (typeof value !== "string") throw new Error("Workflow origin must be a string");
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("Workflow origin must be a valid absolute URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Workflow origins must use http or https");
+  return parsed.origin;
+}
+
+function requireBoundedWorkflowString(value, max, label) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > max) throw new Error(`Workflow ${label} must be a non-empty string of at most ${max} characters`);
+  return value.trim();
+}
+
+function requireWorkflowTimestamp(value, label) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`Workflow ${label} must be an ISO timestamp`);
+  return new Date(value).toISOString();
+}
+
+function cloneWorkflowValue(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 async function executeScopedPageCommand(envelope, options) {
@@ -626,14 +1012,14 @@ async function executeScopedPageCommand(envelope, options) {
     const action = params.actions[0];
     if (action?.type === "navigate") {
       assertAuthorizedDestination(action.params?.url, expectedScopes);
-      return executeCommand(method, params, options);
+      return executeCommand(method, params, { ...options, workflowInternal: true });
     }
     const tabId = action?.params?.tabId;
     if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
     const actionPageGuard = (override = action.params, result) => pageGuard(override, result);
     const runBatch = async () => {
       await actionPageGuard();
-      const batchResult = await executeCommand(method, params, { ...options, pageGuard: actionPageGuard });
+      const batchResult = await executeCommand(method, params, { ...options, pageGuard: actionPageGuard, workflowInternal: true });
       await actionPageGuard();
       return batchResult;
     };
@@ -663,7 +1049,7 @@ async function executeScopedPageCommand(envelope, options) {
   try {
     const persistentMutation = NAVIGATION_BARRIER_PERSISTENT_COMMANDS.has(method);
     const run = async () => {
-      const value = await executeCommand(method, params, { ...options, pageGuard });
+      const value = await executeCommand(method, params, { ...options, pageGuard, workflowInternal: true });
       if (persistentMutation) await pageGuard(params, value);
       return value;
     };

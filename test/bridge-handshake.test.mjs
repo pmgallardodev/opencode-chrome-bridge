@@ -93,6 +93,14 @@ const EXPECTED_TOOL_CAPABILITIES = {
   chrome_ungroup_tabs: caps("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: caps("browser.cdp", "browser.events", "browser.tabs"),
   chrome_wait_for: caps("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
+  chrome_workflow_cancel: caps("browser.workflows"),
+  chrome_workflow_delete: caps("browser.workflows"),
+  chrome_workflow_get: caps("browser.workflows"),
+  chrome_workflow_import: caps("browser.workflows"),
+  chrome_workflow_run: caps("browser.workflows"),
+  chrome_workflow_start: caps("browser.workflows"),
+  chrome_workflow_stop: caps("browser.workflows"),
+  chrome_workflows: caps("browser.workflows"),
   chrome_wizard_step: caps("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 };
 

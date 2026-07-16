@@ -94,6 +94,32 @@ test("path grants honor segment boundaries and never cross scheme or port", () =
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:444/app"), false);
 });
 
+test("workflow run preflights its complete origin union in one approval before playback", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method, params }) => {
+    if (method === "workflowGet") return {
+      id: "checkout", requiredOrigins: ["https://shop.example", "https://pay.example"],
+      steps: [{ method: "getTab", params: { tabId: 7 } }]
+    };
+    if (method === "getTab") return { id: 7, url: "https://shop.example/cart" };
+    if (method === "workflowRun") {
+      assert.deepEqual(params.expectedOrigins, ["https://pay.example:443/", "https://shop.example:443/"]);
+      return { ok: true, results: [], workflowId: "checkout" };
+    }
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_workflow_run.execute({ id: "checkout", totalTimeoutMs: 5000 }, context(asks));
+  } finally {
+    bridge.restore();
+  }
+  const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
+  assert.equal(originAsks.length, 1);
+  assert.deepEqual(originAsks[0].patterns, ["https://pay.example:443/", "https://shop.example:443/"]);
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["workflowGet", "getTab", "workflowRun"]);
+});
+
 test("evaluate asks once for the origin root and a prior path grant does not cover it", async () => {
   pluginModule.clearPageOriginSessionGrants();
   const plugin = await OpenCodeChromeBridgePlugin();

@@ -38,6 +38,7 @@ const HOST_REQUIRED_EXTENSION_CAPABILITIES = Object.freeze([
   "browser.navigation",
   "browser.network",
   "browser.notifications",
+  "browser.workflows",
   "browser.page-context",
   "browser.screenshots",
   "browser.tab-groups",

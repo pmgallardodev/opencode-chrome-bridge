@@ -44,6 +44,7 @@ const PAGE_SCOPED_TOOLS = new Set([
   "chrome_batch",
   "chrome_cdp_targets",
   "chrome_events",
+  "chrome_workflow_run",
   "chrome_tabs"
 ]);
 const RETURNED_URL_TOOLS = new Set([
@@ -136,6 +137,14 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
   chrome_wait_for: capabilities("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
+  chrome_workflow_cancel: capabilities("browser.workflows"),
+  chrome_workflow_delete: capabilities("browser.workflows"),
+  chrome_workflow_get: capabilities("browser.workflows"),
+  chrome_workflow_import: capabilities("browser.workflows"),
+  chrome_workflow_run: capabilities("browser.workflows"),
+  chrome_workflow_start: capabilities("browser.workflows"),
+  chrome_workflow_stop: capabilities("browser.workflows"),
+  chrome_workflows: capabilities("browser.workflows"),
   chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 });
 
@@ -245,6 +254,78 @@ export default async function OpenCodeChromeBridgePlugin() {
       timeoutMs: batchActionTimeoutMs
     })
   ]);
+  const workflowStepTimeoutMs = schema.number().int().min(50).max(30000).optional();
+  const workflowTabParams = schema.strictObject({ tabId: schema.number().int() });
+  const workflowStep = schema.discriminatedUnion("method", [
+    ...["getTab", "activateTab", "reload", "back", "forward"].map((method) => schema.strictObject({
+      method: schema.literal(method), params: workflowTabParams, timeoutMs: workflowStepTimeoutMs
+    })),
+    schema.strictObject({
+      method: schema.literal("navigate"),
+      params: schema.strictObject({ tabId: schema.number().int(), url: schema.string().min(1).max(2000) }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("tabContext"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        maxChars: schema.number().int().min(100).max(200000).optional(),
+        maxSelectionChars: schema.number().int().min(1).max(10000).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("findElements"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), query: schema.string().min(1).max(500),
+        role: schema.string().min(1).max(50).optional(), interactiveOnly: schema.boolean().optional(),
+        visibleOnly: schema.boolean().optional(), limit: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("waitFor"),
+      params: schema.strictObject({
+        tabId: schema.number().int().optional(), condition: waitConditionSchema,
+        timeoutMs: schema.number().int().min(50).max(120000).optional(),
+        pollIntervalMs: schema.number().int().min(10).max(1000).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("clickElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), ref: schema.string().min(1).max(50),
+        button: schema.enum(["left", "middle", "right"]).optional(),
+        modifiers: schema.array(schema.enum(["Alt", "Control", "ControlOrMeta", "Meta", "Shift"])).max(5).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("screenshot"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), format: schema.enum(["png", "jpeg"]).optional(),
+        quality: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    })
+  ]);
+  const workflowSchema = schema.strictObject({
+    schemaVersion: schema.literal(1),
+    id: schema.string().min(1).max(100),
+    name: schema.string().min(1).max(120),
+    shortcut: schema.string().min(1).max(80),
+    requiredCapabilities: schema.array(schema.string().min(1).max(100)).max(100),
+    requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
+    steps: schema.array(workflowStep).min(1).max(100),
+    createdAt: schema.string().min(1).max(100),
+    updatedAt: schema.string().min(1).max(100)
+  });
+  const workflowSelectorArgs = {
+    id: schema.string().min(1).max(100).optional().describe("Workflow id. Use exactly one selector."),
+    name: schema.string().min(1).max(120).optional().describe("Workflow name. Use exactly one selector."),
+    shortcut: schema.string().min(1).max(80).optional().describe("Normalized workflow shortcut. Use exactly one selector.")
+  };
 
   return {
     tool: requireApprovals({
@@ -1134,6 +1215,71 @@ export default async function OpenCodeChromeBridgePlugin() {
           }), null, 2);
         }
       }),
+      chrome_workflow_start: tool({
+        description: "Start recording successful allowlisted browser commands into a bounded reusable workflow. Sensitive command fields are never recorded.",
+        args: {
+          name: schema.string().min(1).max(120).describe("Workflow display name."),
+          shortcut: schema.string().min(1).max(80).optional().describe("Unique shortcut; defaults to the normalized name.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowStartRecording", args), null, 2);
+        }
+      }),
+      chrome_workflow_stop: tool({
+        description: "Stop the active workflow recording, validate it, and persist it locally.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowStopRecording"), null, 2);
+        }
+      }),
+      chrome_workflow_cancel: tool({
+        description: "Cancel and discard the active workflow recording.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowCancelRecording"), null, 2);
+        }
+      }),
+      chrome_workflows: tool({
+        description: "List locally persisted workflows without returning their step bodies.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowList"), null, 2);
+        }
+      }),
+      chrome_workflow_get: tool({
+        description: "Get one versioned workflow by exactly one of id, name, or shortcut.",
+        args: { ...workflowSelectorArgs },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowGet", args), null, 2);
+        }
+      }),
+      chrome_workflow_import: tool({
+        description: "Validate and import one bounded version-1 typed workflow. Recursive, meta, and sensitive steps are rejected.",
+        args: { workflow: workflowSchema.describe("Complete versioned workflow definition.") },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowImport", args), null, 2);
+        }
+      }),
+      chrome_workflow_delete: tool({
+        description: "Delete one persisted workflow by exactly one of id, name, or shortcut.",
+        args: { ...workflowSelectorArgs },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowDelete", args), null, 2);
+        }
+      }),
+      chrome_workflow_run: tool({
+        description: "Preflight the complete capability and origin union, then run one typed workflow sequentially with indexed results and bounded timeouts.",
+        args: {
+          ...workflowSelectorArgs,
+          totalTimeoutMs: schema.number().int().min(50).max(120000).optional().describe("Overall workflow deadline in milliseconds.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("workflowRun", args, {
+            signal: context.abort,
+            timeoutMs: Math.min(126000, (args.totalTimeoutMs ?? 60000) + 5000)
+          }), null, 2);
+        }
+      }),
       chrome_blocked_urls: tool({
         description: "List the effective blocked URL patterns the bridge enforces on navigation. Patterns come from enterprise managed storage and the extension's local storage key blockedUrlPatterns.",
         args: {},
@@ -1209,6 +1355,14 @@ const APPROVAL_METADATA = {
   chrome_network_requests: (args) => ({ action: "Read bounded page network request summaries", tabId: args.tabId, clear: args.clear }),
   chrome_page_assets: (args) => ({ action: "Inventory or bundle page assets", tabId: args.tabId, outputDirectory: args.outputDirectory }),
   chrome_notify: (args) => ({ action: "Show a Chrome notification", title: previewText(args.title) }),
+  chrome_workflow_start: (args) => ({ action: "Start recording a reusable browser workflow", name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_stop: () => ({ action: "Stop and save the active browser workflow recording" }),
+  chrome_workflow_cancel: () => ({ action: "Cancel the active browser workflow recording" }),
+  chrome_workflows: () => ({ action: "List saved browser workflows" }),
+  chrome_workflow_get: (args) => ({ action: "Read one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_import: (args) => ({ action: "Import a typed browser workflow", name: args.workflow?.name, shortcut: args.workflow?.shortcut, steps: args.workflow?.steps?.length }),
+  chrome_workflow_delete: (args) => ({ action: "Delete one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_run: (args) => ({ action: "Run one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut, totalTimeoutMs: args.totalTimeoutMs }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })
@@ -1439,6 +1593,19 @@ async function authorizePageScopes(scopes, originGrant, context, metadata, callG
 async function resolvePageScopes(name, args, pageMetadata) {
   if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
   if (name === "chrome_batch") return resolveBatchPageScopes(args.actions, pageMetadata);
+  if (name === "chrome_workflow_run") {
+    const workflow = await bridgeCommand("workflowGet", workflowSelector(args));
+    if (!Array.isArray(workflow?.requiredOrigins)) throw new Error("Workflow requiredOrigins must be an array");
+    if (!Array.isArray(workflow.steps)) throw new Error("Workflow steps must be an array");
+    const tabIds = [...new Set(workflow.steps.map((step) => step?.params?.tabId).filter(Number.isInteger))];
+    const currentScopes = await scopesForTabIds(tabIds, pageMetadata);
+    const origins = [...new Set([
+      ...workflow.requiredOrigins.map((origin) => canonicalPageScope(`${new URL(origin).origin}/`)),
+      ...currentScopes.map(originRootPageScope)
+    ])].sort();
+    args.expectedOrigins = origins;
+    return origins;
+  }
   if (name === "chrome_tabs") {
     return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
   }
@@ -1477,6 +1644,12 @@ async function resolvePageScopes(name, args, pageMetadata) {
     throw new Error(`${name} requires a tabId for origin-scoped page access`);
   }
   return [];
+}
+
+function workflowSelector(args) {
+  return Object.fromEntries(["id", "name", "shortcut"]
+    .filter((field) => args?.[field] != null)
+    .map((field) => [field, args[field]]));
 }
 
 async function resolvePageBindings(name, args, pageMetadata) {
@@ -1701,8 +1874,9 @@ function pageScopesFromReturnedResult(name, args, value) {
 
 function splitPageScope(scope) {
   const parsed = new URL(scope);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
   return {
-    origin: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+    origin: `${parsed.protocol}//${parsed.hostname}:${port}`,
     path: normalizePermissionPath(parsed.pathname)
   };
 }

@@ -3930,6 +3930,157 @@ test("notifications enforce title and message bounds and use packaged branded ic
   await assert.rejects(() => harness.execute("notify", { title: "ok", message: "x".repeat(1001) }), /message.*1000/iu);
 });
 
+test("workflow recording persists only successful typed non-sensitive steps and strips screenshot bytes", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    scriptingExecuteScript: async (injection) => {
+      if (!injection.func) return [];
+      if (injection.args.length === 2) return [{ result: { editable: true, focused: true, found: true } }];
+      return [{ result: { found: true, verified: true } }];
+    }
+  });
+  await harness.execute("workflowStartRecording", { name: "Checkout", shortcut: "  QUICK   BUY " });
+  await harness.execute("getTab", { tabId: 7 });
+  await harness.execute("screenshot", { tabId: 7, format: "png" });
+  await assert.rejects(() => harness.execute("navigate", { tabId: 7, url: "not-a-url" }));
+  await harness.execute("navigate", { tabId: 7, url: "https://example.com/pay?token=url-secret" });
+  await harness.execute("fillElement", { tabId: 7, ref: "e1", text: "top-secret" });
+  const workflow = await harness.execute("workflowStopRecording", {});
+  assert.equal(workflow.schemaVersion, 1);
+  assert.equal(workflow.shortcut, "quick-buy");
+  assert.equal(JSON.stringify(workflow.steps.map(({ method }) => method)), JSON.stringify(["getTab", "screenshot"]));
+  assert.equal(JSON.stringify(workflow).includes("iVBOR"), false);
+  assert.equal(JSON.stringify(workflow).includes("top-secret"), false);
+  assert.equal(JSON.stringify(workflow).includes("url-secret"), false);
+  assert.ok(stored.opencodeWorkflows);
+});
+
+test("workflow cancel discards a recording and shortcut uniqueness is normalized", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
+  });
+  await harness.execute("workflowStartRecording", { name: "Discard me", shortcut: "discard" });
+  await harness.execute("getTab", { tabId: 7 });
+  assert.equal(JSON.stringify(await harness.execute("workflowCancelRecording", {})), JSON.stringify({ cancelled: true }));
+  assert.equal(JSON.stringify(await harness.execute("workflowList", {})), JSON.stringify([]));
+  await harness.execute("workflowStartRecording", { name: "First", shortcut: "Quick Buy" });
+  await harness.execute("getTab", { tabId: 7 });
+  await harness.execute("workflowStopRecording", {});
+  await harness.execute("workflowStartRecording", { name: "Second", shortcut: " quick---buy " });
+  await harness.execute("getTab", { tabId: 7 });
+  await assert.rejects(() => harness.execute("workflowStopRecording", {}), /shortcut.*unique|already exists/iu);
+});
+
+test("workflow persisted/imported schemas migrate v0 narrowly and otherwise fail closed", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 0, id: "legacy-1", name: "Legacy", shortcut: "legacy",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: [],
+    steps: [{ command: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); } });
+  const migrated = await harness.execute("workflowGet", { id: "legacy-1" });
+  assert.equal(migrated.schemaVersion, 1);
+  assert.equal(migrated.steps[0].method, "getTab");
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "bad", steps: [{ method: "workflowRun", params: { id: "legacy-1" } }] } }), /not allowed|meta|recursive/iu);
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "future", schemaVersion: 99 } }), /schemaVersion|unsupported/iu);
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    ...migrated, id: "missing-origin", name: "Missing origin", shortcut: "missing-origin",
+    requiredCapabilities: ["browser.navigation", "browser.tabs"], requiredOrigins: [],
+    steps: [{ method: "navigate", params: { tabId: 7, url: "https://outside.example/private" } }]
+  } }), /requiredOrigins.*missing|origin/iu);
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    ...migrated, id: "unknown-cap", name: "Unknown capability", shortcut: "unknown-cap",
+    requiredCapabilities: ["browser.not-installed"]
+  } }), /capabilit.*not allowed|unsupported/iu);
+});
+
+test("origin-scoped commands record once with their approved origin", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
+  });
+  await harness.execute("workflowStartRecording", { name: "Scoped", shortcut: "scoped" });
+  await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/app"], method: "getTab", params: { tabId: 7 }
+  });
+  const workflow = await harness.execute("workflowStopRecording", {});
+  assert.equal(workflow.steps.length, 1);
+  assert.equal(workflow.steps[0].method, "getTab");
+  assert.equal(JSON.stringify(workflow.requiredOrigins), JSON.stringify(["https://example.com"]));
+});
+
+test("workflow playback preflights all capabilities and origins before deterministic indexed effects", async () => {
+  let stored = {};
+  const effects = [];
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => { effects.push(`get:${tabId}`); return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }; }
+  });
+  const base = {
+    schemaVersion: 1, id: "play-1", name: "Play", shortcut: "play",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 }, timeoutMs: 1000 }, { method: "getTab", params: { tabId: 8 }, timeoutMs: 1000 }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  await harness.execute("workflowImport", { workflow: base });
+  const result = await harness.execute("workflowRun", { shortcut: " PLAY ", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(JSON.stringify(result.results.map(({ index, ok }) => ({ index, ok }))), JSON.stringify([{ index: 0, ok: true }, { index: 1, ok: true }]));
+  assert.deepEqual(effects, ["get:7", "get:8", "get:7", "get:8"]);
+  effects.length = 0;
+  await assert.rejects(() => harness.execute("workflowRun", { id: "play-1", expectedOrigins: [], totalTimeoutMs: 5000 }), /origin.*preflight|authorized/iu);
+  assert.deepEqual(effects, []);
+  stored.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.not-installed"];
+  await assert.rejects(() => harness.execute("workflowRun", { id: "play-1", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }), /capabilit/iu);
+  assert.deepEqual(effects, []);
+});
+
+test("workflow playback does not trust imported origin metadata for tab-bound steps", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://private.example/account", windowId: 1 })
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "untrusted-origin", name: "Untrusted origin", shortcut: "untrusted-origin",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: [],
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  await assert.rejects(
+    () => harness.execute("workflowRun", { id: "untrusted-origin", expectedOrigins: [], totalTimeoutMs: 5000 }),
+    /origin.*preflight|authorized/iu
+  );
+});
+
+test("workflow storage and playback enforce recursion, count, payload, and timeout bounds", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); } });
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "too-many", name: "Too many", shortcut: "many", requiredCapabilities: [], requiredOrigins: [],
+    steps: Array.from({ length: 101 }, () => ({ method: "getTab", params: { tabId: 7 } })), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } }), /steps.*100|too many/iu);
+  await assert.rejects(() => harness.execute("workflowRun", { id: "none", totalTimeoutMs: 49 }), /totalTimeoutMs/iu);
+
+  const origins = Array.from({ length: 100 }, (_, index) => `https://${index}.${"a".repeat(60)}.example`);
+  stored = { opencodeWorkflows: { schemaVersion: 1, workflows: Array.from({ length: 100 }, (_, index) => ({
+    schemaVersion: 1, id: `large-${index}`, name: `Large ${index}`, shortcut: `large-${index}`,
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: origins,
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  })) } };
+  await assert.rejects(() => harness.execute("workflowList", {}), /storage payload.*too large|500000/iu);
+});
+
 function createBackgroundHarness({
   storageGet = async () => ({}),
   storageSet = async () => {},
@@ -3943,6 +4094,7 @@ function createBackgroundHarness({
   notificationsCreate = async () => "notification-id",
   scriptingExecuteScript = null,
   storageLocalGet = async () => ({}),
+  storageLocalSet = async () => {},
   storageManagedGet = null,
   tabsCaptureVisibleTab = async () => "data:image/png;base64,iVBORw0KGgo=",
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
@@ -3995,7 +4147,7 @@ function createBackgroundHarness({
     }
   };
   const storage = {
-    local: { get: storageLocalGet },
+    local: { get: storageLocalGet, set: storageLocalSet },
     session: {
       get: storageGet,
       set: storageSet
