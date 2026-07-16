@@ -1200,7 +1200,7 @@ export default async function OpenCodeChromeBridgePlugin() {
       chrome_webmcp_list: tool({
         description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter only reads feature-detected document.modelContext or navigator.modelContext APIs in Chrome's MAIN world.",
         args: {
-          tabId: schema.number().int().describe("Chrome tab id whose exact current document will be bound to this discovery call.")
+          tabId: schema.number().int().describe("Chrome tab id whose approved current origin and exact document will be bound to this discovery call.")
         },
         async execute(args, context) {
           return JSON.stringify(await bridgeCommand("webMcpList", args, { signal: context.abort }), null, 2);
@@ -1420,7 +1420,6 @@ export default async function OpenCodeChromeBridgePlugin() {
 // they do not yet have custom prompt metadata. Only the local bridge status probe is
 // safe to run without access to browser data.
 const APPROVAL_EXEMPT_TOOLS = new Set(["chrome_status"]);
-const ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS = new Set(["chrome_webmcp_list"]);
 
 const APPROVAL_METADATA = {
   chrome_batch: (args) => ({
@@ -1512,7 +1511,7 @@ function requireApprovals(tools, schema) {
   const guarded = { ...tools };
   for (const [name, definition] of Object.entries(guarded)) {
     if (APPROVAL_EXEMPT_TOOLS.has(name)) continue;
-    if (PAGE_SCOPED_TOOLS.has(name) && !ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
+    if (PAGE_SCOPED_TOOLS.has(name)) {
       definition.args.originGrant = schema.enum(["once", "session"]).default("once")
         .describe("Use once for this call, or explicitly cache approved page scopes only for the current OpenCode session.");
     }
@@ -1544,15 +1543,13 @@ function requireApprovals(tools, schema) {
         const pageMetadata = new Map();
         const beforeScopes = await resolvePageScopes(name, executionArgs, pageMetadata);
         const beforeBindings = await resolvePageBindings(name, executionArgs, pageMetadata);
-        if (!ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
-          await authorizePageScopes(
-            approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
-            args?.originGrant,
-            context,
-            describe(args),
-            callGrants
-          );
-        }
+        await authorizePageScopes(
+          approvalScopesForTool(name, executionArgs, beforeScopes, "before"),
+          args?.originGrant,
+          context,
+          describe(args),
+          callGrants
+        );
         const executionContext = {
           ...context,
           authorizePageTransition: async (scope) => {
@@ -1582,12 +1579,10 @@ function requireApprovals(tools, schema) {
           ...pageScopesFromReturnedResult(name, executionArgs, result),
           ...await resolvePostExecutionPageScopes(name, executionArgs, result)
         ];
-        if (!ORIGIN_APPROVAL_EXEMPT_PAGE_TOOLS.has(name)) {
-          await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
-            ...describe(args),
-            action: `Re-authorize page scope after ${name}`
-          }, callGrants);
-        }
+        await authorizePageScopes(approvalScopesForTool(name, executionArgs, afterScopes, "after"), args?.originGrant, context, {
+          ...describe(args),
+          action: `Re-authorize page scope after ${name}`
+        }, callGrants);
         return result;
       }
     };

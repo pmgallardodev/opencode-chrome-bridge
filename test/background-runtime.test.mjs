@@ -4945,23 +4945,24 @@ test("scheduled execution fails closed and sanitizes bounded history and notific
   assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
 });
 
-function webMcpMainWorld({ documentContext, navigatorContext, onRun } = {}) {
-  return async (details) => {
+function webMcpMainWorld({ documentContext, navigatorContext, onRun, pageSetup } = {}) {
+  const page = vm.createContext({
+    AbortController,
+    clearTimeout,
+    document: documentContext === undefined ? {} : { modelContext: documentContext },
+    navigator: navigatorContext === undefined ? {} : { modelContext: navigatorContext },
+    setTimeout
+  });
+  if (typeof pageSetup === "string") vm.runInContext(pageSetup, page);
+  const execute = async (details) => {
     assert.equal(details.world, "MAIN");
     assert.equal(Array.isArray(details.files), false);
     onRun?.();
-    const page = vm.createContext({
-      clearTimeout,
-      document: documentContext === undefined ? {} : { modelContext: documentContext },
-      Error,
-      JSON,
-      navigator: navigatorContext === undefined ? {} : { modelContext: navigatorContext },
-      Promise,
-      setTimeout
-    });
     const injected = vm.runInContext(`(${details.func.toString()})`, page);
     return [{ result: await injected(...(details.args ?? [])) }];
   };
+  execute.page = page;
+  return execute;
 }
 
 function webMcpEnvelope(method, params, origin = "https://example.com:443/") {
@@ -4983,11 +4984,10 @@ test("WebMCP list reports unsupported page and unsupported discovery shape struc
   }
 });
 
-test("WebMCP list supports bounded document and navigator discovery variants", async () => {
+test("WebMCP list supports documented getTools on document and deprecated navigator alias", async () => {
   const variants = [
     { source: "document", documentContext: { getTools: async () => [{ name: "cart.add", description: "Add item", inputSchema: { type: "object" } }] } },
-    { source: "navigator", navigatorContext: { listTools: async () => ({ tools: [{ name: "cart.remove", description: "Remove item", inputSchema: "{\"type\":\"object\"}" }] }) } },
-    { source: "navigator", navigatorContext: { tools: [{ name: "cart.read", description: "Read cart" }] } }
+    { source: "navigator", navigatorContext: { getTools: async () => [{ name: "cart.remove", description: "Remove item", inputSchema: { type: "object" } }] } }
   ];
   for (const variant of variants) {
     const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld(variant) });
@@ -4997,6 +4997,15 @@ test("WebMCP list supports bounded document and navigator discovery variants", a
     assert.equal(result.tools.length, 1);
     assert.match(result.tools[0].name, /^cart\./u);
     assert.equal(typeof result.tools[0].inputSchema, "object");
+  }
+});
+
+test("WebMCP rejects speculative discovery variants", async () => {
+  for (const context of [{ listTools: async () => [] }, { tools: [] }]) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: context }) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, false);
+    assert.equal(result.error.code, "WEBMCP_DISCOVERY_UNSUPPORTED");
   }
 });
 
@@ -5021,20 +5030,16 @@ test("WebMCP list rejects duplicate, unserializable, and oversized page tool met
   }
 });
 
-test("WebMCP invoke supports exact executeTool, invokeTool, and callTool variants", async () => {
+test("WebMCP invoke uses exact documented executeTool name, input, and AbortSignal contract", async () => {
   const invocations = [];
   const variants = [
     { documentContext: {
       getTools: async () => [{ name: "cart.add", description: "Add" }],
-      executeTool: async (tool, input) => { invocations.push(["executeTool", tool.name, typeof input]); return { received: JSON.parse(input) }; }
+      executeTool: async (name, input, options) => { invocations.push([name, input, options]); return { received: input }; }
     } },
     { navigatorContext: {
       getTools: async () => [{ name: "cart.add", description: "Add" }],
-      invokeTool: async (name, input) => { invocations.push(["invokeTool", name, typeof input]); return { received: input }; }
-    } },
-    { navigatorContext: {
-      tools: [{ name: "cart.add", description: "Add" }],
-      callTool: async (name, input) => { invocations.push(["callTool", name, typeof input]); return { received: input }; }
+      executeTool: async (name, input, options) => { invocations.push([name, input, options]); return { received: input }; }
     } }
   ];
   for (const variant of variants) {
@@ -5046,9 +5051,9 @@ test("WebMCP invoke supports exact executeTool, invokeTool, and callTool variant
     assert.equal(result.toolName, "cart.add");
     assert.equal(result.result.received.sku, "A1");
   }
-  assert.deepEqual(invocations.map((entry) => entry[0]), ["executeTool", "invokeTool", "callTool"]);
-  assert.equal(invocations[0][2], "string");
-  assert.equal(invocations[1][2], "object");
+  assert.deepEqual(invocations.map((entry) => entry[0]), ["cart.add", "cart.add"]);
+  assert.equal(invocations[0][1].sku, "A1");
+  assert.equal(invocations[0][2].signal instanceof AbortSignal, true);
 });
 
 test("WebMCP invoke returns bounded structured page errors and timeouts", async () => {
@@ -5065,7 +5070,9 @@ test("WebMCP invoke returns bounded structured page errors and timeouts", async 
 
   const timed = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "wait", description: "Wait" }],
-    executeTool: async () => new Promise(() => {})
+    executeTool: async (_name, _input, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("timed out by signal")), { once: true });
+    })
   } }) });
   const timedResult = await timed.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: {}, timeoutMs: 50, toolName: "wait"
@@ -5145,6 +5152,201 @@ test("WebMCP invocation discards output on cancellation and navigation races", a
     () => navigated.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input: {}, timeoutMs: 1000, toolName: "go" })),
     /scope.*changed|not authorized|document/iu
   );
+});
+
+test("WebMCP exact-document dispatch never runs getTools in a raced destination document", async () => {
+  let currentUrl = "https://a.example/app";
+  let documentId = "document-a";
+  let destinationEffects = 0;
+  const destination = webMcpMainWorld({ documentContext: {
+    getTools: async () => { destinationEffects += 1; return []; }
+  } });
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 }),
+    scriptingExecuteScript: async (details) => {
+      currentUrl = "https://b.example/app";
+      documentId = "document-b";
+      if (Array.isArray(details.target.documentIds) && !details.target.documentIds.includes(documentId)) {
+        throw new Error("The exact approved document no longer exists");
+      }
+      return destination(details);
+    }
+  });
+  await assert.rejects(
+    () => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding(7, "https://a.example:443/app", "document-a")],
+      expectedScopes: ["https://a.example:443/app"],
+      method: "webMcpList",
+      params: { tabId: 7 }
+    }),
+    /document|scope|authorized/iu
+  );
+  assert.equal(destinationEffects, 0);
+});
+
+test("WebMCP external cancellation aborts and settles the page tool before returning", async () => {
+  let effects = 0;
+  let started;
+  const began = new Promise((resolve) => { started = resolve; });
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "slow", description: "Slow" }],
+    executeTool: async (_name, _input, options) => new Promise((resolve, reject) => {
+      started();
+      const timer = setTimeout(() => { effects += 1; resolve({ late: true }); }, 80);
+      options?.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        setTimeout(() => reject(new Error("page observed abort")), 10);
+      }, { once: true });
+    })
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "slow"
+  }), { signal: controller.signal });
+  await began;
+  controller.abort(new Error("cancel exact WebMCP"));
+  await assert.rejects(run, /cancel exact WebMCP/u);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(effects, 0);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP cancellation during discovery never starts the page tool and cleans its registry", async () => {
+  let releaseDiscovery;
+  let discoveryStarted;
+  let effects = 0;
+  const discoveryGate = new Promise((resolve) => { releaseDiscovery = resolve; });
+  const began = new Promise((resolve) => { discoveryStarted = resolve; });
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => { discoveryStarted(); await discoveryGate; return [{ name: "late", description: "Late" }]; },
+    executeTool: async () => { effects += 1; return { late: true }; }
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "late"
+  }), { signal: controller.signal });
+  await began;
+  controller.abort(new Error("cancel during discovery"));
+  releaseDiscovery();
+  await assert.rejects(run, /cancel during discovery/u);
+  assert.equal(effects, 0);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP timeout aborts and settles the page tool with no post-return effect", async () => {
+  let effects = 0;
+  let observedAbort = false;
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "timeout", description: "Timeout" }],
+    executeTool: async (_name, _input, { signal } = {}) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { effects += 1; resolve({ late: true }); }, 100);
+      signal?.addEventListener("abort", () => {
+        observedAbort = true;
+        clearTimeout(timer);
+        setTimeout(() => reject(new Error("timeout aborted")), 10);
+      }, { once: true });
+    })
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "timeout"
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_TIMEOUT");
+  assert.equal(observedAbort, true);
+  await new Promise((resolve) => setTimeout(resolve, 110));
+  assert.equal(effects, 0);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP input rejects accessors, exotic records, and ambiguous keys without reading them", async () => {
+  let getterReads = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "secret", { enumerable: true, get() { getterReads += 1; return "read"; } });
+  const dangerous = {};
+  Object.defineProperty(dangerous, "__proto__", { enumerable: true, value: "ambiguous" });
+  const symbolKey = {};
+  symbolKey[Symbol("hidden")] = "ambiguous";
+  const nonEnumerable = {};
+  Object.defineProperty(nonEnumerable, "hidden", { value: "ambiguous" });
+  const decoratedArray = [1];
+  decoratedArray.extra = 2;
+  class CustomRecord { constructor() { this.value = 1; } }
+  let deep = {};
+  for (let index = 0; index < 22; index += 1) deep = { child: deep };
+  const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "echo", description: "Echo" }],
+    executeTool: async (_name, input) => input
+  } }) });
+  for (const input of [accessor, new Date(), new Map([["a", 1]]), new CustomRecord(), dangerous,
+    { constructor: "ambiguous" }, { prototype: "ambiguous" },
+    { ["k".repeat(1_001)]: 1 }, deep, Array.from({ length: 5_001 }, () => 0), { value: Symbol("bad") },
+    symbolKey, nonEnumerable, decoratedArray]) {
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input, timeoutMs: 1_000, toolName: "echo" })),
+      /WebMCP input.*(?:plain|accessor|ambiguous|JSON|serializ|large|bounded|symbol|hidden)/iu
+    );
+  }
+  assert.equal(getterReads, 0);
+
+  const nullRecord = Object.create(null);
+  nullRecord.safe = [1, "two"];
+  const accepted = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: nullRecord, timeoutMs: 1_000, toolName: "echo"
+  }));
+  assert.equal(JSON.stringify(accepted.result), '{"safe":[1,"two"]}');
+});
+
+test("WebMCP output and metadata reject accessors and non-plain objects without invoking getters", async () => {
+  let outputGetterReads = 0;
+  const accessorOutput = {};
+  Object.defineProperty(accessorOutput, "secret", { enumerable: true, get() { outputGetterReads += 1; return "read"; } });
+  const outputHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "bad", description: "Bad" }],
+    executeTool: async () => accessorOutput
+  } }) });
+  const result = await outputHarness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "bad"
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_OUTPUT_INVALID");
+  assert.equal(outputGetterReads, 0);
+
+  for (const inputSchema of [new Date(), new Map(), Object.create({ inherited: true })]) {
+    const listHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "bad-schema", description: "Bad", inputSchema }]
+    } }) });
+    await assert.rejects(
+      () => listHarness.execute("scopedCommand", webMcpEnvelope("webMcpList", {})),
+      /WebMCP.*(?:plain|schema|invalid)/iu
+    );
+  }
+});
+
+test("WebMCP captures intrinsics before page callbacks monkeypatch globals", async () => {
+  const mainWorld = webMcpMainWorld({ pageSetup: `
+    document.modelContext = {
+      async getTools() {
+        globalThis.JSON = { parse() { throw new Error("poison JSON.parse"); }, stringify() { throw new Error("poison JSON.stringify"); } };
+        globalThis.Object = { keys() { throw new Error("poison Object.keys"); } };
+        Set.prototype.has = () => { throw new Error("poison Set.has"); };
+        String.prototype.charCodeAt = () => { throw new Error("poison charCodeAt"); };
+        globalThis.Promise = { race() { throw new Error("poison Promise.race"); } };
+        globalThis.setTimeout = () => { throw new Error("poison setTimeout"); };
+        return [{ name: "safe", description: "Safe", inputSchema: { type: "object" } }];
+      },
+      async executeTool(name, input, { signal }) { return { name, input, aborted: signal.aborted }; }
+    };
+  ` });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: { value: 1 }, timeoutMs: 1_000, toolName: "safe"
+  }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(JSON.stringify(result.result), '{"name":"safe","input":{"value":1},"aborted":false}');
 });
 
 function createBackgroundHarness({

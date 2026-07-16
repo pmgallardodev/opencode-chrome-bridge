@@ -783,7 +783,7 @@ test("every public tool has an explicit page or browser origin classification", 
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
 });
 
-test("WebMCP discovery is document-bound while invocation requires exact current-origin approval", async () => {
+test("WebMCP discovery and invocation require exact current-origin approval before MAIN execution", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];
   const bridge = installBridge(({ method }) => {
@@ -794,7 +794,7 @@ test("WebMCP discovery is document-bound while invocation requires exact current
     throw new Error(`unexpected ${method}`);
   });
   try {
-    await plugin.tool.chrome_webmcp_list.execute({ tabId: 7 }, context(asks));
+    await plugin.tool.chrome_webmcp_list.execute({ originGrant: "once", tabId: 7 }, context(asks));
     await assert.rejects(() => plugin.tool.chrome_webmcp_invoke.execute({
       input: {}, originGrant: "once", tabId: 7, timeoutMs: 1_000, toolName: "cart.add"
     }, {
@@ -808,8 +808,9 @@ test("WebMCP discovery is document-bound while invocation requires exact current
     bridge.restore();
   }
   assert.deepEqual(asks.map((entry) => entry.permission), [
-    "chrome_webmcp_list", "chrome_webmcp_invoke", "browser.origin"
+    "chrome_webmcp_list", "browser.origin", "chrome_webmcp_invoke", "browser.origin"
   ]);
+  assert.deepEqual(asks[1].patterns, ["https://shop.example:443/cart"]);
   assert.deepEqual(asks.at(-1).patterns, ["https://shop.example:443/cart"]);
   assert.deepEqual(bridge.calls.map((entry) => entry.method), ["getTab", "webMcpList", "getTab", "getTab"]);
   const listCall = bridge.calls.find((entry) => entry.method === "webMcpList");
