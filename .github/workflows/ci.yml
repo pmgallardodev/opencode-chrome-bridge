@@ -33,6 +33,8 @@ jobs:
         run: npm ci
       - name: Check syntax
         run: npm run check
+      - name: Scan release tree
+        run: npm run scan:release
       - name: Run tests
         run: npm test
       - name: Smoke-test native host

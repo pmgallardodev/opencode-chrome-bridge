@@ -29,10 +29,10 @@ function compatibleStatus() {
     compatible: true,
     hostReachable: true,
     legacy: false,
-    host: { name: "com.opencode.chrome_bridge", version: "1.3.0", protocolMin: "1.0.0", protocolMax: "1.0.0" },
-    client: { name: "opencode-plugin", version: "1.3.0", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    host: { name: "com.opencode.chrome_bridge", version: "1.4.0", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    client: { name: "opencode-plugin", version: "1.4.0", protocolMin: "1.0.0", protocolMax: "1.0.0" },
     extension: {
-      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.3.0", protocolVersion: "1.0.0",
+      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.4.0", protocolVersion: "1.0.0",
       hostName: "com.opencode.chrome_bridge",
       capabilities: pluginModule.ALL_TOOL_REQUIRED_CAPABILITIES
     },
@@ -44,8 +44,10 @@ function compatibleStatus() {
 function installBridge(respond) {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const trace = [];
   globalThis.fetch = async (_url, options = {}) => {
     if (options.method === "GET") {
+      trace.push("handshake");
       return new Response(JSON.stringify(compatibleStatus()), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     const request = JSON.parse(options.body);
@@ -53,10 +55,11 @@ function installBridge(respond) {
       ? { ...request.params, scoped: true }
       : request;
     calls.push(command);
+    trace.push(command.method);
     const result = await respond(command, calls);
     return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "Content-Type": "application/json" } });
   };
-  return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+  return { calls, trace, restore: () => { globalThis.fetch = originalFetch; } };
 }
 
 function context(asks, sessionID = "session-a") {
@@ -85,6 +88,154 @@ test("canonical page scopes include effective ports and normalized IDN paths", (
   }
 });
 
+test("schedule creation requires a dedicated exact persistent approval after the generic tool grant", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const approval = {
+    version: 1,
+    pattern: `v1:${"a".repeat(64)}`,
+    scheduleId: "schedule-1",
+    workflowSchemaVersion: 1,
+    workflowId: "workflow-1",
+    workflowFingerprint: "b".repeat(64),
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    recurrenceFingerprint: "c".repeat(64),
+    notificationPolicy: "failure",
+    requiredOrigins: ["https://example.com"],
+    managedTabs: [{ tabId: 7, sessionId: "session-a", leaseId: "lease-a" }]
+  };
+  const bridge = installBridge(async (command) => {
+    if (command.method === "scheduleApprovalPreview") return approval;
+    throw new Error(`unexpected mutating bridge call ${command.method}`);
+  });
+  const asks = [];
+  try {
+    await assert.rejects(() => plugin.tool.chrome_schedule_create.execute({
+      enabled: true,
+      name: "Daily",
+      notify: "failure",
+      recurrence: { kind: "daily", hour: 9, minute: 30 },
+      requiredOrigins: ["https://example.com"],
+      workflowId: "workflow-1"
+    }, {
+      directory: path.resolve(import.meta.dirname, ".."),
+      sessionID: "session-a",
+      ask: async (request) => {
+        asks.push(request);
+        if (request.permission === "browser.schedule-unattended") throw new Error("dedicated approval denied");
+      }
+    }), /dedicated approval denied/u);
+  } finally {
+    bridge.restore();
+  }
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["scheduleApprovalPreview"]);
+  assert.equal(asks.length, 2);
+  assert.equal(asks[0].permission, "chrome_schedule_create");
+  assert.equal(asks[1].permission, "browser.schedule-unattended");
+  assert.deepEqual(asks[1].patterns, [approval.pattern]);
+  assert.deepEqual(asks[1].always, [approval.pattern]);
+  assert.deepEqual(asks[1].metadata, {
+    action: "Approve unattended browser workflow schedule",
+    notificationPolicy: "failure",
+    originCount: 1,
+    origins: ["https://example.com"],
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    scheduleId: "schedule-1",
+    workflowFingerprint: "b".repeat(64),
+    workflowId: "workflow-1",
+    workflowSchemaVersion: 1
+  });
+  assert.equal(JSON.stringify(asks[1]).includes("lease-a"), false);
+});
+
+test("mocked public orchestration handshakes then runs context, find, batch, resume, workflow, and schedule preflight", async () => {
+  pluginModule.clearPageOriginSessionGrants();
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const ctx = context(asks, "release-e2e");
+  const workflow = {
+    id: "workflow-e2e",
+    name: "Release E2E",
+    shortcut: "release-e2e",
+    schemaVersion: 1,
+    requiredCapabilities: ["browser.tabs"],
+    requiredOrigins: ["https://example.com:443/app"],
+    steps: [{ method: "getTab", params: { tabId: 7 }, timeoutMs: 1000 }]
+  };
+  const approval = {
+    version: 1,
+    pattern: `v1:${"a".repeat(64)}`,
+    scheduleId: "schedule-e2e",
+    workflowSchemaVersion: 1,
+    workflowId: workflow.id,
+    workflowFingerprint: "b".repeat(64),
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    recurrenceFingerprint: "c".repeat(64),
+    notificationPolicy: "failure",
+    requiredOrigins: ["https://example.com:443/app"],
+    managedTabs: [{ tabId: 7, sessionId: "release-e2e", leaseId: "lease-e2e" }]
+  };
+  const bridge = installBridge(({ method, params }) => {
+    if (method === "getTab") return {
+      active: true, documentId: "document-7", id: 7, index: 0,
+      navigationGeneration: 2, title: "App", url: "https://example.com/app", windowId: 1
+    };
+    if (method === "tabContext") return {
+      documentHeight: 900, documentWidth: 1440, mimeType: "text/html", selectedRefs: [],
+      selection: "", tabId: 7, title: "App", url: "https://example.com/app", visibleText: "Pay now"
+    };
+    if (method === "findElements") return {
+      matches: [{ name: "Pay now", ref: "e1", role: "button", score: 100 }], tabId: 7, truncated: false
+    };
+    if (method === "browserBatch") return {
+      ok: true, results: [{ index: 0, ok: true, result: { id: 7, url: "https://example.com/app" }, type: params.actions[0].type }]
+    };
+    if (method === "resumeSession") return { resumed: true, sessionId: params.sessionId, tabs: [{ id: 7 }] };
+    if (method === "workflowStartRecording") return { recording: true };
+    if (method === "workflowStopRecording" || method === "workflowGet") return workflow;
+    if (method === "workflowRun") return { ok: true, results: [{ index: 0, ok: true }], workflowId: workflow.id };
+    if (method === "scheduleApprovalPreview") return approval;
+    if (method === "scheduleCreate") return { enabled: true, id: approval.scheduleId, workflowId: workflow.id };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    assert.equal(JSON.parse(await plugin.tool.chrome_tab_context.execute({
+      maxChars: 50000, maxSelectionChars: 2000, previewChars: 12000, saveText: false, tabId: 7
+    }, ctx)).visibleText, "Pay now");
+    assert.equal(JSON.parse(await plugin.tool.chrome_find.execute({
+      interactiveOnly: true, limit: 20, query: "Pay", tabId: 7, visibleOnly: true
+    }, ctx)).matches[0].ref, "e1");
+    assert.equal(JSON.parse(await plugin.tool.chrome_batch.execute({
+      actions: [{ type: "getTab", params: { tabId: 7 }, timeoutMs: 1000 }],
+      stopOnError: true, totalTimeoutMs: 5000
+    }, ctx)).ok, true);
+    assert.equal(JSON.parse(await plugin.tool.chrome_resume_session.execute({
+      sessionId: "release-e2e", turnId: "turn-2"
+    }, ctx)).resumed, true);
+    await plugin.tool.chrome_workflow_start.execute({ name: "Release E2E", shortcut: "release-e2e" }, ctx);
+    await plugin.tool.chrome_workflow_stop.execute({}, ctx);
+    assert.equal(JSON.parse(await plugin.tool.chrome_workflow_run.execute({
+      id: workflow.id, totalTimeoutMs: 5000
+    }, ctx)).ok, true);
+    assert.equal(JSON.parse(await plugin.tool.chrome_schedule_create.execute({
+      enabled: true,
+      name: "Daily E2E",
+      notify: "failure",
+      recurrence: { kind: "daily", hour: 9, minute: 30 },
+      requiredOrigins: ["https://example.com:443/app"],
+      workflowId: workflow.id
+    }, ctx)).id, approval.scheduleId);
+  } finally {
+    bridge.restore();
+  }
+  assert.equal(bridge.trace[0], "handshake");
+  for (const method of [
+    "tabContext", "findElements", "browserBatch", "resumeSession", "workflowStartRecording",
+    "workflowStopRecording", "workflowRun", "scheduleApprovalPreview", "scheduleCreate"
+  ]) assert.ok(bridge.trace.includes(method), `missing E2E command ${method}`);
+  assert.ok(asks.some((entry) => entry.permission === "browser.schedule-unattended"));
+  assert.ok(bridge.trace.indexOf("scheduleApprovalPreview") < bridge.trace.indexOf("scheduleCreate"));
+});
+
 test("path grants honor segment boundaries and never cross scheme or port", () => {
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:443/app"), true);
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:443/app/orders"), true);
@@ -92,6 +243,38 @@ test("path grants honor segment boundaries and never cross scheme or port", () =
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:443/apple"), false);
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "http://example.com:80/app"), false);
   assert.equal(pluginModule.pageScopeCovers("https://example.com:443/app", "https://example.com:444/app"), false);
+});
+
+test("workflow run preflights its complete origin union in one approval before playback", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method, params }) => {
+    if (method === "workflowGet") return {
+      id: "checkout", requiredOrigins: ["https://untrusted-superset.example"],
+      steps: [{ method: "getTab", params: { tabId: 7 } }, { method: "getTab", params: { tabId: 8 } }]
+    };
+    if (method === "getTab") return {
+      documentId: `document-${params.tabId}`, id: params.tabId, navigationGeneration: 3,
+      url: params.tabId === 7 ? "https://shop.example/cart" : "https://pay.example/checkout"
+    };
+    if (method === "workflowRun") {
+      assert.deepEqual(params.expectedOrigins, ["https://pay.example:443/", "https://shop.example:443/"]);
+      return { ok: true, results: [], workflowId: "checkout" };
+    }
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_workflow_run.execute({ id: "checkout", totalTimeoutMs: 5000 }, context(asks));
+  } finally {
+    bridge.restore();
+  }
+  const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
+  assert.equal(originAsks.length, 1);
+  assert.deepEqual(originAsks[0].patterns, ["https://pay.example:443/", "https://shop.example:443/"]);
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["workflowGet", "getTab", "getTab", "workflowGet", "workflowRun"]);
+  const runCall = bridge.calls.at(-1);
+  assert.equal(runCall.scoped, true);
+  assert.deepEqual(runCall.expectedBindings.map((entry) => entry.tabId), [7, 8]);
 });
 
 test("evaluate asks once for the origin root and a prior path grant does not cover it", async () => {
@@ -690,6 +873,41 @@ test("every public tool has an explicit page or browser origin classification", 
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_favicon_badge, "page");
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_events, "page");
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
+});
+
+test("WebMCP discovery and invocation require exact current-origin approval before isolated execution", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  const asks = [];
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") return {
+      documentId: "document-webmcp", id: 7, navigationGeneration: 4, url: "https://shop.example/cart"
+    };
+    if (method === "webMcpList") return { supported: true, source: "document", tools: [] };
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_webmcp_list.execute({ originGrant: "once", tabId: 7 }, context(asks));
+    await assert.rejects(() => plugin.tool.chrome_webmcp_invoke.execute({
+      input: {}, originGrant: "once", tabId: 7, timeoutMs: 1_000, toolName: "cart.add"
+    }, {
+      ...context(asks),
+      ask: async (request) => {
+        asks.push(request);
+        if (request.permission === "browser.origin") throw new Error("WebMCP origin denied");
+      }
+    }), /WebMCP origin denied/u);
+  } finally {
+    bridge.restore();
+  }
+  assert.deepEqual(asks.map((entry) => entry.permission), [
+    "chrome_webmcp_list", "browser.origin", "chrome_webmcp_invoke", "browser.origin"
+  ]);
+  assert.deepEqual(asks[1].patterns, ["https://shop.example:443/cart"]);
+  assert.deepEqual(asks.at(-1).patterns, ["https://shop.example:443/cart"]);
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["getTab", "webMcpList", "getTab", "getTab"]);
+  const listCall = bridge.calls.find((entry) => entry.method === "webMcpList");
+  assert.equal(listCall.scoped, true);
+  assert.equal(listCall.expectedBindings[0].documentId, "document-webmcp");
 });
 
 test("origin-bearing events drop internal page metadata before exposure", () => {

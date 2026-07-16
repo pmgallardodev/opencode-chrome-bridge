@@ -20,9 +20,26 @@ const MAX_UPLOAD_FILES = 20;
 const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
 const PAGE_ORIGIN_PERMISSION = "browser.origin";
+const SCHEDULE_UNATTENDED_PERMISSION = "browser.schedule-unattended";
 const MAX_ORIGIN_GRANT_SESSIONS = 100;
 const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
+const WEBMCP_LIST_TRANSPORT_TIMEOUT_MS = 35_000;
+const WEBMCP_INVOKE_TRANSPORT_TIMEOUT_MS = 0;
 const pageOriginSessionGrants = new Map();
+
+async function webMcpBridgeCommand(method, params, signal) {
+  try {
+    return await bridgeCommand(method, params, {
+      signal,
+      timeoutMs: method === "webMcpInvoke" ? WEBMCP_INVOKE_TRANSPORT_TIMEOUT_MS : WEBMCP_LIST_TRANSPORT_TIMEOUT_MS
+    });
+  } catch (error) {
+    if (/Bridge request timed out/iu.test(error?.message ?? "")) {
+      throw new Error("WebMCP platform failure: isolated discovery did not settle before the transport deadline");
+    }
+    throw error;
+  }
+}
 
 const DESTINATION_SCOPED_TOOLS = new Set(["chrome_open", "chrome_open_window"]);
 const TAB_SCOPED_TOOLS = new Set([
@@ -36,7 +53,7 @@ const TAB_SCOPED_TOOLS = new Set([
   "chrome_screenshot", "chrome_screenshot_region", "chrome_scroll", "chrome_set_viewport",
   "chrome_subscribe_cdp", "chrome_tab_context", "chrome_type", "chrome_unsubscribe_cdp",
   "chrome_upload_files", "chrome_wait_for", "chrome_wizard_step", "chrome_cursor_state",
-  "chrome_favicon_badge"
+  "chrome_favicon_badge", "chrome_webmcp_invoke", "chrome_webmcp_list"
 ]);
 const PAGE_SCOPED_TOOLS = new Set([
   ...DESTINATION_SCOPED_TOOLS,
@@ -44,6 +61,7 @@ const PAGE_SCOPED_TOOLS = new Set([
   "chrome_batch",
   "chrome_cdp_targets",
   "chrome_events",
+  "chrome_workflow_run",
   "chrome_tabs"
 ]);
 const RETURNED_URL_TOOLS = new Set([
@@ -121,6 +139,12 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_release_debuggers: capabilities("browser.cdp"),
   chrome_reload: capabilities("browser.navigation", "browser.tabs"),
   chrome_reset_viewport: capabilities("browser.cdp", "browser.tabs"),
+  chrome_schedule_create: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedule_delete: capabilities("browser.schedules"),
+  chrome_schedule_history: capabilities("browser.schedules"),
+  chrome_schedule_run_now: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedule_update: capabilities("browser.schedules", "browser.workflows"),
+  chrome_schedules: capabilities("browser.schedules"),
   chrome_screenshot: capabilities("browser.screenshots", "browser.tabs", "browser.windows"),
   chrome_screenshot_region: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows"),
   chrome_scroll: capabilities("browser.cdp", "browser.tabs"),
@@ -136,6 +160,16 @@ export const TOOL_CAPABILITY_REQUIREMENTS = Object.freeze({
   chrome_ungroup_tabs: capabilities("browser.tab-groups", "browser.tabs"),
   chrome_unsubscribe_cdp: capabilities("browser.cdp", "browser.events", "browser.tabs"),
   chrome_wait_for: capabilities("browser.cdp", "browser.downloads", "browser.tabs", "browser.wait"),
+  chrome_webmcp_invoke: capabilities("browser.tabs", "browser.webmcp"),
+  chrome_webmcp_list: capabilities("browser.tabs", "browser.webmcp"),
+  chrome_workflow_cancel: capabilities("browser.workflows"),
+  chrome_workflow_delete: capabilities("browser.workflows"),
+  chrome_workflow_get: capabilities("browser.workflows"),
+  chrome_workflow_import: capabilities("browser.workflows"),
+  chrome_workflow_run: capabilities("browser.workflows"),
+  chrome_workflow_start: capabilities("browser.workflows"),
+  chrome_workflow_stop: capabilities("browser.workflows"),
+  chrome_workflows: capabilities("browser.workflows"),
   chrome_wizard_step: capabilities("browser.cdp", "browser.screenshots", "browser.tabs", "browser.windows")
 });
 
@@ -245,6 +279,92 @@ export default async function OpenCodeChromeBridgePlugin() {
       timeoutMs: batchActionTimeoutMs
     })
   ]);
+  const workflowStepTimeoutMs = schema.number().int().min(50).max(30000).optional();
+  const workflowTabParams = schema.strictObject({ tabId: schema.number().int() });
+  const workflowStep = schema.discriminatedUnion("method", [
+    ...["getTab", "activateTab", "reload", "back", "forward"].map((method) => schema.strictObject({
+      method: schema.literal(method), params: workflowTabParams, timeoutMs: workflowStepTimeoutMs
+    })),
+    schema.strictObject({
+      method: schema.literal("navigate"),
+      params: schema.strictObject({ tabId: schema.number().int(), url: schema.string().min(1).max(2000) }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("tabContext"),
+      params: schema.strictObject({
+        tabId: schema.number().int(),
+        maxChars: schema.number().int().min(100).max(200000).optional(),
+        maxSelectionChars: schema.number().int().min(1).max(10000).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("findElements"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), query: schema.string().min(1).max(500),
+        role: schema.string().min(1).max(50).optional(), interactiveOnly: schema.boolean().optional(),
+        visibleOnly: schema.boolean().optional(), limit: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("waitFor"),
+      params: schema.strictObject({
+        tabId: schema.number().int().optional(), condition: waitConditionSchema,
+        timeoutMs: schema.number().int().min(50).max(120000).optional(),
+        pollIntervalMs: schema.number().int().min(10).max(1000).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("clickElement"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), ref: schema.string().min(1).max(50),
+        button: schema.enum(["left", "middle", "right"]).optional(),
+        modifiers: schema.array(schema.enum(["Alt", "Control", "ControlOrMeta", "Meta", "Shift"])).max(5).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    }),
+    schema.strictObject({
+      method: schema.literal("screenshot"),
+      params: schema.strictObject({
+        tabId: schema.number().int(), format: schema.enum(["png", "jpeg"]).optional(),
+        quality: schema.number().int().min(1).max(100).optional()
+      }),
+      timeoutMs: workflowStepTimeoutMs
+    })
+  ]);
+  const workflowSchema = schema.strictObject({
+    schemaVersion: schema.literal(1),
+    id: schema.string().min(1).max(100),
+    name: schema.string().min(1).max(120),
+    shortcut: schema.string().min(1).max(80),
+    requiredCapabilities: schema.array(schema.string().min(1).max(100)).max(100),
+    requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
+    steps: schema.array(workflowStep).min(1).max(100),
+    createdAt: schema.string().datetime({ offset: true }).max(100),
+    updatedAt: schema.string().datetime({ offset: true }).max(100)
+  });
+  const workflowSelectorArgs = {
+    id: schema.string().min(1).max(100).optional().describe("Workflow id. Use exactly one selector."),
+    name: schema.string().min(1).max(120).optional().describe("Workflow name. Use exactly one selector."),
+    shortcut: schema.string().min(1).max(80).optional().describe("Normalized workflow shortcut. Use exactly one selector.")
+  };
+  const scheduleRecurrence = schema.discriminatedUnion("kind", [
+    schema.strictObject({ kind: schema.literal("daily"), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("weekly"), weekday: schema.number().int().min(0).max(6), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("monthly"), day: schema.number().int().min(1).max(31), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) }),
+    schema.strictObject({ kind: schema.literal("annual"), month: schema.number().int().min(1).max(12), day: schema.number().int().min(1).max(31), hour: schema.number().int().min(0).max(23), minute: schema.number().int().min(0).max(59) })
+  ]);
+  const scheduleCreateArgs = {
+    name: schema.string().min(1).max(120),
+    workflowId: schema.string().min(1).max(100),
+    recurrence: scheduleRecurrence,
+    requiredOrigins: schema.array(schema.string().url().max(2000)).max(100),
+    enabled: schema.boolean().default(true),
+    notify: schema.enum(["none", "success", "failure", "always"]).default("none")
+  };
 
   return {
     tool: requireApprovals({
@@ -1093,6 +1213,33 @@ export default async function OpenCodeChromeBridgePlugin() {
           return JSON.stringify(await bridgeCommand("accessibilityTree", args), null, 2);
         }
       }),
+      chrome_webmcp_list: tool({
+        description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter reads feature-detected document.modelContext or navigator.modelContext APIs in the extension's ISOLATED world.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id whose approved current origin and exact document will be bound to this discovery call."),
+          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("WebMCP discovery deadline in milliseconds.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await webMcpBridgeCommand("webMcpList", args, context.abort), null, 2);
+        }
+      }),
+      chrome_webmcp_invoke: tool({
+        description: "Invoke one exact WebMCP tool exposed by the current document, with bounded JSON input and output. The current origin requires explicit approval; once native executeTool dispatch commits, it settles naturally.",
+        args: {
+          tabId: schema.number().int().describe("Chrome tab id whose current origin has been explicitly approved."),
+          toolName: schema.string().min(1).max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u).describe("Exact WebMCP tool name returned by chrome_webmcp_list."),
+          input: schema.any().optional().describe("Losslessly JSON-serializable input, limited to 64 KiB."),
+          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("Admission/pre-dispatch deadline in milliseconds; it does not time out a committed page tool.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await webMcpBridgeCommand("webMcpInvoke", {
+            input: Object.hasOwn(args, "input") ? args.input : {},
+            tabId: args.tabId,
+            timeoutMs: args.timeoutMs,
+            toolName: args.toolName
+          }, context.abort), null, 2);
+        }
+      }),
       chrome_click_element: tool({
         description: "Click an element in a Chrome tab by its accessibility-tree reference. Scrolls the element into view and clicks its center through CDP. Capture chrome_accessibility_tree first to obtain refs.",
         args: {
@@ -1132,6 +1279,125 @@ export default async function OpenCodeChromeBridgePlugin() {
             signal: context.abort,
             tabId: args.tabId
           }), null, 2);
+        }
+      }),
+      chrome_workflow_start: tool({
+        description: "Start recording successful allowlisted browser commands into a bounded reusable workflow. Sensitive command fields are never recorded.",
+        args: {
+          name: schema.string().min(1).max(120).describe("Workflow display name."),
+          shortcut: schema.string().min(1).max(80).optional().describe("Unique shortcut; defaults to the normalized name.")
+        },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowStartRecording", args), null, 2);
+        }
+      }),
+      chrome_workflow_stop: tool({
+        description: "Stop the active workflow recording, validate it, and persist it locally.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowStopRecording"), null, 2);
+        }
+      }),
+      chrome_workflow_cancel: tool({
+        description: "Cancel and discard the active workflow recording.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowCancelRecording"), null, 2);
+        }
+      }),
+      chrome_workflows: tool({
+        description: "List locally persisted workflows without returning their step bodies.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("workflowList"), null, 2);
+        }
+      }),
+      chrome_workflow_get: tool({
+        description: "Get one versioned workflow by exactly one of id, name, or shortcut.",
+        args: { ...workflowSelectorArgs },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowGet", args), null, 2);
+        }
+      }),
+      chrome_workflow_import: tool({
+        description: "Validate and import one bounded version-1 typed workflow. Recursive, meta, and sensitive steps are rejected.",
+        args: { workflow: workflowSchema.describe("Complete versioned workflow definition.") },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowImport", args), null, 2);
+        }
+      }),
+      chrome_workflow_delete: tool({
+        description: "Delete one persisted workflow by exactly one of id, name, or shortcut.",
+        args: { ...workflowSelectorArgs },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("workflowDelete", args), null, 2);
+        }
+      }),
+      chrome_workflow_run: tool({
+        description: "Preflight the complete capability and origin union, then run one typed workflow sequentially with indexed results and bounded timeouts.",
+        args: {
+          ...workflowSelectorArgs,
+          totalTimeoutMs: schema.number().int().min(50).max(120000).optional().describe("Overall workflow deadline in milliseconds.")
+        },
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("workflowRun", args, {
+            signal: context.abort,
+            timeoutMs: Math.min(126000, (args.totalTimeoutMs ?? 60000) + 5000)
+          }), null, 2);
+        }
+      }),
+      chrome_schedule_create: tool({
+        description: "Create a bounded local-calendar schedule for one workflow using explicit persistent unattended origin grants.",
+        args: scheduleCreateArgs,
+        async execute(args, context) {
+          const approval = await requestScheduleUnattendedApproval(args, context);
+          return JSON.stringify(await bridgeCommand("scheduleCreate", { ...args, approval }), null, 2);
+        }
+      }),
+      chrome_schedules: tool({
+        description: "List persisted workflow schedules without execution history bodies.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await bridgeCommand("scheduleList"), null, 2);
+        }
+      }),
+      chrome_schedule_update: tool({
+        description: "Update one workflow schedule and recompute its next local-calendar occurrence.",
+        args: {
+          id: schema.string().min(1).max(100),
+          name: schema.string().min(1).max(120).optional(),
+          recurrence: scheduleRecurrence.optional(),
+          requiredOrigins: schema.array(schema.string().url().max(2000)).max(100).optional(),
+          enabled: schema.boolean().optional(),
+          notify: schema.enum(["none", "success", "failure", "always"]).optional()
+        },
+        async execute(args, context) {
+          const approval = await requestScheduleUnattendedApproval(args, context);
+          return JSON.stringify(await bridgeCommand("scheduleUpdate", { ...args, approval }), null, 2);
+        }
+      }),
+      chrome_schedule_delete: tool({
+        description: "Delete one persisted workflow schedule and its named Chrome alarm.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleDelete", args), null, 2);
+        }
+      }),
+      chrome_schedule_run_now: tool({
+        description: "Run one schedule now through the same unattended fail-closed capability and origin preflight.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args, context) {
+          return JSON.stringify(await bridgeCommand("scheduleRunNow", args, {
+            signal: context.abort,
+            timeoutMs: 126000
+          }), null, 2);
+        }
+      }),
+      chrome_schedule_history: tool({
+        description: "Read the bounded sanitized execution history for one workflow schedule.",
+        args: { id: schema.string().min(1).max(100) },
+        async execute(args) {
+          return JSON.stringify(await bridgeCommand("scheduleHistory", args), null, 2);
         }
       }),
       chrome_blocked_urls: tool({
@@ -1200,6 +1466,8 @@ const APPROVAL_METADATA = {
   chrome_tab_context: (args) => ({ action: "Read bounded page context and selection", tabId: args.tabId, outputDirectory: args.outputDirectory }),
   chrome_read_page: (args) => ({ action: "Read page context, accessibility, and optional screenshot", tabId: args.tabId, includeScreenshot: args.includeScreenshot, outputDirectory: args.outputDirectory }),
   chrome_accessibility_tree: (args) => ({ action: "Read the page accessibility tree", tabId: args.tabId }),
+  chrome_webmcp_list: (args) => ({ action: "List declarative WebMCP tools exposed by the current page", tabId: args.tabId }),
+  chrome_webmcp_invoke: (args) => ({ action: "Invoke one declarative WebMCP page tool", tabId: args.tabId, toolName: args.toolName, timeoutMs: args.timeoutMs }),
   chrome_click_element: (args) => ({ action: "Click a page element by reference", tabId: args.tabId, ref: args.ref }),
   chrome_fill_element: (args) => ({ action: "Type into a page element by reference", tabId: args.tabId, ref: args.ref, text: previewText(args.text) }),
   chrome_upload_files: (args) => ({ action: "Upload workspace files to a page file input", tabId: args.tabId, ref: args.ref, files: args.paths?.length }),
@@ -1209,10 +1477,52 @@ const APPROVAL_METADATA = {
   chrome_network_requests: (args) => ({ action: "Read bounded page network request summaries", tabId: args.tabId, clear: args.clear }),
   chrome_page_assets: (args) => ({ action: "Inventory or bundle page assets", tabId: args.tabId, outputDirectory: args.outputDirectory }),
   chrome_notify: (args) => ({ action: "Show a Chrome notification", title: previewText(args.title) }),
+  chrome_workflow_start: (args) => ({ action: "Start recording a reusable browser workflow", name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_stop: () => ({ action: "Stop and save the active browser workflow recording" }),
+  chrome_workflow_cancel: () => ({ action: "Cancel the active browser workflow recording" }),
+  chrome_workflows: () => ({ action: "List saved browser workflows" }),
+  chrome_workflow_get: (args) => ({ action: "Read one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_import: (args) => ({ action: "Import a typed browser workflow", name: args.workflow?.name, shortcut: args.workflow?.shortcut, steps: args.workflow?.steps?.length }),
+  chrome_workflow_delete: (args) => ({ action: "Delete one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut }),
+  chrome_workflow_run: (args) => ({ action: "Run one saved browser workflow", id: args.id, name: args.name, shortcut: args.shortcut, totalTimeoutMs: args.totalTimeoutMs }),
   chrome_screenshot: (args) => ({ action: "Capture a screenshot of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_screenshot_region: (args) => ({ action: "Capture a screenshot region of the page", tabId: args.tabId, outputPath: args.outputPath }),
   chrome_downloads_list: (args) => ({ action: "List the user's Chrome downloads", query: args.query })
 };
+
+async function requestScheduleUnattendedApproval(args, context) {
+  const approval = await bridgeCommand("scheduleApprovalPreview", args);
+  if (!approval || typeof approval !== "object" || Array.isArray(approval)
+    || approval.version !== 1
+    || typeof approval.pattern !== "string"
+    || !/^v1:[a-f0-9]{64}$/u.test(approval.pattern)
+    || typeof approval.scheduleId !== "string"
+    || typeof approval.workflowId !== "string"
+    || !Number.isInteger(approval.workflowSchemaVersion)
+    || !approval.recurrence || typeof approval.recurrence !== "object" || Array.isArray(approval.recurrence)
+    || typeof approval.notificationPolicy !== "string"
+    || !Array.isArray(approval.requiredOrigins)
+    || !Array.isArray(approval.managedTabs)) {
+    throw new Error("Schedule approval preview is invalid");
+  }
+  await context.ask({
+    permission: SCHEDULE_UNATTENDED_PERMISSION,
+    patterns: [approval.pattern],
+    always: [approval.pattern],
+    metadata: {
+      action: "Approve unattended browser workflow schedule",
+      notificationPolicy: approval.notificationPolicy,
+      originCount: approval.requiredOrigins.length,
+      origins: [...approval.requiredOrigins],
+      recurrence: { ...approval.recurrence },
+      scheduleId: approval.scheduleId,
+      workflowFingerprint: approval.workflowFingerprint,
+      workflowId: approval.workflowId,
+      workflowSchemaVersion: approval.workflowSchemaVersion
+    }
+  });
+  return approval;
+}
 
 function requireApprovals(tools, schema) {
   const guarded = { ...tools };
@@ -1439,6 +1749,20 @@ async function authorizePageScopes(scopes, originGrant, context, metadata, callG
 async function resolvePageScopes(name, args, pageMetadata) {
   if (DESTINATION_SCOPED_TOOLS.has(name)) return args.url == null ? [] : [canonicalPageScope(args.url)];
   if (name === "chrome_batch") return resolveBatchPageScopes(args.actions, pageMetadata);
+  if (name === "chrome_workflow_run") {
+    const workflow = await bridgeCommand("workflowGet", workflowSelector(args));
+    if (!Array.isArray(workflow.steps)) throw new Error("Workflow steps must be an array");
+    const tabIds = [...new Set(workflow.steps.map((step) => step?.params?.tabId).filter(Number.isInteger))];
+    const currentScopes = await scopesForTabIds(tabIds, pageMetadata);
+    const origins = [...new Set([
+      ...currentScopes.map(originRootPageScope),
+      ...workflow.steps
+        .filter((step) => step?.method === "navigate" && typeof step.params?.url === "string")
+        .map((step) => originRootPageScope(canonicalPageScope(step.params.url)))
+    ])].sort();
+    args.expectedOrigins = origins;
+    return origins;
+  }
   if (name === "chrome_tabs") {
     return scopesFromTabs(filterPublicPageMetadata(await bridgeCommand("listTabs")));
   }
@@ -1479,9 +1803,20 @@ async function resolvePageScopes(name, args, pageMetadata) {
   return [];
 }
 
+function workflowSelector(args) {
+  return Object.fromEntries(["id", "name", "shortcut"]
+    .filter((field) => args?.[field] != null)
+    .map((field) => [field, args[field]]));
+}
+
 async function resolvePageBindings(name, args, pageMetadata) {
   let tabIds = [];
   if (name === "chrome_batch") tabIds = batchTabIds(args.actions);
+  else if (name === "chrome_workflow_run") {
+    const workflow = await bridgeCommand("workflowGet", workflowSelector(args));
+    if (!Array.isArray(workflow?.steps)) throw new Error("Workflow steps must be an array");
+    tabIds = [...new Set(workflow.steps.map((step) => step?.params?.tabId).filter(Number.isInteger))];
+  }
   else if (Number.isInteger(args?.tabId)) tabIds = [args.tabId];
   if (tabIds.length === 0) return [];
   const bindings = [];
@@ -1701,8 +2036,9 @@ function pageScopesFromReturnedResult(name, args, value) {
 
 function splitPageScope(scope) {
   const parsed = new URL(scope);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
   return {
-    origin: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+    origin: `${parsed.protocol}//${parsed.hostname}:${port}`,
     path: normalizePermissionPath(parsed.pathname)
   };
 }

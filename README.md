@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.0-0f766e?style=flat-square" alt="Version v1.3.0" />
+  <img src="https://img.shields.io/badge/Version-v1.4.0-0f766e?style=flat-square" alt="Version v1.4.0" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -408,6 +408,113 @@ Session tabs are grouped per Chrome window and newly opened child tabs are adopt
 from a live leased parent. `chrome_resume_session` fails closed on malformed or internal
 tabs and keeps handoff state intact when recovery must be retried.
 
+### Reusable workflows
+
+| Tool | Description |
+| --- | --- |
+| `chrome_workflow_start` | Start recording successful allowlisted browser operations |
+| `chrome_workflow_stop` | Validate and persist the active recording |
+| `chrome_workflow_cancel` | Discard the active recording |
+| `chrome_workflows` | List persisted workflows without their step bodies |
+| `chrome_workflow_get` | Read one workflow by exactly one of id, name, or shortcut |
+| `chrome_workflow_import` | Validate and import one versioned typed workflow |
+| `chrome_workflow_delete` | Delete one workflow by exactly one selector |
+| `chrome_workflow_run` | Preflight and execute a workflow sequentially with indexed results |
+
+Workflows are local, typed data rather than arbitrary scripts. The current schema is:
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "workflow-1",
+  "name": "Open dashboard",
+  "shortcut": "open-dashboard",
+  "steps": [
+    {
+      "method": "navigate",
+      "params": { "tabId": 7, "url": "https://example.com/dashboard" },
+      "timeoutMs": 10000
+    }
+  ],
+  "requiredCapabilities": ["browser.navigation", "browser.tabs"],
+  "requiredOrigins": ["https://example.com:443/dashboard"],
+  "createdAt": "2026-07-16T12:00:00.000Z",
+  "updatedAt": "2026-07-16T12:00:00.000Z"
+}
+```
+
+The allowlist contains `activateTab`, `back`, `clickElement`, `findElements`, `forward`,
+`getTab`, `navigate`, `reload`, `screenshot`, `tabContext`, and `waitFor`. Recursive,
+meta, sensitive, or unknown operations are rejected. Version-0 data receives only the
+narrow built-in migration; unknown and future schema versions fail closed. Import never
+trusts supplied capability or origin metadata: both sets are recomputed from the steps.
+`createdAt` and `updatedAt` are required ISO 8601 timestamps with an explicit timezone.
+
+Storage is bounded to 100 workflows, 100 steps and 100 origins per workflow, and 500,000
+serialized bytes. Names are limited to 120 characters, shortcuts to 80, each step timeout
+to 50–30,000 ms, and a run to 50–120,000 ms. A run approves the complete capability and
+origin union before its first side effect.
+
+### Scheduled workflows
+
+| Tool | Description |
+| --- | --- |
+| `chrome_schedule_create` | Create a local-calendar workflow schedule |
+| `chrome_schedules` | List schedules without history bodies |
+| `chrome_schedule_update` | Update and recompute a schedule's next occurrence |
+| `chrome_schedule_delete` | Delete a schedule and its Chrome alarm |
+| `chrome_schedule_run_now` | Run a schedule immediately through unattended preflight |
+| `chrome_schedule_history` | Read bounded, sanitized execution history |
+
+Schedules support daily, weekly, monthly, and annual local-calendar recurrences, plus
+`none`, `success`, `failure`, and `always` notification policies. They are bounded to 100
+schedules, 50 history entries per schedule, 100 required origins, and 500,000 serialized
+bytes. Manual runs remain cancellable and use the same capability and origin checks.
+
+Creating or materially changing a schedule first asks for the ordinary tool permission and
+then for a dedicated, exact `browser.schedule-unattended` approval. The preview binds the
+workflow fingerprint, recurrence, notification policy, required origins, and managed tabs;
+the bridge never accepts client-provided skip or `unattendedApproved` flags. Changing any
+bound field requires a new explicit approval before unattended execution can continue.
+
+Schedule state and Chrome alarms use a durable journal and committed semantics: a result is
+reported only after its state transition is committed. Interrupted alarm changes are repaired
+on restart. Executions are claimed and deduplicated before work starts, completed occurrences
+are not replayed after a crash, and stored history is sanitized.
+
+### Experimental WebMCP
+
+| Tool | Description |
+| --- | --- |
+| `chrome_webmcp_list` | Discover bounded WebMCP tools exposed by the exact current document |
+| `chrome_webmcp_invoke` | Invoke one discovered descriptor under an admission token |
+
+WebMCP support is experimental. It targets the current Chrome implementation documented in
+[Chrome's official WebMCP guide](https://developer.chrome.com/docs/ai/webmcp) and, for local
+development, requires `chrome://flags/#enable-webmcp-testing`. It does not run in headless
+mode. The page must be an origin-isolated top-level document permitted by the `tools`
+Permissions Policy. The bridge binds discovery and invocation to that exact origin and
+document, and navigation invalidates the binding.
+
+The content-script adapter runs in Chrome's `ISOLATED` world; it does not publish a registry
+in the page's main world. It uses only the official signatures
+`document.modelContext.getTools()` and
+`document.modelContext.executeTool(descriptor, inputJson, { signal })` (with a narrow legacy
+`navigator.modelContext` compatibility lookup), rather than guessing alternate method names.
+
+Discovery admits at most 100 tools. Names are capped at 100 characters, descriptions at
+2,000, each schema at 64 KiB, invocation input at 64 KiB, output at 512 KiB, and the adapter
+envelope at 768 KiB. JSON is limited to depth 20, 5,000 nodes, and 1,000 keys. Admission has
+a caller-selected 50–30,000 ms deadline (10,000 ms by default), at most 8 committed tokens
+exist globally, only one may be committed per tab, and each token expires after 30,000 ms.
+
+The deadline governs binding, discovery, the navigation guard, and admission lock only. The
+service worker prepares a random token, commits the exact descriptor only after a synchronous
+signal/deadline check in the exact current document, and then releases the admission barrier
+when the page call naturally settles or rejects. That commit is irrevocable: disconnecting or
+cancelling the client after commit cannot abort the page's signal or free the slot early.
+Regular bridge and status capacity remains reserved while WebMCP invocations are active.
+
 ### Origin permissions, uploads, assets, and notifications
 
 | Tool | Description |
@@ -469,6 +576,7 @@ Navigation commands (`chrome_open`, `chrome_open_window`) refuse URLs matching `
 | Run tests | `npm test` | Runs the Node built-in test suite |
 | Verify wiring | `npm run verify` | Checks native host manifest + OpenCode config |
 | Smoke native host | `npm run smoke:native` | Tests that the native host can bind, write state, and round-trip commands and events |
+| Smoke installed stack | `npm run smoke:installed` | Exercises the installed host, extension, managed tab, workflow, and disabled schedule end to end |
 
 ## Project structure
 
@@ -562,6 +670,18 @@ path-prefix grants. Execution remains bound to the exact approved live document,
 Chrome's same-origin model means approving these tools on `/public` cannot isolate
 same-origin `/admin` data.
 
+### Privacy and local data
+
+The bridge has no telemetry or cloud relay. Its bearer token and runtime state stay in the
+current user's private local state directory. Workflows, schedules, approval fingerprints,
+and sanitized schedule history stay in Chrome extension storage. Browser data, screenshots,
+page assets, and file uploads leave the browser or workspace only when an approved tool
+explicitly requests them; do not commit generated artifacts or credentials.
+
+WebMCP returns only bounded descriptor metadata and JSON results through the local
+authenticated bridge. Its admission tokens are random, short-lived, document-bound, and
+never persisted. Page exceptions are normalized before crossing the isolated adapter boundary.
+
 ### Tool approval prompts
 
 Every browser tool except `chrome_status` asks for your explicit approval before it runs. This deny-by-default rule covers reads, metadata, navigation, browser mutations, lifecycle operations, and newly added tools. The plugin calls OpenCode's permission system (`context.ask`), so you get the native **allow once / allow always / deny** prompt with concrete details of the action:
@@ -591,6 +711,31 @@ com.opencode.chrome_bridge
 ```
 
 ## Manual installation
+
+### Upgrade or repair an installation
+
+Update all components together so the plugin, native host, and extension negotiate the same
+release. From this repository run:
+
+```bash
+git pull --ff-only
+npm ci
+npm run install:native
+npm run install:opencode
+```
+
+Then reload **OpenCode Chrome Bridge** at `chrome://extensions`, restart OpenCode, and run:
+
+```bash
+npm run verify
+npm run check:chrome-extension
+npm run smoke:native
+npm run smoke:installed
+```
+
+The same sequence repairs stale launchers, native-host manifests, or plugin configuration.
+If verification still reports a mismatch, use the exact repair command shown in the popup or
+in [Troubleshooting](#troubleshooting); never bypass the version or permission checks.
 
 ### Native messaging host on Windows
 
@@ -710,6 +855,15 @@ What each command proves:
 - `npm run verify` — OpenCode config and Chrome native-host manifest are wired to this workspace.
 - `npm run check:chrome-extension` — Chrome has loaded this unpacked extension.
 - `npm run smoke:native` — the native host can bind a local bridge, write bridge state, and round-trip commands and events.
+- `npm run smoke:installed` — the real authenticated HTTP bridge, native messaging host,
+  extension worker, managed tab lease, workflow storage, and disabled-schedule lifecycle work
+  together. It creates only a dedicated inactive local-fixture tab and unique records, then
+  deletes the schedule/workflow and finalizes that session in `finally`; existing user tabs are
+  never selected or modified. WebMCP discovery is reported conditionally when Chrome enables it.
+
+Reload the unpacked extension at `chrome://extensions` before `npm run smoke:installed` after
+changing extension code. The command requires a connected, compatible v1.4.0 extension and
+fails before opening its fixture tab when Chrome still runs an older service worker.
 
 For a direct bridge status check:
 

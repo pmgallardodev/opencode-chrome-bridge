@@ -17,11 +17,14 @@ const BRIDGE_CAPABILITIES = Object.freeze([
   "browser.network",
   "browser.notifications",
   "browser.page-context",
+  "browser.schedules",
   "browser.screenshots",
   "browser.tab-groups",
   "browser.tabs",
   "browser.wait",
+  "browser.webmcp",
   "browser.windows",
+  "browser.workflows",
   "session.resume",
   "session.tab-leases"
 ]);
@@ -59,6 +62,23 @@ const MIN_WAIT_TIMEOUT_MS = 50;
 const MAX_WAIT_POLL_MS = 1_000;
 const MIN_WAIT_POLL_MS = 10;
 const MAX_WAIT_VALUE_CHARS = 2_000;
+const MAX_WEBMCP_TOOLS = 100;
+const MAX_WEBMCP_NAME_CHARS = 100;
+const MAX_WEBMCP_DESCRIPTION_CHARS = 2_000;
+const MAX_WEBMCP_INPUT_BYTES = 64 * 1024;
+const MAX_WEBMCP_OUTPUT_BYTES = 512 * 1024;
+const MAX_WEBMCP_SCHEMA_BYTES = 64 * 1024;
+const MAX_WEBMCP_ENVELOPE_BYTES = 768 * 1024;
+const MAX_WEBMCP_JSON_DEPTH = 20;
+const MAX_WEBMCP_JSON_NODES = 5_000;
+const MAX_WEBMCP_JSON_KEY_CHARS = 1_000;
+const MIN_WEBMCP_TIMEOUT_MS = 50;
+const MAX_WEBMCP_TIMEOUT_MS = 30_000;
+const DEFAULT_WEBMCP_TIMEOUT_MS = 10_000;
+const WEBMCP_PREPARED_REGISTRY_LIMIT = 8;
+const WEBMCP_PREPARED_TTL_MS = 30_000;
+const MAX_COMMITTED_WEBMCP_INVOKES = 8;
+const WEBMCP_TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u;
 const MAX_NETWORK_REQUEST_STATES = 1_000;
 const MAX_NETWORK_BUFFER_CHARS = 2_000_000;
 const MAX_NETWORK_RESULT_LIMIT = 500;
@@ -99,6 +119,42 @@ const MAX_BATCH_ACTION_TIMEOUT_MS = 30_000;
 const MAX_BATCH_TOTAL_TIMEOUT_MS = 120_000;
 const DEFAULT_BATCH_ACTION_TIMEOUT_MS = 10_000;
 const DEFAULT_BATCH_TOTAL_TIMEOUT_MS = 60_000;
+const WORKFLOW_SCHEMA_VERSION = 1;
+const WORKFLOW_STORAGE_KEY = "opencodeWorkflows";
+const WORKFLOW_RECORDING_STORAGE_KEY = "opencodeWorkflowRecording";
+const MAX_WORKFLOWS = 100;
+const MAX_WORKFLOW_STEPS = 100;
+const MAX_WORKFLOW_ORIGINS = 100;
+const MAX_WORKFLOW_STORAGE_BYTES = 500_000;
+const MAX_WORKFLOW_NAME_CHARS = 120;
+const MAX_WORKFLOW_SHORTCUT_CHARS = 80;
+const DEFAULT_WORKFLOW_STEP_TIMEOUT_MS = 10_000;
+const DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS = 60_000;
+const SCHEDULE_SCHEMA_VERSION = 2;
+const SCHEDULE_APPROVAL_VERSION = 1;
+const SCHEDULE_STORAGE_KEY = "opencodeSchedules";
+const SCHEDULE_ALARM_PREFIX = "opencode-workflow-schedule:";
+const MAX_SCHEDULES = 100;
+const MAX_SCHEDULE_HISTORY = 50;
+const MAX_SCHEDULE_STORAGE_BYTES = 500_000;
+const WORKFLOW_STEP_METHODS = Object.freeze({
+  activateTab: { capability: ["browser.tabs", "browser.windows"], type: "activateTab" },
+  back: { capability: ["browser.navigation", "browser.tabs"], type: "back" },
+  clickElement: { capability: ["browser.accessibility", "browser.cdp", "browser.tabs"], type: "clickElement" },
+  findElements: { capability: ["browser.find", "browser.tabs"], type: "findElements" },
+  forward: { capability: ["browser.navigation", "browser.tabs"], type: "forward" },
+  getTab: { capability: ["browser.tabs"], type: "getTab" },
+  navigate: { capability: ["browser.navigation", "browser.tabs"], type: "navigate" },
+  reload: { capability: ["browser.navigation", "browser.tabs"], type: "reload" },
+  screenshot: { capability: ["browser.screenshots", "browser.tabs", "browser.windows"], type: null },
+  tabContext: { capability: ["browser.page-context", "browser.tabs"], type: "tabContext" },
+  waitFor: { capability: ["browser.tabs", "browser.wait"], type: "waitFor" }
+});
+const WORKFLOW_CONTROL_METHODS = new Set([
+  "workflowStartRecording", "workflowStopRecording", "workflowCancelRecording",
+  "workflowList", "workflowGet", "workflowImport", "workflowDelete", "workflowRun",
+  "scheduleApprovalPreview", "scheduleCreate", "scheduleList", "scheduleUpdate", "scheduleDelete", "scheduleRunNow", "scheduleHistory"
+]);
 const BATCH_ACTION_METHODS = Object.freeze({
   activateTab: "activateTab",
   back: "back",
@@ -118,6 +174,8 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "fileUploadCommit", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
   "pageAssets",
+  "webMcpList", "webMcpInvoke",
+  "workflowRun",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
   "waitFor", "type"
@@ -128,7 +186,7 @@ const ALLOWED_RAW_PAGE_CDP_METHODS = new Set([
 const NAVIGATION_BARRIER_COMMANDS = new Set([
   "cdpCommand", "click", "clickElement", "doubleClick", "evaluate", "fillElement", "hover",
   "getConsoleLogs", "keypress", "moveSequence", "networkRequests", "screenshotRegion", "scroll",
-  "pageAssets",
+  "pageAssets", "webMcpList", "webMcpInvoke",
   "setViewport", "resetViewport", "subscribeCdpEvents", "type", "unsubscribeCdpEvents"
 ]);
 const NAVIGATION_BARRIER_PERSISTENT_COMMANDS = new Set([
@@ -176,13 +234,36 @@ const tabNavigationAttempts = new Map();
 const retiredMainFrameLoaders = new Map();
 let navigationAttemptSequence = 1;
 const activeNativeCommands = new Map();
+const activeCommittedWebMcpInvokes = new Set();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
+let workflowMutationQueue = Promise.resolve();
+let workflowRecordingFault = null;
+let scheduleMutationQueue = Promise.resolve();
 
-chrome.runtime.onInstalled.addListener(connectNativeHost);
-chrome.runtime.onStartup.addListener(connectNativeHost);
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) connectNativeHost();
+chrome.runtime.onInstalled.addListener(async () => {
+  connectNativeHost();
+  await restoreScheduleAlarms();
+});
+chrome.runtime.onStartup.addListener(async () => {
+  connectNativeHost();
+  await restoreScheduleAlarms();
+});
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === RECONNECT_ALARM) {
+    connectNativeHost();
+    return;
+  }
+  if (typeof alarm?.name === "string" && alarm.name.startsWith(SCHEDULE_ALARM_PREFIX)) {
+    try {
+      await executeSchedule(alarm.name.slice(SCHEDULE_ALARM_PREFIX.length), {
+        scheduledTime: alarm.scheduledTime,
+        trigger: "alarm"
+      });
+    } catch (error) {
+      sendEvent({ category: "scheduler", type: "alarmFailed", error: sanitizeScheduleError(error) });
+    }
+  }
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_BRIDGE_STATUS") {
@@ -211,6 +292,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 registerBrowserEventListeners();
 
 connectNativeHost();
+// A service worker can be suspended and later recreated without Chrome firing
+// runtime.onStartup. Reconcile durable schedule state on every module load too.
+void restoreScheduleAlarms();
 
 function connectNativeHost() {
   if (nativePort || reconnecting) return;
@@ -393,6 +477,7 @@ async function handleNativeMessage(message) {
     return;
   }
   if (message?.type !== "command" || typeof message.id !== "string") return;
+  const settlementTracked = message.method === "scopedCommand" && message.params?.method === "webMcpInvoke";
   const controller = new AbortController();
   activeNativeCommands.set(message.id, controller);
   try {
@@ -408,6 +493,9 @@ async function handleNativeMessage(message) {
       error: truncateString(error?.message || String(error), MAX_NATIVE_ERROR_CHARS)
     });
   } finally {
+    if (settlementTracked && controller.signal.aborted) {
+      try { postNativeResponse({ type: "settled", id: message.id }); } catch {}
+    }
     if (activeNativeCommands.get(message.id) === controller) activeNativeCommands.delete(message.id);
   }
 }
@@ -428,6 +516,43 @@ function postNativeResponse(message) {
 }
 
 async function executeCommand(method, params, options = {}) {
+  if (options.workflowInternal === true || WORKFLOW_CONTROL_METHODS.has(method)) {
+    return executeCommandCore(method, params, options);
+  }
+  const decision = await queueWorkflowMutation(async () => {
+    throwIfAborted(options.signal);
+    const recording = await loadWorkflowRecording();
+    if (!recording) return { recording: false };
+    if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    if (recording.pendingStep) throw new Error("Workflow recording is fail-closed because its durable journal has a pending browser effect; cancel the recording");
+    const plan = await prepareWorkflowRecordingStep(recording, method, params);
+    const journaled = await journalWorkflowRecordingStep(recording, plan);
+    let result;
+    try {
+      throwIfAborted(options.signal);
+      result = await executeCommandCore(method, params, options);
+    } catch (error) {
+      try {
+        await clearJournaledWorkflowStep(journaled);
+      } catch (clearError) {
+        workflowRecordingFault = clearError?.message ?? String(clearError);
+        sendEvent({ category: "workflow", type: "recordingFailed", error: workflowRecordingFault });
+      }
+      throw error;
+    }
+    try {
+      await commitJournaledWorkflowStep(journaled);
+    } catch (error) {
+      workflowRecordingFault = error?.message ?? String(error);
+      sendEvent({ category: "workflow", type: "recordingFailed", error: workflowRecordingFault });
+    }
+    return { recording: true, result };
+  });
+  if (decision.recording) return decision.result;
+  return executeCommandCore(method, params, { ...options, workflowInternal: true });
+}
+
+async function executeCommandCore(method, params, options = {}) {
   switch (method) {
     case "scopedCommand":
       return executeScopedPageCommand(params, options);
@@ -479,7 +604,7 @@ async function executeCommand(method, params, options = {}) {
       throwIfAborted(options.signal);
       return { ok: true };
     case "screenshot":
-      return captureScreenshot(params, options.pageGuard);
+      return captureScreenshot(params, options.signal, options.pageGuard);
     case "screenshotRegion":
       return captureScreenshotRegion(params, options.pageGuard);
     case "getConsoleLogs":
@@ -584,12 +709,46 @@ async function executeCommand(method, params, options = {}) {
       return findElements(params, options.signal);
     case "waitFor":
       return waitFor(params, options);
+    case "webMcpList":
+      return listWebMcpTools(params, options.webMcpExternalSignal, options.pageGuard, options.webMcpDeadlineEpochMs);
+    case "webMcpInvoke":
+      return invokeWebMcpTool(params, options.webMcpExternalSignal, options.pageGuard, options.webMcpDeadlineEpochMs);
     case "browserBatch":
       return browserBatch(params, options);
     case "clickElement":
       return clickElement(params, options.signal, options.pageGuard);
     case "fillElement":
       return fillElement(params, options.signal, options.pageGuard);
+    case "workflowStartRecording":
+      return startWorkflowRecording(params);
+    case "workflowStopRecording":
+      return stopWorkflowRecording();
+    case "workflowCancelRecording":
+      return cancelWorkflowRecording();
+    case "workflowList":
+      return listWorkflows();
+    case "workflowGet":
+      return getWorkflow(params);
+    case "workflowImport":
+      return importWorkflow(params);
+    case "workflowDelete":
+      return deleteWorkflow(params);
+    case "workflowRun":
+      return runWorkflow(params, options);
+    case "scheduleApprovalPreview":
+      return previewScheduleApproval(params);
+    case "scheduleCreate":
+      return createSchedule(params);
+    case "scheduleList":
+      return listSchedules();
+    case "scheduleUpdate":
+      return updateSchedule(params);
+    case "scheduleDelete":
+      return deleteSchedule(params);
+    case "scheduleRunNow":
+      return runScheduleNow(params, options);
+    case "scheduleHistory":
+      return scheduleHistory(params);
     case "getBlockedUrlPatterns":
       return { patterns: await loadBlockedUrlPatterns() };
     default:
@@ -597,14 +756,1309 @@ async function executeCommand(method, params, options = {}) {
   }
 }
 
+function startWorkflowRecording(params) {
+  return queueWorkflowMutation(async () => {
+    if (await loadWorkflowRecording()) throw new Error("A workflow recording is already active");
+    if (!isRecord(params)) throw new Error("workflow recording params must be an object");
+    const name = requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "name");
+    const shortcut = normalizeWorkflowShortcut(params.shortcut ?? name);
+    const recording = {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      name, shortcut, requiredCapabilities: [], requiredOrigins: [], steps: [],
+      pendingStep: null, revision: 0, startedAt: new Date().toISOString()
+    };
+    await saveWorkflowRecording(recording);
+    workflowRecordingFault = null;
+    return { name, recording: true, shortcut };
+  });
+}
+
+async function stopWorkflowRecording() {
+  return queueWorkflowMutation(async () => {
+    const recording = await loadWorkflowRecording();
+    if (!recording) throw new Error("No workflow recording is active");
+    if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    if (recording.pendingStep) throw new Error("Workflow recording is fail-closed because its durable journal has a pending browser effect; cancel the recording");
+    if (recording.steps.length === 0) throw new Error("A workflow must contain at least one recorded step");
+    const collection = await loadWorkflowCollection();
+    if (collection.workflows.some((entry) => entry.shortcut === recording.shortcut)) {
+      throw new Error(`Workflow shortcut ${recording.shortcut} already exists and must be unique`);
+    }
+    if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+    const now = new Date().toISOString();
+    const workflow = await validateWorkflowSchema({
+      schemaVersion: WORKFLOW_SCHEMA_VERSION, id: crypto.randomUUID(), name: recording.name,
+      shortcut: recording.shortcut, requiredCapabilities: recording.requiredCapabilities,
+      requiredOrigins: recording.requiredOrigins, steps: recording.steps,
+      createdAt: recording.startedAt, updatedAt: now
+    });
+    await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+    await clearWorkflowRecording();
+    workflowRecordingFault = null;
+    return workflow;
+  });
+}
+
+function cancelWorkflowRecording() {
+  return queueWorkflowMutation(async () => {
+    if (!await loadWorkflowRecording()) throw new Error("No workflow recording is active");
+    await clearWorkflowRecording();
+    workflowRecordingFault = null;
+    return { cancelled: true };
+  });
+}
+
+async function prepareWorkflowRecordingStep(recording, method, params) {
+  let recordedMethod = method;
+  let recordedParams = params;
+  let expectedOrigins = [];
+  if (method === "scopedCommand") {
+    if (!isRecord(params)) throw new Error("Scoped workflow recording params are invalid");
+    recordedMethod = params.method;
+    recordedParams = params.params;
+    expectedOrigins = Array.isArray(params.expectedScopes) ? params.expectedScopes : [];
+  }
+  if (!Object.hasOwn(WORKFLOW_STEP_METHODS, recordedMethod)) throw new Error(`Command ${recordedMethod} is not recordable while workflow recording is active`);
+  if (recordedMethod === "waitFor" && ["text", "url"].includes(recordedParams?.condition?.type)) {
+    throw new Error(`Sensitive waitFor ${recordedParams.condition.type} conditions are not recordable`);
+  }
+  if (containsSensitiveWorkflowField(recordedParams)) throw new Error(`Command ${recordedMethod} contains sensitive fields and is not recordable`);
+  if (recording.steps.length >= MAX_WORKFLOW_STEPS) {
+    throw new Error(`Workflow recording is limited to ${MAX_WORKFLOW_STEPS} steps`);
+  }
+  const step = await validateWorkflowStep({ method: recordedMethod, params: cloneWorkflowValue(recordedParams) });
+  return { expectedOrigins, recordedMethod, recordedParams, step };
+}
+
+function workflowRecordingMetadata(recording, plan) {
+  const capabilities = new Set(recording.requiredCapabilities);
+  const origins = new Set(recording.requiredOrigins);
+  for (const capability of workflowStepCapabilities(plan.step)) {
+    capabilities.add(capability);
+  }
+  for (const scope of plan.expectedOrigins) origins.add(workflowOrigin(scope));
+  if (plan.recordedMethod === "navigate") origins.add(workflowOrigin(plan.recordedParams.url));
+  const requiredOrigins = [...origins].sort();
+  assertWorkflowOriginCount(requiredOrigins, "Workflow recording origins");
+  return { requiredCapabilities: [...capabilities].sort(), requiredOrigins };
+}
+
+async function journalWorkflowRecordingStep(recording, plan) {
+  const metadata = workflowRecordingMetadata(recording, plan);
+  const journaled = {
+    ...recording,
+    pendingStep: { ...metadata, step: plan.step },
+    revision: recording.revision + 1
+  };
+  await saveWorkflowRecording(journaled);
+  return journaled;
+}
+
+async function commitJournaledWorkflowStep(recording) {
+  const pending = recording.pendingStep;
+  if (!pending) throw new Error("Workflow recording journal is missing its pending step");
+  await saveWorkflowRecording({
+    ...recording,
+    pendingStep: null,
+    requiredCapabilities: pending.requiredCapabilities,
+    requiredOrigins: pending.requiredOrigins,
+    revision: recording.revision + 1,
+    steps: [...recording.steps, pending.step]
+  });
+}
+
+async function clearJournaledWorkflowStep(recording) {
+  await saveWorkflowRecording({ ...recording, pendingStep: null, revision: recording.revision + 1 });
+}
+
+function queueWorkflowMutation(operation) {
+  const next = workflowMutationQueue.then(operation, operation);
+  workflowMutationQueue = next.catch(() => {});
+  return next;
+}
+
+async function loadWorkflowRecording() {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(WORKFLOW_RECORDING_STORAGE_KEY);
+  } catch (error) {
+    throw new Error(`Could not read active workflow recording: ${error?.message ?? String(error)}`);
+  }
+  const raw = stored?.[WORKFLOW_RECORDING_STORAGE_KEY];
+  if (raw == null) return null;
+  if (!isRecord(raw) || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Active workflow recording schema is invalid or unsupported");
+  const allowed = ["schemaVersion", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "pendingStep", "revision", "startedAt"];
+  const extra = Object.keys(raw).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Active workflow recording contains unsupported fields: ${extra.join(", ")}`);
+  const name = requireBoundedWorkflowString(raw.name, MAX_WORKFLOW_NAME_CHARS, "name");
+  const shortcut = normalizeWorkflowShortcut(raw.shortcut);
+  if (!Array.isArray(raw.steps) || raw.steps.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording steps are invalid");
+  const steps = await Promise.all(raw.steps.map(validateWorkflowStep));
+  const derivedCapabilities = [...new Set(steps.flatMap(workflowStepCapabilities))].sort();
+  if (!Array.isArray(raw.requiredCapabilities)
+    || JSON.stringify([...new Set(raw.requiredCapabilities)].sort()) !== JSON.stringify(derivedCapabilities)) {
+    throw new Error("Active workflow recording capabilities do not match its typed steps");
+  }
+  if (!Array.isArray(raw.requiredOrigins) || raw.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) throw new Error("Active workflow recording origins are invalid");
+  const requiredOrigins = [...new Set(raw.requiredOrigins.map(workflowOrigin))].sort();
+  if (!Number.isSafeInteger(raw.revision) || raw.revision < 0) throw new Error("Active workflow recording revision is invalid");
+  let pendingStep = null;
+  if (raw.pendingStep != null) {
+    if (!isRecord(raw.pendingStep)
+      || Object.keys(raw.pendingStep).some((field) => !["step", "requiredCapabilities", "requiredOrigins"].includes(field))) {
+      throw new Error("Active workflow recording pending journal schema is invalid");
+    }
+    const step = await validateWorkflowStep(raw.pendingStep.step);
+    const pendingCapabilities = [...new Set([...derivedCapabilities, ...workflowStepCapabilities(step)])].sort();
+    if (!Array.isArray(raw.pendingStep.requiredCapabilities)
+      || JSON.stringify([...new Set(raw.pendingStep.requiredCapabilities)].sort()) !== JSON.stringify(pendingCapabilities)) {
+      throw new Error("Active workflow recording pending journal capabilities are invalid");
+    }
+    if (!Array.isArray(raw.pendingStep.requiredOrigins) || raw.pendingStep.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) {
+      throw new Error("Active workflow recording pending journal origins are invalid");
+    }
+    pendingStep = {
+      requiredCapabilities: pendingCapabilities,
+      requiredOrigins: [...new Set(raw.pendingStep.requiredOrigins.map(workflowOrigin))].sort(),
+      step
+    };
+  }
+  const startedAt = requireWorkflowTimestamp(raw.startedAt, "startedAt");
+  return {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION, name, shortcut, pendingStep,
+    requiredCapabilities: derivedCapabilities, requiredOrigins, revision: raw.revision, steps, startedAt
+  };
+}
+
+async function saveWorkflowRecording(recording) {
+  assertWorkflowOriginCount(recording.requiredOrigins, "Active workflow recording origins");
+  if (recording.pendingStep) {
+    assertWorkflowOriginCount(recording.pendingStep.requiredOrigins, "Active workflow recording pending origins");
+  }
+  const serialized = JSON.stringify(recording);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) throw new Error("Active workflow recording payload is too large");
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_RECORDING_STORAGE_KEY]: recording });
+  } catch (error) {
+    throw new Error(`Could not persist active workflow recording: ${error?.message ?? String(error)}`);
+  }
+}
+
+async function clearWorkflowRecording() {
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_RECORDING_STORAGE_KEY]: null });
+  } catch (error) {
+    throw new Error(`Could not clear active workflow recording: ${error?.message ?? String(error)}`);
+  }
+}
+
+function containsSensitiveWorkflowField(value, key = "") {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/gu, "");
+  if (["text", "expression", "data", "base64", "body", "content", "headers", "password", "passwd", "secret", "token", "credential", "cookie", "authorization", "path", "paths", "files"].some((term) => normalized.includes(term))) {
+    return true;
+  }
+  if (normalized === "url" && typeof value === "string") {
+    try {
+      const parsed = new URL(value);
+      if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(isSensitiveQueryKey)) return true;
+    } catch {
+      return true;
+    }
+  }
+  if (Array.isArray(value)) return value.some((entry) => containsSensitiveWorkflowField(entry));
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([field, entry]) => containsSensitiveWorkflowField(entry, field));
+}
+
+async function listWorkflows() {
+  const { workflows } = await loadWorkflowCollection();
+  return workflows.map(({ steps, ...workflow }) => ({ ...workflow, stepCount: steps.length }));
+}
+
+async function getWorkflow(params) {
+  return resolveWorkflow(await loadWorkflowCollection(), params);
+}
+
+async function importWorkflow(params) {
+  return queueWorkflowMutation(async () => {
+    if (!isRecord(params) || !isRecord(params.workflow)) throw new Error("workflowImport requires a workflow object");
+    const collection = await loadWorkflowCollection();
+    const workflow = await validateWorkflowSchema(params.workflow);
+    if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+    if (collection.workflows.some((entry) => entry.id === workflow.id || entry.name === workflow.name || entry.shortcut === workflow.shortcut)) {
+      throw new Error("Imported workflow id, name, and shortcut must be unique");
+    }
+    await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+    return workflow;
+  });
+}
+
+async function deleteWorkflow(params) {
+  return queueWorkflowMutation(async () => {
+    const collection = await loadWorkflowCollection();
+    const workflow = resolveWorkflow(collection, params);
+    await saveWorkflowCollection({
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      workflows: collection.workflows.filter((entry) => entry.id !== workflow.id)
+    });
+    return { deleted: true, id: workflow.id };
+  });
+}
+
+async function runWorkflow(params, options = {}) {
+  throwIfAborted(options.signal);
+  if (!isRecord(params)) throw new Error("workflowRun params must be an object");
+  const totalTimeoutMs = strictBatchInteger(params.totalTimeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_TOTAL_TIMEOUT_MS, DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS, "totalTimeoutMs");
+  const collection = await loadWorkflowCollection();
+  throwIfAborted(options.signal);
+  const workflow = await validateWorkflowSchema(resolveWorkflow(collection, params), { hydrateOrigins: true });
+  const missingCapabilities = workflow.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
+  if (missingCapabilities.length > 0) throw new Error(`Workflow capability preflight failed: ${missingCapabilities.join(", ")}`);
+  if (!Array.isArray(params.expectedOrigins)) throw new Error("Workflow origin preflight requires expectedOrigins");
+  const expectedOrigins = new Set(params.expectedOrigins.map(workflowOrigin));
+  const missingOrigins = workflow.requiredOrigins.filter((origin) => !expectedOrigins.has(origin));
+  if (missingOrigins.length > 0) throw new Error(`Workflow origin preflight failed; origins are not authorized: ${missingOrigins.join(", ")}`);
+  // Validate every step before any browser effect. This also rejects meta/recursive
+  // commands and malformed values that may have reached persisted storage.
+  const steps = await Promise.all(workflow.steps.map(validateWorkflowStep));
+  throwIfAborted(options.signal);
+  const runtimeOrigins = await resolveWorkflowRuntimeOrigins(steps);
+  const unauthorizedRuntimeOrigins = runtimeOrigins.filter((origin) => !expectedOrigins.has(origin));
+  if (unauthorizedRuntimeOrigins.length > 0) {
+    throw new Error(`Workflow origin preflight failed; current tab origins are not authorized: ${unauthorizedRuntimeOrigins.join(", ")}`);
+  }
+  const authorizedScopes = options.workflowExpectedScopes
+    ?? [...expectedOrigins].map((origin) => canonicalPermissionScope(`${origin}/`));
+  const bindings = new Map((options.workflowExpectedBindings ?? []).map((binding) => [binding.tabId, binding]));
+  for (const tabId of [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))]) {
+    const current = await currentPageBinding(tabId);
+    throwIfAborted(options.signal);
+    if (!workflowScopeAuthorized(current.pageScope, authorizedScopes)) {
+      throw new Error(`Workflow origin preflight failed; current page scope is not authorized: ${current.pageScope}`);
+    }
+    const expected = bindings.get(tabId);
+    if (expected && !workflowBindingMatches(current, expected)) {
+      throw new Error(`Workflow document binding changed before playback for tab ${tabId}`);
+    }
+    if (!expected) bindings.set(tabId, current);
+  }
+  const startedAt = Date.now();
+  const deadline = startedAt + totalTimeoutMs;
+  const results = [];
+  for (let index = 0; index < steps.length; index += 1) {
+    throwIfAborted(options.signal);
+    const step = steps[index];
+    const remainingMs = deadline - Date.now();
+    if (remainingMs < MIN_BATCH_TIMEOUT_MS) throw new Error(`Workflow total timeout after ${totalTimeoutMs}ms at step ${index}`);
+    try {
+      const hasTab = Number.isInteger(step.params.tabId);
+      const expected = hasTab ? bindings.get(step.params.tabId) : null;
+      if (hasTab) {
+        const current = await currentPageBinding(step.params.tabId);
+        throwIfAborted(options.signal);
+        if (!expected || !workflowBindingMatches(current, expected)) {
+          throw new Error(`Workflow document binding changed before step ${index}`);
+        }
+      }
+      if (step.method === "navigate" && !workflowScopeAuthorized(canonicalPermissionScope(step.params.url), authorizedScopes)) {
+        throw new Error(`Workflow navigation destination was not included in origin preflight: ${step.params.url}`);
+      }
+      const stepScopes = hasTab && expected
+        ? [...new Set([...authorizedScopes, expected.pageScope])]
+        : authorizedScopes;
+      const value = await executeWorkflowStep(
+        step,
+        Math.min(step.timeoutMs, remainingMs),
+        options.signal,
+        (stepSignal) => step.method === "waitFor" && step.params.condition.type === "download"
+          ? executeCommand(step.method, cloneWorkflowValue(step.params), { signal: stepSignal, workflowInternal: true })
+          : executeScopedPageCommand({
+            expectedBindings: expected ? [expected] : [],
+            expectedScopes: stepScopes,
+            method: step.method,
+            params: cloneWorkflowValue(step.params)
+          }, { signal: stepSignal, workflowInternal: true })
+      );
+      const after = hasTab ? await currentPageBinding(step.params.tabId, value?.url) : null;
+      if (step.method === "navigate") {
+        if (!workflowScopeAuthorized(after.pageScope, authorizedScopes)) {
+          throw new Error(`Workflow navigation left its preauthorized origin union: ${after.pageScope}`);
+        }
+        bindings.set(step.params.tabId, after);
+      } else if (hasTab && !workflowBindingMatches(after, expected)) {
+        throw new Error(`Workflow document binding changed during step ${index}`);
+      }
+      results.push({ index, method: step.method, ok: true, value });
+    } catch (error) {
+      results.push({ error: error?.message ?? String(error), index, method: step.method, ok: false });
+      return { completed: results.length, elapsedMs: Date.now() - startedAt, ok: false, results, stoppedAt: index, totalSteps: steps.length, workflowId: workflow.id };
+    }
+  }
+  return { completed: results.length, elapsedMs: Date.now() - startedAt, ok: true, results, stoppedAt: null, totalSteps: steps.length, workflowId: workflow.id };
+}
+
+function workflowBindingMatches(current, expected) {
+  return current.documentId === expected.documentId
+    && current.navigationGeneration === expected.navigationGeneration
+    && current.pageScope === expected.pageScope;
+}
+
+function workflowScopeAuthorized(scope, authorizedScopes) {
+  const actual = new URL(canonicalPermissionScope(scope));
+  return authorizedScopes.some((allowedScope) => {
+    const allowed = new URL(canonicalPermissionScope(allowedScope));
+    if (actual.protocol !== allowed.protocol || actual.hostname !== allowed.hostname || actual.port !== allowed.port) return false;
+    const prefix = allowed.pathname === "/" ? "/" : allowed.pathname.replace(/\/$/u, "");
+    return prefix === "/" || actual.pathname === prefix || actual.pathname.startsWith(`${prefix}/`);
+  });
+}
+
+async function resolveWorkflowRuntimeOrigins(steps) {
+  const tabIds = [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))];
+  const origins = await Promise.all(tabIds.map(async (tabId) => {
+    const tab = await chrome.tabs.get(tabId);
+    if (typeof tab?.url !== "string") throw new Error(`Workflow origin preflight could not resolve tab ${tabId}`);
+    return workflowOrigin(tab.url);
+  }));
+  return [...new Set(origins)].sort();
+}
+
+function executeWorkflowStep(step, timeoutMs, parentSignal, operation) {
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(parentSignal.reason);
+  if (parentSignal?.aborted) controller.abort(parentSignal.reason);
+  else parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  let rejectOnAbort;
+  const abortPromise = new Promise((_, reject) => {
+    rejectOnAbort = () => reject(controller.signal.reason ?? new Error("Workflow step was cancelled"));
+    controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
+  });
+  const timer = setTimeout(() => controller.abort(new Error(`Workflow step ${step.method} timed out after ${timeoutMs}ms`)), timeoutMs);
+  const execution = Promise.resolve().then(() => {
+    throwIfAborted(controller.signal);
+    return operation(controller.signal);
+  });
+  return Promise.race([execution, abortPromise]).catch(async (error) => {
+    if (controller.signal.aborted) await execution.catch(() => {});
+    throw error;
+  }).finally(() => {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", onParentAbort);
+    controller.signal.removeEventListener("abort", rejectOnAbort);
+  });
+}
+
+async function loadWorkflowCollection() {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(WORKFLOW_STORAGE_KEY);
+  } catch (error) {
+    throw new Error(`Could not read workflow local storage: ${error?.message ?? String(error)}`);
+  }
+  const raw = stored?.[WORKFLOW_STORAGE_KEY];
+  if (raw == null) return { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [] };
+  if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
+    throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
+  }
+  const collectionExtra = isRecord(raw) ? Object.keys(raw).filter((field) => !["schemaVersion", "workflows"].includes(field)) : [];
+  if (!isRecord(raw) || collectionExtra.length > 0 || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION || !Array.isArray(raw.workflows) || raw.workflows.length > MAX_WORKFLOWS) {
+    throw new Error("Persisted workflow collection schema is invalid or unsupported");
+  }
+  const workflows = await Promise.all(raw.workflows.map(async (entry) => {
+    const migratedEntry = migrateWorkflow(entry);
+    return validateWorkflowSchema(migratedEntry);
+  }));
+  assertUniqueWorkflows(workflows);
+  const collection = { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows };
+  return collection;
+}
+
+async function saveWorkflowCollection(collection) {
+  assertUniqueWorkflows(collection.workflows);
+  for (const workflow of collection.workflows) {
+    assertWorkflowOriginCount(workflow.requiredOrigins, `Workflow ${workflow.id ?? "unknown"} origins`);
+  }
+  const serialized = JSON.stringify(collection);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
+    throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
+  }
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_STORAGE_KEY]: collection });
+  } catch (error) {
+    throw new Error(`Could not write workflow local storage: ${error?.message ?? String(error)}`);
+  }
+}
+
+function migrateWorkflow(value) {
+  if (!isRecord(value) || value.schemaVersion !== 0) return value;
+  if (!Array.isArray(value.steps)) throw new Error("Legacy workflow steps must be an array");
+  return {
+    ...value,
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    steps: value.steps.map((step) => {
+      if (!isRecord(step) || typeof step.command !== "string" || Object.hasOwn(step, "method")) {
+        throw new Error("Legacy workflow step schema cannot be migrated safely");
+      }
+      const { command, ...rest } = step;
+      return { ...rest, method: command };
+    })
+  };
+}
+
+async function validateWorkflowSchema(value, { hydrateOrigins = false } = {}) {
+  if (!isRecord(value) || value.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Workflow schemaVersion is unsupported");
+  const allowed = ["schemaVersion", "id", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "createdAt", "updatedAt"];
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Workflow contains unsupported fields: ${extra.join(", ")}`);
+  const id = requireBoundedWorkflowString(value.id, 100, "id");
+  const name = requireBoundedWorkflowString(value.name, MAX_WORKFLOW_NAME_CHARS, "name");
+  const shortcut = normalizeWorkflowShortcut(value.shortcut);
+  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_WORKFLOW_STEPS) throw new Error(`Workflow steps must contain 1 to ${MAX_WORKFLOW_STEPS} entries`);
+  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > 100) throw new Error("Workflow requiredCapabilities is invalid");
+  if (!Array.isArray(value.requiredOrigins) || value.requiredOrigins.length > MAX_WORKFLOW_ORIGINS) throw new Error("Workflow requiredOrigins is invalid");
+  const steps = await Promise.all(value.steps.map(validateWorkflowStep));
+  const requiredCapabilities = [...new Set(steps.flatMap(workflowStepCapabilities))].sort();
+  const requiredOrigins = new Set(steps
+    .filter((step) => step.method === "navigate")
+    .map((step) => workflowOrigin(step.params.url)));
+  if (hydrateOrigins) {
+    const tabIds = [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))];
+    for (const tabId of tabIds) {
+      const tab = await chrome.tabs.get(tabId);
+      if (typeof tab?.url !== "string") throw new Error(`Workflow origin metadata could not resolve tab ${tabId}`);
+      requiredOrigins.add(workflowOrigin(tab.url));
+    }
+  } else {
+    for (const origin of value.requiredOrigins) requiredOrigins.add(workflowOrigin(origin));
+  }
+  const normalizedOrigins = [...requiredOrigins].sort();
+  assertWorkflowOriginCount(normalizedOrigins, "Workflow required origins");
+  const createdAt = requireWorkflowTimestamp(value.createdAt, "createdAt");
+  const updatedAt = requireWorkflowTimestamp(value.updatedAt, "updatedAt");
+  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins: normalizedOrigins, steps, createdAt, updatedAt };
+}
+
+function workflowStepCapabilities(step) {
+  if (step?.method === "waitFor") {
+    const conditionType = step.params?.condition?.type;
+    if (conditionType === "download") return ["browser.downloads", "browser.wait"];
+    if (conditionType === "networkIdle") return ["browser.cdp", "browser.tabs", "browser.wait"];
+  }
+  return WORKFLOW_STEP_METHODS[step.method].capability;
+}
+
+function assertWorkflowOriginCount(origins, label) {
+  if (!Array.isArray(origins) || origins.length > MAX_WORKFLOW_ORIGINS) {
+    throw new Error(`${label} are limited to ${MAX_WORKFLOW_ORIGINS}`);
+  }
+}
+
+async function validateWorkflowStep(value) {
+  if (!isRecord(value) || typeof value.method !== "string" || !Object.hasOwn(WORKFLOW_STEP_METHODS, value.method)) {
+    throw new Error("Workflow step method is not allowed; recursive and meta commands are prohibited");
+  }
+  const extra = Object.keys(value).filter((field) => !["method", "params", "timeoutMs"].includes(field));
+  if (extra.length > 0 || !isRecord(value.params) || containsSensitiveWorkflowField(value.params)) throw new Error("Workflow step contains unsupported or sensitive fields");
+  if (value.method === "waitFor" && ["text", "url"].includes(value.params?.condition?.type)) {
+    throw new Error(`Sensitive waitFor ${value.params.condition.type} conditions are not allowed in workflows`);
+  }
+  const timeoutMs = strictBatchInteger(value.timeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_ACTION_TIMEOUT_MS, DEFAULT_WORKFLOW_STEP_TIMEOUT_MS, "workflow step timeoutMs");
+  let params;
+  if (value.method === "screenshot") {
+    const allowed = ["format", "quality", "tabId"];
+    assertBatchFields(value.params, allowed, "workflow screenshot");
+    requireTabId(value.params);
+    if (value.params.format != null && !["png", "jpeg"].includes(value.params.format)) throw new Error("workflow screenshot format must be png or jpeg");
+    if (value.params.quality != null) strictBatchInteger(value.params.quality, 1, 100, 80, "workflow screenshot quality");
+    params = { ...value.params };
+  } else {
+    const type = WORKFLOW_STEP_METHODS[value.method].type;
+    params = (await validateBatchAction({ type, params: value.params, timeoutMs }, 0)).params;
+  }
+  return { method: value.method, params: cloneWorkflowValue(params), timeoutMs };
+}
+
+function resolveWorkflow(collection, params) {
+  if (!isRecord(params)) throw new Error("Workflow selector must be an object");
+  const selectors = ["id", "name", "shortcut"].filter((field) => params[field] != null);
+  if (selectors.length !== 1) throw new Error("Select exactly one workflow by id, name, or shortcut");
+  const field = selectors[0];
+  const needle = field === "shortcut" ? normalizeWorkflowShortcut(params[field]) : requireBoundedWorkflowString(params[field], 120, field);
+  const workflow = collection.workflows.find((entry) => entry[field] === needle);
+  if (!workflow) throw new Error(`Workflow ${field} was not found`);
+  return workflow;
+}
+
+function assertUniqueWorkflows(workflows) {
+  for (const field of ["id", "name", "shortcut"]) {
+    const values = workflows.map((entry) => entry[field]);
+    if (new Set(values).size !== values.length) throw new Error(`Workflow ${field} values must be unique`);
+  }
+}
+
+function normalizeWorkflowShortcut(value) {
+  const raw = requireBoundedWorkflowString(value, MAX_WORKFLOW_SHORTCUT_CHARS, "shortcut");
+  const normalized = raw.toLowerCase().trim().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "");
+  if (normalized.length === 0 || normalized.length > MAX_WORKFLOW_SHORTCUT_CHARS) throw new Error("Workflow shortcut is invalid");
+  return normalized;
+}
+
+function workflowOrigin(value) {
+  if (typeof value !== "string") throw new Error("Workflow origin must be a string");
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("Workflow origin must be a valid absolute URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Workflow origins must use http or https");
+  return parsed.origin;
+}
+
+function requireBoundedWorkflowString(value, max, label) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > max) throw new Error(`Workflow ${label} must be a non-empty string of at most ${max} characters`);
+  return value.trim();
+}
+
+function requireWorkflowTimestamp(value, label) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`Workflow ${label} must be an ISO timestamp`);
+  return new Date(value).toISOString();
+}
+
+function cloneWorkflowValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function queueScheduleMutation(operation) {
+  const next = scheduleMutationQueue.then(operation, operation);
+  scheduleMutationQueue = next.catch(() => {});
+  return next;
+}
+
+async function createSchedule(params) {
+  return queueScheduleMutation(async () => {
+    assertScheduleFields(params, ["approval", "enabled", "name", "notify", "recurrence", "requiredOrigins", "workflowId"], "schedule create");
+    const workflow = await scheduledWorkflowSnapshot(params.workflowId);
+    const requiredOrigins = normalizeScheduleOrigins(params.requiredOrigins);
+    assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+    const recurrence = validateScheduleRecurrence(params.recurrence);
+    const notify = validateScheduleNotify(params.notify ?? "none");
+    const enabled = params.enabled !== false;
+    const proposedApproval = validateScheduleApproval(params.approval);
+    if (proposedApproval.scheduleId === null) throw new Error("Dedicated schedule approval must bind the new schedule id");
+    const collection = await loadScheduleMutationCollection();
+    const nextCreateGeneration = collection.createGeneration + 1;
+    if (proposedApproval.approvalGeneration !== nextCreateGeneration) {
+      throw new Error("Schedule creation approval was already consumed or is stale");
+    }
+    const approval = await requireExactScheduleApproval(proposedApproval, {
+      approvalGeneration: nextCreateGeneration, enabled, notify, recurrence, requiredOrigins,
+      scheduleId: proposedApproval.scheduleId, workflow
+    });
+    const now = new Date().toISOString();
+    const schedule = validateSchedule({
+      schemaVersion: SCHEDULE_SCHEMA_VERSION,
+      id: approval.scheduleId,
+      name: requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "schedule name"),
+      workflowId: workflow.id,
+      requiredCapabilities: workflow.requiredCapabilities,
+      requiredOrigins,
+      approval,
+      enabled,
+      notify,
+      recurrence,
+      nextRunAt: 0,
+      lastScheduledFor: null,
+      executionClaim: null,
+      history: [],
+      createdAt: now,
+      updatedAt: now
+    });
+    schedule.nextRunAt = nextScheduleRunAt(schedule.recurrence, Date.now());
+    if (collection.schedules.length >= MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
+    if (collection.schedules.some((entry) => entry.id === schedule.id)) {
+      throw new Error("Schedule creation ids are single-use and must not replace an existing schedule");
+    }
+    await transitionScheduleAlarm({ ...collection, createGeneration: nextCreateGeneration }, {
+      operation: "upsert", scheduleId: schedule.id, nextSchedule: schedule
+    });
+    return schedule;
+  });
+}
+
+async function listSchedules() {
+  const { schedules } = await loadScheduleCollection();
+  return schedules.map(({ history, ...schedule }) => ({ ...schedule, historyCount: history.length }));
+}
+
+async function scheduleHistory(params) {
+  const schedule = resolveSchedule(await loadScheduleCollection(), params);
+  return schedule.history;
+}
+
+async function updateSchedule(params) {
+  return queueScheduleMutation(async () => {
+    assertScheduleFields(params, ["approval", "enabled", "id", "name", "notify", "recurrence", "requiredOrigins"], "schedule update");
+    const collection = await loadScheduleMutationCollection();
+    const existing = resolveSchedule(collection, { id: params.id });
+    const workflow = await scheduledWorkflowSnapshot(existing.workflowId);
+    const requiredOrigins = params.requiredOrigins == null ? existing.requiredOrigins : normalizeScheduleOrigins(params.requiredOrigins);
+    assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+    const recurrence = params.recurrence == null ? existing.recurrence : validateScheduleRecurrence(params.recurrence);
+    const notify = params.notify == null ? existing.notify : validateScheduleNotify(params.notify);
+    const enabled = params.enabled ?? existing.enabled;
+    const approval = await requireExactScheduleApproval(params.approval, {
+      approvalGeneration: existing.approval.approvalGeneration + 1,
+      enabled, notify, recurrence, requiredOrigins, scheduleId: existing.id, workflow
+    });
+    const updated = validateSchedule({
+      ...existing,
+      enabled,
+      name: params.name == null ? existing.name : requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "schedule name"),
+      notify,
+      recurrence,
+      requiredCapabilities: workflow.requiredCapabilities,
+      requiredOrigins,
+      approval,
+      nextRunAt: nextScheduleRunAt(recurrence, Date.now()),
+      updatedAt: new Date().toISOString()
+    });
+    await transitionScheduleAlarm(collection, { operation: "upsert", scheduleId: updated.id, nextSchedule: updated });
+    return updated;
+  });
+}
+
+async function deleteSchedule(params) {
+  return queueScheduleMutation(async () => {
+    const collection = await loadScheduleMutationCollection();
+    const schedule = resolveSchedule(collection, params);
+    await transitionScheduleAlarm(collection, { operation: "delete", scheduleId: schedule.id, nextSchedule: null });
+    return { deleted: true, id: schedule.id };
+  });
+}
+
+function runScheduleNow(params, options = {}) {
+  if (!isRecord(params) || Object.keys(params).some((field) => field !== "id")) {
+    throw new Error("scheduleRunNow requires exactly one id");
+  }
+  return executeSchedule(requireBoundedWorkflowString(params.id, 100, "schedule id"), {
+    signal: options.signal,
+    trigger: "manual"
+  });
+}
+
+function executeSchedule(id, { scheduledTime, signal, trigger }) {
+  return queueScheduleMutation(async () => {
+    throwIfAborted(signal);
+    const collection = await loadScheduleMutationCollection();
+    const schedule = resolveSchedule(collection, { id });
+    const occurrence = trigger === "alarm"
+      ? (Number.isFinite(scheduledTime) ? Math.trunc(scheduledTime) : schedule.nextRunAt)
+      : null;
+    if (trigger === "alarm" && occurrence !== schedule.nextRunAt) {
+      return { stale: true, ok: false, scheduleId: schedule.id };
+    }
+    if (trigger === "alarm" && schedule.lastScheduledFor === occurrence) {
+      return { duplicate: true, ok: false, scheduleId: schedule.id };
+    }
+    let claimed = schedule;
+    if (trigger === "alarm") {
+      const startedAt = new Date().toISOString();
+      claimed = {
+        ...schedule,
+        executionClaim: {
+          executionId: crypto.randomUUID(),
+          phase: "preflight",
+          scheduledFor: occurrence,
+          startedAt
+        },
+        lastScheduledFor: occurrence,
+        updatedAt: startedAt
+      };
+      await replaceSchedule(collection, claimed);
+    }
+    const startedAt = new Date().toISOString();
+    let ok = false;
+    let error;
+    try {
+      if (trigger === "alarm" && claimed.enabled !== true) throw new Error("Schedule is disabled");
+      const workflow = await scheduledWorkflowSnapshot(claimed.workflowId);
+      assertSameStringSet(claimed.requiredCapabilities, workflow.requiredCapabilities, "Workflow capability requirements changed");
+      assertSameStringSet(claimed.requiredOrigins, workflow.requiredOrigins, "Workflow origin requirements changed");
+      await requireExactScheduleApproval(claimed.approval, {
+        approvalGeneration: claimed.approval.approvalGeneration,
+        enabled: claimed.enabled,
+        notify: claimed.notify,
+        recurrence: claimed.recurrence,
+        requiredOrigins: claimed.requiredOrigins,
+        scheduleId: claimed.id,
+        workflow
+      });
+      throwIfAborted(signal);
+      if (trigger === "alarm") {
+        claimed = {
+          ...claimed,
+          executionClaim: { ...claimed.executionClaim, phase: "workflow" },
+          updatedAt: new Date().toISOString()
+        };
+        await replaceSchedule(await loadScheduleCollection(), claimed);
+      }
+      const result = await runWorkflow({
+        id: workflow.id,
+        expectedOrigins: claimed.requiredOrigins,
+        totalTimeoutMs: DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS
+      }, {
+        signal,
+        workflowExpectedScopes: claimed.requiredOrigins.map((origin) => canonicalPermissionScope(`${origin}/`)),
+        workflowInternal: true
+      });
+      throwIfAborted(signal);
+      if (result.ok !== true) throw new Error(result.results?.find((entry) => entry.ok === false)?.error ?? "Workflow execution failed");
+      ok = true;
+    } catch (executionError) {
+      if (signal?.aborted) throwIfAborted(signal);
+      error = sanitizeScheduleError(executionError);
+    }
+    const entry = {
+      id: crypto.randomUUID(),
+      finishedAt: new Date().toISOString(),
+      ok,
+      startedAt,
+      trigger,
+      ...(error ? { error } : {})
+    };
+    const latest = resolveSchedule(await loadScheduleCollection(), { id: claimed.id });
+    const nextRunAt = trigger === "alarm"
+      ? nextScheduleRunAt(latest.recurrence, Math.max(occurrence, Date.now()))
+      : latest.nextRunAt;
+    const updated = {
+      ...latest,
+      executionClaim: null,
+      history: [...latest.history, entry].slice(-MAX_SCHEDULE_HISTORY),
+      nextRunAt,
+      updatedAt: new Date().toISOString()
+    };
+    const latestCollection = await loadScheduleCollection();
+    if (trigger === "alarm") {
+      await transitionScheduleAlarm(latestCollection, { operation: "upsert", scheduleId: updated.id, nextSchedule: updated });
+    } else {
+      await replaceSchedule(latestCollection, updated);
+    }
+    await notifyScheduleResult(updated, entry);
+    return { ...entry, scheduleId: updated.id };
+  });
+}
+
+async function scheduledWorkflowSnapshot(workflowId) {
+  const id = requireBoundedWorkflowString(workflowId, 100, "workflow id");
+  const collection = await loadWorkflowCollection();
+  const workflow = collection.workflows.find((entry) => entry.id === id);
+  if (!workflow) throw new Error(`Scheduled workflow ${id} was not found`);
+  const hydrated = await validateWorkflowSchema(workflow, { hydrateOrigins: true });
+  const missing = hydrated.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
+  if (missing.length > 0) throw new Error(`Scheduled workflow capabilities are unavailable: ${missing.join(", ")}`);
+  await ensureTabLeasesLoaded();
+  const managedTabs = [];
+  for (const tabId of [...new Set(hydrated.steps.map((step) => step.params.tabId).filter(Number.isInteger))].sort((left, right) => left - right)) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.incognito === true) throw new Error(`Incognito tab ${tabId} cannot be used by a schedule`);
+    const lease = tabLeases.get(tabId);
+    if (!lease || typeof lease.leaseId !== "string" || lease.leaseId.length === 0 || typeof lease.sessionId !== "string") {
+      throw new Error(`Scheduled workflow tab ${tabId} requires a stable managed session lease`);
+    }
+    managedTabs.push({ tabId, sessionId: lease.sessionId, leaseId: lease.leaseId });
+  }
+  const workflowFingerprint = await sha256ScheduleValue({
+    schemaVersion: hydrated.schemaVersion,
+    id: hydrated.id,
+    requiredCapabilities: hydrated.requiredCapabilities,
+    requiredOrigins: hydrated.requiredOrigins,
+    steps: hydrated.steps,
+    managedTabs
+  });
+  return { ...hydrated, managedTabs, workflowFingerprint };
+}
+
+async function previewScheduleApproval(params) {
+  if (!isRecord(params)) throw new Error("Schedule approval preview params must be an object");
+  if (params.id != null) {
+    assertScheduleFields(params, ["enabled", "id", "name", "notify", "recurrence", "requiredOrigins"], "schedule approval preview");
+    const existing = resolveSchedule(await loadScheduleMutationCollection(), { id: params.id });
+    const workflow = await scheduledWorkflowSnapshot(existing.workflowId);
+    const requiredOrigins = params.requiredOrigins == null ? existing.requiredOrigins : normalizeScheduleOrigins(params.requiredOrigins);
+    assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+    return buildScheduleApproval({
+      approvalGeneration: existing.approval.approvalGeneration + 1,
+      enabled: params.enabled ?? existing.enabled,
+      notify: params.notify == null ? existing.notify : validateScheduleNotify(params.notify),
+      recurrence: params.recurrence == null ? existing.recurrence : validateScheduleRecurrence(params.recurrence),
+      requiredOrigins,
+      scheduleId: existing.id,
+      workflow
+    });
+  }
+  assertScheduleFields(params, ["enabled", "name", "notify", "recurrence", "requiredOrigins", "workflowId"], "schedule approval preview");
+  const collection = await loadScheduleMutationCollection();
+  const workflow = await scheduledWorkflowSnapshot(params.workflowId);
+  const requiredOrigins = normalizeScheduleOrigins(params.requiredOrigins);
+  assertSameStringSet(requiredOrigins, workflow.requiredOrigins, "Schedule requiredOrigins must exactly match the workflow's current origin requirements");
+  return buildScheduleApproval({
+    approvalGeneration: collection.createGeneration + 1,
+    enabled: params.enabled !== false,
+    notify: validateScheduleNotify(params.notify ?? "none"),
+    recurrence: validateScheduleRecurrence(params.recurrence),
+    requiredOrigins,
+    scheduleId: crypto.randomUUID(),
+    workflow
+  });
+}
+
+async function buildScheduleApproval({ approvalGeneration, enabled, notify, recurrence, requiredOrigins, scheduleId, workflow }) {
+  const recurrenceFingerprint = await sha256ScheduleValue(recurrence);
+  const descriptor = {
+    version: SCHEDULE_APPROVAL_VERSION,
+    approvalGeneration,
+    enabled,
+    scheduleId,
+    workflowSchemaVersion: workflow.schemaVersion,
+    workflowId: workflow.id,
+    workflowFingerprint: workflow.workflowFingerprint,
+    recurrence: { ...recurrence },
+    recurrenceFingerprint,
+    recurrenceKind: recurrence.kind,
+    notificationPolicy: notify,
+    requiredOrigins: [...requiredOrigins],
+    managedTabs: workflow.managedTabs.map((entry) => ({ ...entry }))
+  };
+  return { ...descriptor, pattern: `v1:${await sha256ScheduleValue(descriptor)}` };
+}
+
+async function requireExactScheduleApproval(value, expectedInput) {
+  const approval = validateScheduleApproval(value);
+  const expected = await buildScheduleApproval(expectedInput);
+  if (canonicalScheduleValue(approval) !== canonicalScheduleValue(expected)) {
+    throw new Error("Dedicated schedule approval does not exactly match the canonical fingerprint");
+  }
+  return approval;
+}
+
+function validateScheduleApproval(value) {
+  const allowed = ["version", "approvalGeneration", "enabled", "scheduleId", "pattern", "workflowSchemaVersion", "workflowId", "workflowFingerprint", "recurrence", "recurrenceFingerprint", "recurrenceKind", "notificationPolicy", "requiredOrigins", "managedTabs"];
+  if (!isRecord(value) || Object.keys(value).some((field) => !allowed.includes(field)) || value.version !== SCHEDULE_APPROVAL_VERSION) {
+    throw new Error("Dedicated schedule approval is required");
+  }
+  if (typeof value.pattern !== "string" || !/^v1:[a-f0-9]{64}$/u.test(value.pattern)
+    || value.workflowSchemaVersion !== WORKFLOW_SCHEMA_VERSION
+    || typeof value.workflowFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(value.workflowFingerprint)
+    || typeof value.recurrenceFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(value.recurrenceFingerprint)
+    || !["daily", "weekly", "monthly", "annual"].includes(value.recurrenceKind)) {
+    throw new Error("Dedicated schedule approval fingerprint is invalid");
+  }
+  const workflowId = requireBoundedWorkflowString(value.workflowId, 100, "approval workflow id");
+  if (!Number.isSafeInteger(value.approvalGeneration) || value.approvalGeneration < 1 || value.approvalGeneration > 1_000_000) throw new Error("Schedule approval generation is invalid");
+  if (typeof value.enabled !== "boolean") throw new Error("Schedule approval enabled state is invalid");
+  const scheduleId = value.scheduleId === null ? null : requireBoundedWorkflowString(value.scheduleId, 100, "approval schedule id");
+  const recurrence = validateScheduleRecurrence(value.recurrence);
+  if (recurrence.kind !== value.recurrenceKind) throw new Error("Schedule approval recurrence kind is inconsistent");
+  const notificationPolicy = validateScheduleNotify(value.notificationPolicy);
+  const requiredOrigins = normalizeScheduleOrigins(value.requiredOrigins);
+  if (!Array.isArray(value.managedTabs) || value.managedTabs.length > MAX_TAB_IDS) throw new Error("Schedule approval managed tabs are invalid");
+  const managedTabs = value.managedTabs.map((entry) => {
+    if (!isRecord(entry) || JSON.stringify(Object.keys(entry).sort()) !== JSON.stringify(["leaseId", "sessionId", "tabId"])) throw new Error("Schedule approval managed tab is invalid");
+    return {
+      tabId: requireTabId({ tabId: entry.tabId }),
+      sessionId: requireBoundedWorkflowString(entry.sessionId, MAX_KEY_CHARS, "approval session id"),
+      leaseId: requireBoundedWorkflowString(entry.leaseId, MAX_KEY_CHARS, "approval lease id")
+    };
+  }).sort((left, right) => left.tabId - right.tabId);
+  if (new Set(managedTabs.map((entry) => entry.tabId)).size !== managedTabs.length) throw new Error("Schedule approval managed tabs must be unique");
+  return {
+    version: SCHEDULE_APPROVAL_VERSION,
+    approvalGeneration: value.approvalGeneration,
+    enabled: value.enabled,
+    scheduleId,
+    pattern: value.pattern,
+    workflowSchemaVersion: value.workflowSchemaVersion,
+    workflowId,
+    workflowFingerprint: value.workflowFingerprint,
+    recurrence,
+    recurrenceFingerprint: value.recurrenceFingerprint,
+    recurrenceKind: value.recurrenceKind,
+    notificationPolicy,
+    requiredOrigins,
+    managedTabs
+  };
+}
+
+async function sha256ScheduleValue(value) {
+  const bytes = new TextEncoder().encode(canonicalScheduleValue(value));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function canonicalScheduleValue(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalScheduleValue).join(",")}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalScheduleValue(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+async function replaceSchedule(collection, schedule) {
+  await saveScheduleCollection({
+    alarmJournal: collection.alarmJournal,
+    createGeneration: collection.createGeneration,
+    schemaVersion: SCHEDULE_SCHEMA_VERSION,
+    schedules: collection.schedules.map((entry) => entry.id === schedule.id ? schedule : entry)
+  });
+}
+
+async function transitionScheduleAlarm(collection, transition) {
+  if (collection.alarmJournal.length >= MAX_SCHEDULES) throw new Error("Schedule alarm journal is full");
+  const journalEntry = validateScheduleAlarmJournalEntry({
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    ...transition
+  });
+  const pending = {
+    alarmJournal: [...collection.alarmJournal, journalEntry],
+    createGeneration: collection.createGeneration,
+    schemaVersion: SCHEDULE_SCHEMA_VERSION,
+    schedules: collection.schedules
+  };
+  await saveScheduleCollection(pending);
+  await applyScheduleAlarmJournalEntry(journalEntry);
+  const schedules = journalEntry.operation === "delete"
+    ? collection.schedules.filter((entry) => entry.id !== journalEntry.scheduleId)
+    : collection.schedules.some((entry) => entry.id === journalEntry.scheduleId)
+      ? collection.schedules.map((entry) => entry.id === journalEntry.scheduleId ? journalEntry.nextSchedule : entry)
+      : [...collection.schedules, journalEntry.nextSchedule];
+  await saveScheduleCollection({
+    alarmJournal: pending.alarmJournal.filter((entry) => entry.id !== journalEntry.id),
+    createGeneration: pending.createGeneration,
+    schemaVersion: SCHEDULE_SCHEMA_VERSION,
+    schedules
+  });
+}
+
+async function applyScheduleAlarmJournalEntry(entry) {
+  const name = scheduleAlarmName(entry.scheduleId);
+  if (entry.operation === "delete" || entry.nextSchedule.enabled !== true) {
+    await chrome.alarms.clear(name);
+    return;
+  }
+  await chrome.alarms.create(name, { when: entry.nextSchedule.nextRunAt });
+}
+
+async function restoreScheduleAlarms() {
+  try {
+    await queueScheduleMutation(async () => {
+      let collection = await loadScheduleCollection();
+      const reconciledIds = new Set();
+      for (const journalEntry of [...collection.alarmJournal]) {
+        await applyScheduleAlarmJournalEntry(journalEntry);
+        reconciledIds.add(journalEntry.scheduleId);
+        const schedules = journalEntry.operation === "delete"
+          ? collection.schedules.filter((entry) => entry.id !== journalEntry.scheduleId)
+          : collection.schedules.some((entry) => entry.id === journalEntry.scheduleId)
+            ? collection.schedules.map((entry) => entry.id === journalEntry.scheduleId ? journalEntry.nextSchedule : entry)
+            : [...collection.schedules, journalEntry.nextSchedule];
+        collection = {
+          alarmJournal: collection.alarmJournal.filter((entry) => entry.id !== journalEntry.id),
+          createGeneration: collection.createGeneration,
+          schemaVersion: SCHEDULE_SCHEMA_VERSION,
+          schedules
+        };
+        await saveScheduleCollection(collection);
+      }
+      for (const schedule of [...collection.schedules]) {
+        const claim = schedule.executionClaim;
+        if (!claim && schedule.lastScheduledFor !== schedule.nextRunAt) continue;
+        const finishedAt = new Date().toISOString();
+        const interrupted = claim ? {
+          id: crypto.randomUUID(),
+          executionId: claim.executionId,
+          phase: claim.phase,
+          status: "interrupted",
+          startedAt: claim.startedAt,
+          finishedAt,
+          trigger: "alarm",
+          ok: false,
+          error: "Scheduled execution was interrupted before completion"
+        } : null;
+        const baseline = claim?.scheduledFor ?? schedule.nextRunAt;
+        const recovered = {
+          ...schedule,
+          executionClaim: null,
+          history: interrupted ? [...schedule.history, interrupted].slice(-MAX_SCHEDULE_HISTORY) : schedule.history,
+          nextRunAt: nextScheduleRunAt(schedule.recurrence, Math.max(baseline, Date.now())),
+          updatedAt: finishedAt
+        };
+        await transitionScheduleAlarm(collection, {
+          operation: "upsert",
+          scheduleId: recovered.id,
+          nextSchedule: recovered
+        });
+        reconciledIds.add(recovered.id);
+        collection = await loadScheduleCollection();
+      }
+      for (const schedule of collection.schedules) {
+        if (!reconciledIds.has(schedule.id)) await armScheduleAlarm(schedule);
+      }
+    });
+  } catch (error) {
+    sendEvent({ category: "scheduler", type: "restoreFailed", error: sanitizeScheduleError(error) });
+  }
+}
+
+async function armScheduleAlarm(schedule) {
+  const name = scheduleAlarmName(schedule.id);
+  if (schedule.enabled !== true) {
+    await chrome.alarms.clear(name);
+    return;
+  }
+  await chrome.alarms.create(name, { when: schedule.nextRunAt });
+}
+
+function scheduleAlarmName(id) {
+  return `${SCHEDULE_ALARM_PREFIX}${id}`;
+}
+
+async function loadScheduleCollection() {
+  let stored;
+  try { stored = await chrome.storage.local.get(SCHEDULE_STORAGE_KEY); }
+  catch (error) { throw new Error(`Could not read schedule storage: ${error?.message ?? String(error)}`); }
+  const raw = stored?.[SCHEDULE_STORAGE_KEY];
+  if (raw == null) return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules: [], alarmJournal: [], createGeneration: 0 };
+  if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_SCHEDULE_STORAGE_BYTES) throw new Error("Schedule storage payload is too large");
+  if (!isRecord(raw)
+    || JSON.stringify(Object.keys(raw).sort()) !== JSON.stringify(["alarmJournal", "createGeneration", "schedules", "schemaVersion"])
+    || raw.schemaVersion !== SCHEDULE_SCHEMA_VERSION
+    || !Array.isArray(raw.schedules)
+    || raw.schedules.length > MAX_SCHEDULES
+    || !Array.isArray(raw.alarmJournal)
+    || raw.alarmJournal.length > MAX_SCHEDULES
+    || !Number.isSafeInteger(raw.createGeneration)
+    || raw.createGeneration < 0
+    || raw.createGeneration >= 1_000_000) throw new Error("Persisted schedule collection schema is invalid");
+  const schedules = raw.schedules.map(validateSchedule);
+  const alarmJournal = raw.alarmJournal.map(validateScheduleAlarmJournalEntry);
+  if (new Set(schedules.map((entry) => entry.id)).size !== schedules.length) throw new Error("Schedule ids must be unique");
+  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, schedules, alarmJournal, createGeneration: raw.createGeneration };
+}
+
+async function loadScheduleMutationCollection() {
+  const collection = await loadScheduleCollection();
+  if (collection.alarmJournal.length > 0) {
+    throw new Error("A pending schedule alarm transition must be reconciled before another mutation");
+  }
+  return collection;
+}
+
+async function saveScheduleCollection(collection) {
+  if (!isRecord(collection) || collection.schemaVersion !== SCHEDULE_SCHEMA_VERSION || !Array.isArray(collection.schedules)) {
+    throw new Error("Schedule collection is invalid");
+  }
+  const validated = {
+    alarmJournal: (collection.alarmJournal ?? []).map(validateScheduleAlarmJournalEntry),
+    createGeneration: collection.createGeneration,
+    schemaVersion: SCHEDULE_SCHEMA_VERSION,
+    schedules: collection.schedules.map(validateSchedule)
+  };
+  if (!Number.isSafeInteger(validated.createGeneration)
+    || validated.createGeneration < 0
+    || validated.createGeneration >= 1_000_000) throw new Error("Schedule create generation is invalid");
+  if (validated.schedules.length > MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
+  if (validated.alarmJournal.length > MAX_SCHEDULES) throw new Error("Schedule alarm journal is full");
+  const serialized = JSON.stringify(validated);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_SCHEDULE_STORAGE_BYTES) throw new Error("Schedule storage payload is too large");
+  try { await chrome.storage.local.set({ [SCHEDULE_STORAGE_KEY]: validated }); }
+  catch (error) { throw new Error(`Could not write schedule storage: ${error?.message ?? String(error)}`); }
+}
+
+function validateScheduleAlarmJournalEntry(value) {
+  if (!isRecord(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(["createdAt", "id", "nextSchedule", "operation", "scheduleId"])) {
+    throw new Error("Schedule alarm journal entry is invalid");
+  }
+  const id = requireBoundedWorkflowString(value.id, 100, "schedule alarm journal id");
+  const scheduleId = requireBoundedWorkflowString(value.scheduleId, 100, "schedule alarm journal schedule id");
+  const createdAt = requireWorkflowTimestamp(value.createdAt, "schedule alarm journal createdAt");
+  if (!['delete', 'upsert'].includes(value.operation)) throw new Error("Schedule alarm journal operation is invalid");
+  const nextSchedule = value.operation === "delete" && value.nextSchedule === null
+    ? null
+    : validateSchedule(value.nextSchedule);
+  if (value.operation === "upsert" && nextSchedule?.id !== scheduleId) throw new Error("Schedule alarm journal target is invalid");
+  return { id, createdAt, operation: value.operation, scheduleId, nextSchedule };
+}
+
+function validateSchedule(value) {
+  if (!isRecord(value) || value.schemaVersion !== SCHEDULE_SCHEMA_VERSION) throw new Error("Schedule schemaVersion is unsupported");
+  const allowed = ["schemaVersion", "id", "name", "workflowId", "requiredCapabilities", "requiredOrigins", "approval", "enabled", "notify", "recurrence", "nextRunAt", "lastScheduledFor", "executionClaim", "history", "createdAt", "updatedAt"];
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Schedule contains unsupported fields: ${extra.join(", ")}`);
+  const id = requireBoundedWorkflowString(value.id, 100, "schedule id");
+  const name = requireBoundedWorkflowString(value.name, MAX_WORKFLOW_NAME_CHARS, "schedule name");
+  const workflowId = requireBoundedWorkflowString(value.workflowId, 100, "workflow id");
+  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > 100
+    || value.requiredCapabilities.some((entry) => typeof entry !== "string" || !/^[a-z][a-z0-9.-]{0,99}$/u.test(entry))) {
+    throw new Error("Schedule requiredCapabilities are invalid");
+  }
+  const requiredCapabilities = [...new Set(value.requiredCapabilities)].sort();
+  const requiredOrigins = normalizeScheduleOrigins(value.requiredOrigins);
+  const approval = validateScheduleApproval(value.approval);
+  if (typeof value.enabled !== "boolean") throw new Error("Schedule enabled flag must be a boolean");
+  const notify = validateScheduleNotify(value.notify);
+  const recurrence = validateScheduleRecurrence(value.recurrence);
+  if (!Number.isSafeInteger(value.nextRunAt) || value.nextRunAt < 0) throw new Error("Schedule nextRunAt is invalid");
+  if (value.lastScheduledFor !== null && (!Number.isSafeInteger(value.lastScheduledFor) || value.lastScheduledFor < 0)) throw new Error("Schedule lastScheduledFor is invalid");
+  const executionClaim = validateScheduleExecutionClaim(value.executionClaim);
+  if (!Array.isArray(value.history) || value.history.length > MAX_SCHEDULE_HISTORY) throw new Error("Schedule history is invalid");
+  const history = value.history.map(validateScheduleHistoryEntry);
+  const createdAt = requireWorkflowTimestamp(value.createdAt, "schedule createdAt");
+  const updatedAt = requireWorkflowTimestamp(value.updatedAt, "schedule updatedAt");
+  return { schemaVersion: SCHEDULE_SCHEMA_VERSION, id, name, workflowId, requiredCapabilities, requiredOrigins, approval, enabled: value.enabled, notify, recurrence, nextRunAt: value.nextRunAt, lastScheduledFor: value.lastScheduledFor, executionClaim, history, createdAt, updatedAt };
+}
+
+function validateScheduleExecutionClaim(value) {
+  if (value === null) return null;
+  if (!isRecord(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(["executionId", "phase", "scheduledFor", "startedAt"])) {
+    throw new Error("Schedule execution claim is invalid");
+  }
+  const executionId = requireBoundedWorkflowString(value.executionId, 100, "schedule execution id");
+  if (!["preflight", "workflow"].includes(value.phase)) throw new Error("Schedule execution phase is invalid");
+  if (!Number.isSafeInteger(value.scheduledFor) || value.scheduledFor < 0) throw new Error("Schedule execution occurrence is invalid");
+  const startedAt = requireWorkflowTimestamp(value.startedAt, "schedule execution startedAt");
+  return { executionId, phase: value.phase, scheduledFor: value.scheduledFor, startedAt };
+}
+
+function validateScheduleHistoryEntry(value) {
+  if (!isRecord(value) || Object.keys(value).some((field) => !["id", "startedAt", "finishedAt", "trigger", "ok", "error", "executionId", "phase", "status"].includes(field))) {
+    throw new Error("Schedule history entry is invalid");
+  }
+  const id = requireBoundedWorkflowString(value.id, 100, "schedule history id");
+  const startedAt = requireWorkflowTimestamp(value.startedAt, "schedule history startedAt");
+  const finishedAt = requireWorkflowTimestamp(value.finishedAt, "schedule history finishedAt");
+  if (!['alarm', 'manual'].includes(value.trigger) || typeof value.ok !== "boolean") throw new Error("Schedule history status is invalid");
+  const error = value.error == null ? undefined : sanitizeScheduleError(value.error);
+  const executionId = value.executionId == null ? undefined : requireBoundedWorkflowString(value.executionId, 100, "schedule history execution id");
+  const phase = value.phase == null ? undefined : requireBoundedWorkflowString(value.phase, 20, "schedule history phase");
+  const status = value.status == null ? undefined : requireBoundedWorkflowString(value.status, 20, "schedule history status");
+  return { id, startedAt, finishedAt, trigger: value.trigger, ok: value.ok, ...(error ? { error } : {}), ...(executionId ? { executionId } : {}), ...(phase ? { phase } : {}), ...(status ? { status } : {}) };
+}
+
+function validateScheduleRecurrence(value) {
+  if (!isRecord(value) || !["daily", "weekly", "monthly", "annual"].includes(value.kind)) throw new Error("Schedule recurrence kind is invalid");
+  const allowed = { daily: ["kind", "hour", "minute"], weekly: ["kind", "weekday", "hour", "minute"], monthly: ["kind", "day", "hour", "minute"], annual: ["kind", "month", "day", "hour", "minute"] }[value.kind];
+  if (Object.keys(value).some((field) => !allowed.includes(field))) throw new Error("Schedule recurrence contains unsupported fields");
+  if (!Number.isInteger(value.hour) || value.hour < 0 || value.hour > 23 || !Number.isInteger(value.minute) || value.minute < 0 || value.minute > 59) throw new Error("Schedule local time is invalid");
+  if (value.kind === "weekly" && (!Number.isInteger(value.weekday) || value.weekday < 0 || value.weekday > 6)) throw new Error("Schedule weekday is invalid");
+  if (["monthly", "annual"].includes(value.kind) && (!Number.isInteger(value.day) || value.day < 1 || value.day > 31)) throw new Error("Schedule day is invalid");
+  if (value.kind === "annual" && (!Number.isInteger(value.month) || value.month < 1 || value.month > 12)) throw new Error("Schedule month is invalid");
+  return { ...value };
+}
+
+function nextScheduleRunAt(rawRecurrence, afterMs) {
+  const recurrence = validateScheduleRecurrence(rawRecurrence);
+  if (!Number.isFinite(afterMs)) throw new Error("Schedule recurrence baseline is invalid");
+  const after = new Date(afterMs);
+  const candidateFor = (year, month, day) => {
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    return new Date(year, month, Math.min(day, lastDay), recurrence.hour, recurrence.minute, 0, 0).getTime();
+  };
+  if (recurrence.kind === "daily" || recurrence.kind === "weekly") {
+    for (let offset = 0; offset <= 370; offset += 1) {
+      const date = new Date(after.getFullYear(), after.getMonth(), after.getDate() + offset);
+      if (recurrence.kind === "weekly" && date.getDay() !== recurrence.weekday) continue;
+      const candidate = candidateFor(date.getFullYear(), date.getMonth(), date.getDate());
+      if (candidate > afterMs) return candidate;
+    }
+  } else if (recurrence.kind === "monthly") {
+    for (let offset = 0; offset <= 24; offset += 1) {
+      const month = new Date(after.getFullYear(), after.getMonth() + offset, 1);
+      const candidate = candidateFor(month.getFullYear(), month.getMonth(), recurrence.day);
+      if (candidate > afterMs) return candidate;
+    }
+  } else {
+    for (let offset = 0; offset <= 200; offset += 1) {
+      const candidate = candidateFor(after.getFullYear() + offset, recurrence.month - 1, recurrence.day);
+      if (candidate > afterMs) return candidate;
+    }
+  }
+  throw new Error("Could not compute the next schedule occurrence");
+}
+
+function normalizeScheduleOrigins(value) {
+  if (!Array.isArray(value) || value.length > MAX_WORKFLOW_ORIGINS) throw new Error("Schedule requiredOrigins are invalid");
+  return [...new Set(value.map(workflowOrigin))].sort();
+}
+
+function validateScheduleNotify(value) {
+  if (!["none", "success", "failure", "always"].includes(value)) throw new Error("Schedule notify must be none, success, failure, or always");
+  return value;
+}
+
+function assertSameStringSet(left, right, message) {
+  if (JSON.stringify([...new Set(left)].sort()) !== JSON.stringify([...new Set(right)].sort())) throw new Error(message);
+}
+
+function assertScheduleFields(value, allowed, label) {
+  if (!isRecord(value)) throw new Error(`${label} params must be an object`);
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`${label} contains unsupported fields: ${extra.join(", ")}`);
+}
+
+function resolveSchedule(collection, params) {
+  if (!isRecord(params) || Object.keys(params).some((field) => field !== "id")) throw new Error("Select exactly one schedule by id");
+  const id = requireBoundedWorkflowString(params.id, 100, "schedule id");
+  const schedule = collection.schedules.find((entry) => entry.id === id);
+  if (!schedule) throw new Error(`Schedule ${id} was not found`);
+  return schedule;
+}
+
+function sanitizeScheduleError(error) {
+  const raw = typeof error === "string" ? error : error?.message ?? String(error);
+  return truncateString(raw, 500)
+    .replace(/https?:\/\/[^\s]+/giu, "[redacted-url]")
+    .replace(/(?:token|secret|password|authorization|cookie)\s*[=:]\s*[^\s,;]+/giu, "$1=[redacted]")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .trim();
+}
+
+async function notifyScheduleResult(schedule, entry) {
+  if (schedule.notify === "none" || (entry.ok && schedule.notify === "failure") || (!entry.ok && schedule.notify === "success")) return;
+  const title = entry.ok ? "OpenCode schedule completed" : "OpenCode schedule failed";
+  const message = entry.ok ? `${schedule.name} completed.` : `${schedule.name} failed. Open schedule history for details.`;
+  await createNotification({ title, message }).catch(() => {});
+}
+
 async function executeScopedPageCommand(envelope, options) {
   if (!isRecord(envelope) || !ORIGIN_SCOPED_COMMANDS.has(envelope.method) || !isRecord(envelope.params)) {
     throw new Error("scoped page command is invalid or not allowed");
   }
-  const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes);
-  const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const method = envelope.method;
+  const expectedScopes = validateExpectedPageScopes(
+    envelope.expectedScopes,
+    options.workflowInternal === true ? 101 : method === "workflowRun" ? 100 : 25
+  );
+  const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const params = envelope.params;
+  let commandOptions = options;
+  if (["webMcpList", "webMcpInvoke"].includes(method)) {
+    const timeoutMs = strictBatchInteger(
+      params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+      DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+    );
+    const webMcpDeadlineEpochMs = Date.now() + timeoutMs;
+    const deadlineSignal = AbortSignal.timeout(timeoutMs);
+    commandOptions = {
+      ...options,
+      signal: options.signal ? AbortSignal.any([options.signal, deadlineSignal]) : deadlineSignal,
+      webMcpDeadlineEpochMs,
+      webMcpExternalSignal: options.signal ?? null
+    };
+  }
+  if (method === "workflowRun") {
+    return executeCommand(method, params, {
+      ...options, workflowExpectedBindings: expectedBindings,
+      workflowExpectedScopes: expectedScopes, workflowInternal: true
+    });
+  }
   if (method === "evaluate" || (method === "cdpCommand" && params.method === "Runtime.evaluate")) {
     params.__expectedScopes = expectedScopes;
   }
@@ -618,7 +2072,8 @@ async function executeScopedPageCommand(envelope, options) {
   if (expectedTabBinding && ["fileUploadCommit", "setCursorState", "setFaviconBadge"].includes(method)) {
     params.__expectedDocumentId = expectedTabBinding.documentId;
   }
-  const pageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
+  const rawPageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
+  const pageGuard = (...args) => abortableChromeOperation(rawPageGuard(...args), commandOptions.signal);
   if (method === "browserBatch") {
     if (!Array.isArray(params.actions) || params.actions.length !== 1) {
       throw new Error("origin-scoped browser batches must contain exactly one action");
@@ -626,14 +2081,14 @@ async function executeScopedPageCommand(envelope, options) {
     const action = params.actions[0];
     if (action?.type === "navigate") {
       assertAuthorizedDestination(action.params?.url, expectedScopes);
-      return executeCommand(method, params, options);
+      return executeCommand(method, params, { ...options, workflowInternal: true });
     }
     const tabId = action?.params?.tabId;
     if (!Number.isInteger(tabId)) throw new Error("origin-scoped batch action requires a deterministic tabId");
     const actionPageGuard = (override = action.params, result) => pageGuard(override, result);
     const runBatch = async () => {
       await actionPageGuard();
-      const batchResult = await executeCommand(method, params, { ...options, pageGuard: actionPageGuard });
+      const batchResult = await executeCommand(method, params, { ...options, pageGuard: actionPageGuard, workflowInternal: true });
       await actionPageGuard();
       return batchResult;
     };
@@ -663,7 +2118,7 @@ async function executeScopedPageCommand(envelope, options) {
   try {
     const persistentMutation = NAVIGATION_BARRIER_PERSISTENT_COMMANDS.has(method);
     const run = async () => {
-      const value = await executeCommand(method, params, { ...options, pageGuard });
+      const value = await executeCommand(method, params, { ...commandOptions, pageGuard, workflowInternal: true });
       if (persistentMutation) await pageGuard(params, value);
       return value;
     };
@@ -671,7 +2126,7 @@ async function executeScopedPageCommand(envelope, options) {
     result = barrierTabId !== null
       && NAVIGATION_BARRIER_COMMANDS.has(method)
       && !(method === "cdpCommand" && params.method === "Page.navigate")
-      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, options.signal, { persistentMutation })
+      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, commandOptions.signal, { persistentMutation })
       : await run();
   } catch (error) {
     if (method !== "click" || error?.authorizedPageEffect !== true) throw error;
@@ -684,7 +2139,10 @@ async function executeScopedPageCommand(envelope, options) {
     if (method === "click" && after && !pageBindingMatches(after, expectedBindings, expectedScopes)) {
       return { ...result, transition: after };
     }
-    if (method !== "navigate") await pageGuard(params, result);
+    if (method !== "navigate"
+      && (!(["webMcpList", "webMcpInvoke"].includes(method)) || !commandOptions.signal?.aborted)) {
+      await pageGuard(params, result);
+    }
   }
   return result;
 }
@@ -743,8 +2201,8 @@ async function currentPageBinding(tabId, knownUrl) {
   };
 }
 
-function validateExpectedPageScopes(value) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 25) {
+function validateExpectedPageScopes(value, maxScopes = 25) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxScopes) {
     throw new Error("scoped page command expectedScopes must be a bounded non-empty array");
   }
   return [...new Set(value.map(canonicalPermissionScope))].sort();
@@ -816,9 +2274,678 @@ function requireTabId(params) {
   return params.tabId;
 }
 
+async function listWebMcpTools(params, signal, pageGuard, deadlineEpochMs) {
+  assertWebMcpFields(params, ["tabId", "timeoutMs"], "WebMCP list");
+  const tabId = requireTabId(params);
+  const timeoutMs = strictBatchInteger(
+    params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+    DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+  );
+  if (!Number.isFinite(deadlineEpochMs)) throw new Error("WebMCP deadline is unavailable");
+  const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
+  const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
+  const envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "list", { abortChannel, deadlineEpochMs, timeoutMs }, signal);
+  if (envelope.supported === false) {
+    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_DISCOVERY_TIMEOUT"].includes(envelope.error?.code)) {
+      throw new Error(`WebMCP metadata is invalid: ${sanitizeWebMcpError(envelope.error?.message)}`);
+    }
+    return {
+      error: validateWebMcpError(envelope.error),
+      source: null,
+      supported: false,
+      tools: []
+    };
+  }
+  if (envelope.supported !== true || !["document", "navigator"].includes(envelope.source)) {
+    throw new Error("WebMCP metadata response is invalid");
+  }
+  return {
+    source: envelope.source,
+    supported: true,
+    tools: validateWebMcpTools(envelope.tools)
+  };
+}
+
+async function invokeWebMcpTool(params, signal, pageGuard, deadlineEpochMs) {
+  assertWebMcpFields(params, ["input", "tabId", "timeoutMs", "toolName"], "WebMCP invoke");
+  const tabId = requireTabId(params);
+  const toolName = requireWebMcpToolName(params.toolName);
+  const timeoutMs = strictBatchInteger(
+    params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+    DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+  );
+  if (!Number.isFinite(deadlineEpochMs)) throw new Error("WebMCP deadline is unavailable");
+  const input = cloneBoundedWebMcpJson(
+    Object.hasOwn(params, "input") ? params.input : {},
+    "WebMCP input",
+    MAX_WEBMCP_INPUT_BYTES
+  );
+  const inputJson = JSON.stringify(input);
+  const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
+  const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
+  const webMcpPrepareToken = crypto.randomUUID();
+  let preparationIssued = false;
+  let committed = false;
+  let extensionCommitTracked = false;
+  let envelope;
+  try {
+    preparationIssued = true;
+    const preparation = await runWebMcpIsolatedAdapter(tabId, documentId, "prepare", {
+      abortChannel, deadlineEpochMs, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+      timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+    }, signal);
+    if (preparation?.prepared !== true || preparation.toolName !== toolName
+      || preparation.tool?.name !== toolName
+      || !["document", "navigator"].includes(preparation.source)) {
+      envelope = preparation;
+    } else {
+      await pageGuard(params);
+      throwIfAborted(signal);
+      if (Date.now() >= deadlineEpochMs) {
+        envelope = webMcpInvocationError("WEBMCP_TIMEOUT", "WebMCP admission deadline expired before dispatch", true);
+      } else if (activeCommittedWebMcpInvokes.size >= MAX_COMMITTED_WEBMCP_INVOKES) {
+        envelope = webMcpInvocationError("WEBMCP_TOOL_ERROR", "Too many committed WebMCP invocations", true);
+      } else {
+        // This assignment and the executeScript issue inside runWebMcpIsolatedAdapter
+        // are synchronous: cancellation observed afterwards is post-commit.
+        committed = true;
+        activeCommittedWebMcpInvokes.add(webMcpPrepareToken);
+        extensionCommitTracked = true;
+        envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "commit", {
+          abortChannel, deadlineEpochMs, inputJson, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+          timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+        }, null);
+      }
+    }
+  } finally {
+    if (extensionCommitTracked) activeCommittedWebMcpInvokes.delete(webMcpPrepareToken);
+    if (preparationIssued && !committed) {
+      await runWebMcpIsolatedAdapter(tabId, documentId, "cleanup", {
+        abortChannel, deadlineEpochMs, registryLimit: WEBMCP_PREPARED_REGISTRY_LIMIT,
+        timeoutMs, token: webMcpPrepareToken, ttlMs: WEBMCP_PREPARED_TTL_MS, toolName
+      }, null).catch(() => {});
+    }
+  }
+  if (!isRecord(envelope)) throw new Error("WebMCP invocation response is invalid");
+  if (envelope.ok === false) {
+    const error = validateWebMcpError(envelope.error);
+    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_INVOCATION_UNSUPPORTED",
+      "WEBMCP_TOOL_NOT_FOUND", "WEBMCP_TOOL_ERROR", "WEBMCP_TIMEOUT",
+      "WEBMCP_DISCOVERY_TIMEOUT",
+      "WEBMCP_OUTPUT_INVALID", "WEBMCP_OUTPUT_TOO_LARGE"].includes(error.code)) {
+      throw new Error("WebMCP invocation returned an invalid error code");
+    }
+    return {
+      error,
+      ok: false,
+      source: ["document", "navigator"].includes(envelope.source) ? envelope.source : null,
+      supported: envelope.supported === true,
+      toolName
+    };
+  }
+  if (envelope.ok !== true || envelope.supported !== true
+    || !["document", "navigator"].includes(envelope.source)
+    || envelope.invocation !== "executeTool"
+    || envelope.toolName !== toolName) {
+    throw new Error("WebMCP invocation response is invalid");
+  }
+  return {
+    invocation: envelope.invocation,
+    ok: true,
+    result: cloneBoundedWebMcpJson(envelope.result, "WebMCP output", MAX_WEBMCP_OUTPUT_BYTES),
+    source: envelope.source,
+    supported: true,
+    toolName
+  };
+}
+
+async function requireWebMcpDocumentBinding(pageGuard, params) {
+  if (typeof pageGuard !== "function") throw new Error("WebMCP requires an exact approved document binding");
+  const binding = await pageGuard(params);
+  if (!isRecord(binding) || typeof binding.documentId !== "string" || binding.documentId.length === 0) {
+    throw new Error("WebMCP exact approved document binding is unavailable");
+  }
+  return binding.documentId;
+}
+
+async function runWebMcpIsolatedAdapter(tabId, documentId, operation, payload, signal) {
+  throwIfAborted(signal);
+  const target = { documentIds: [documentId], tabId };
+  const execution = chrome.scripting.executeScript({
+    args: [operation, payload],
+    func: webMcpIsolatedAdapter,
+    target,
+    world: "ISOLATED"
+  });
+  let abortExecution = null;
+  let aborted = false;
+  const abortInvocation = () => {
+    if (aborted) return;
+    aborted = true;
+    abortExecution = chrome.scripting.executeScript({
+      args: [payload.abortChannel],
+      func: webMcpAbortAdapter,
+      target,
+      world: "ISOLATED"
+    }).catch(() => []);
+  };
+  signal?.addEventListener("abort", abortInvocation, { once: true });
+  let results;
+  try {
+    results = await execution;
+  } catch (error) {
+    if (aborted) {
+      await abortExecution;
+      throwIfAborted(signal);
+    }
+    const message = error?.message ?? String(error);
+    if (/document|frame|navigation|tab.*closed|not found/iu.test(message)) {
+      throw new Error("WebMCP exact approved document changed before isolated-world dispatch");
+    }
+    return operation === "list"
+      ? webMcpUnsupportedList("The page or browser does not expose an executable isolated-world WebMCP context")
+      : webMcpInvocationError("WEBMCP_UNSUPPORTED", "The page or browser does not expose an executable isolated-world WebMCP context", false);
+  } finally {
+    signal?.removeEventListener("abort", abortInvocation);
+  }
+  if (aborted) await abortExecution;
+  if (!Array.isArray(results) || results.length !== 1 || typeof results[0]?.result !== "string") {
+    throwIfAborted(signal);
+    throw new Error("WebMCP isolated-world adapter returned an invalid envelope");
+  }
+  const serialized = results[0].result;
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WEBMCP_ENVELOPE_BYTES) {
+    if (operation === "invoke") {
+      return webMcpInvocationError("WEBMCP_OUTPUT_TOO_LARGE", "WebMCP output exceeded the bounded response size", true);
+    }
+    throw new Error("WebMCP metadata response is too large");
+  }
+  let envelope;
+  try {
+    envelope = JSON.parse(serialized);
+  } catch {
+    throw new Error("WebMCP isolated-world adapter returned invalid JSON");
+  }
+  if (aborted && envelope?.committed !== true) throwIfAborted(signal);
+  return envelope;
+}
+
+function webMcpAbortAdapter(abortChannel) {
+  try {
+    if (typeof abortChannel !== "string") return false;
+    globalThis.dispatchEvent(new Event(abortChannel));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// This function is serialized by chrome.scripting and executes once in Chrome's
+// trusted extension ISOLATED world. Keep every dependency local and return only
+// a JSON string so WebMCP descriptors never leave the injected call.
+async function webMcpIsolatedAdapter(operation, payload) {
+  const unsupported = operation === "list"
+    ? "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"The isolated document does not expose WebMCP\"},\"source\":null,\"supported\":false,\"tools\":[]}"
+    : "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"The isolated document does not expose WebMCP\"},\"ok\":false,\"source\":null,\"supported\":false}";
+  try {
+    const clean = globalThis;
+    const SafeObject = clean.Object;
+    const SafeArray = clean.Array;
+    const SafeNumber = clean.Number;
+    const SafeString = clean.String;
+    const SafePromise = clean.Promise;
+    const SafeSet = clean.Set;
+    const SafeMap = clean.Map;
+    const SafeAbortController = clean.AbortController;
+    const objectCreate = SafeObject.create;
+    const getOwnPropertyDescriptor = SafeObject.getOwnPropertyDescriptor;
+    const getPrototypeOf = SafeObject.getPrototypeOf;
+    const arrayIsArray = SafeArray.isArray;
+    const numberIsFinite = SafeNumber.isFinite;
+    const reflectApply = clean.Reflect.apply;
+    const reflectOwnKeys = clean.Reflect.ownKeys;
+    const regexpTest = clean.RegExp.prototype.test;
+    const setAdd = SafeSet.prototype.add;
+    const setDelete = SafeSet.prototype.delete;
+    const setForEach = SafeSet.prototype.forEach;
+    const setHas = SafeSet.prototype.has;
+    const mapDelete = SafeMap.prototype.delete;
+    const mapEntries = SafeMap.prototype.entries;
+    const mapGet = SafeMap.prototype.get;
+    const mapSet = SafeMap.prototype.set;
+    const stringCharCodeAt = SafeString.prototype.charCodeAt;
+    const stringIncludes = SafeString.prototype.includes;
+    const stringSlice = SafeString.prototype.slice;
+    const addEventListener = clean.EventTarget.prototype.addEventListener;
+    const removeEventListener = clean.EventTarget.prototype.removeEventListener;
+    const safeSetTimeout = clean.setTimeout;
+    const safeClearTimeout = clean.clearTimeout;
+    const safeJsonStringify = clean.JSON.stringify;
+    const safeDateNow = clean.Date.now;
+    const symbolFor = clean.Symbol.for;
+    const objectPrototype = SafeObject.prototype;
+    const timers = new SafeSet();
+    const maxEnvelopeBytes = 768 * 1024;
+    const dangerousKeys = new SafeSet(["__proto__", "constructor", "prototype"]);
+    const controller = new SafeAbortController();
+    let committed = false;
+    let preDispatchAborted = false;
+    let abortResolve;
+    const abortPromise = new SafePromise((resolve) => { abortResolve = resolve; });
+    const onAbort = () => {
+      if (committed) return;
+      preDispatchAborted = true;
+      abortResolve({ kind: "abort" });
+    };
+    if (!payload || typeof payload !== "object" || typeof payload.abortChannel !== "string"
+      || typeof payload.timeoutMs !== "number" || typeof payload.deadlineEpochMs !== "number") return unsupported;
+    const remainingMs = () => Math.max(0, Math.min(payload.timeoutMs,
+      payload.deadlineEpochMs - reflectApply(safeDateNow, clean.Date, [])));
+    reflectApply(addEventListener, globalThis, [payload.abortChannel, onAbort]);
+
+    const utf8Bytes = (text, jsonString = false) => {
+      let bytes = 0;
+      for (let index = 0; index < text.length; index += 1) {
+        const code = reflectApply(stringCharCodeAt, text, [index]);
+        if (jsonString && (code === 34 || code === 92 || code === 8 || code === 9
+          || code === 10 || code === 12 || code === 13)) bytes += 2;
+        else if (jsonString && code < 32) bytes += 6;
+        else if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
+          const next = reflectApply(stringCharCodeAt, text, [index + 1]);
+          if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index += 1; } else bytes += 3;
+        } else bytes += 3;
+      }
+      return bytes;
+    };
+    const isPlainRecord = (value) => {
+      const prototype = getPrototypeOf(value);
+      if (prototype === null || prototype === objectPrototype) return true;
+      if (getPrototypeOf(prototype) !== null) return false;
+      const descriptor = getOwnPropertyDescriptor(prototype, "constructor");
+      return Boolean(descriptor && "value" in descriptor && typeof descriptor.value === "function"
+        && descriptor.value.name === "Object");
+    };
+    const cloneJson = (value, label, maxBytes, sharedBudget = null) => {
+      const ancestors = new SafeSet();
+      let nodes = 0;
+      let bytes = 0;
+      const spend = (count) => {
+        bytes += count;
+        if (bytes > maxBytes) throw new clean.Error(`${label} is too large`);
+        if (sharedBudget) {
+          sharedBudget.bytes += count;
+          if (sharedBudget.bytes > sharedBudget.maxBytes) throw new clean.Error("WebMCP metadata exceeds the total byte budget");
+        }
+      };
+      const visit = (current, depth) => {
+        nodes += 1;
+        if (nodes > 5_000 || depth > 20) throw new clean.Error(`${label} is not bounded JSON`);
+        if (current === null) { spend(4); return null; }
+        if (typeof current === "string") { spend(utf8Bytes(current, true) + 2); return current; }
+        if (typeof current === "boolean") { spend(5); return current; }
+        if (typeof current === "number") {
+          if (!numberIsFinite(current)) throw new clean.Error(`${label} contains a non-finite number`);
+          spend(24); return current;
+        }
+        if (typeof current !== "object") throw new clean.Error(`${label} contains a non-JSON value`);
+        if (reflectApply(setHas, ancestors, [current])) throw new clean.Error(`${label} contains a cycle`);
+        reflectApply(setAdd, ancestors, [current]);
+        let copy;
+        if (arrayIsArray(current)) {
+          copy = [];
+          spend(2 + current.length);
+          const keys = reflectOwnKeys(current);
+          for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+            const key = keys[keyIndex];
+            if (key === "length") continue;
+            if (typeof key !== "string" || !reflectApply(regexpTest, /^(?:0|[1-9][0-9]*)$/u, [key])
+              || SafeNumber(key) >= current.length) throw new clean.Error(`${label} contains an ambiguous array key`);
+            const descriptor = getOwnPropertyDescriptor(current, key);
+            if (!descriptor?.enumerable || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or hidden array value`);
+          }
+          for (let index = 0; index < current.length; index += 1) {
+            const descriptor = getOwnPropertyDescriptor(current, SafeString(index));
+            if (!descriptor || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or sparse array`);
+            copy[index] = visit(descriptor.value, depth + 1);
+          }
+        } else {
+          if (!isPlainRecord(current)) throw new clean.Error(`${label} must contain only plain records`);
+          copy = objectCreate(null);
+          const keys = reflectOwnKeys(current);
+          spend(2 + keys.length);
+          for (let index = 0; index < keys.length; index += 1) {
+            const key = keys[index];
+            if (typeof key !== "string") throw new clean.Error(`${label} contains a symbol key`);
+            if (key.length > 1_000 || reflectApply(setHas, dangerousKeys, [key])) throw new clean.Error(`${label} contains an ambiguous key`);
+            const descriptor = getOwnPropertyDescriptor(current, key);
+            if (!descriptor?.enumerable || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or hidden value`);
+            spend(utf8Bytes(key, true) + 3);
+            copy[key] = visit(descriptor.value, depth + 1);
+          }
+        }
+        reflectApply(setDelete, ancestors, [current]);
+        return copy;
+      };
+      return visit(value, 0);
+    };
+    const safeMessage = (message) => reflectApply(stringSlice, SafeString(message || "WebMCP error"), [0, 500]);
+    const errorEnvelope = (code, message, supported, source = null, wasCommitted = false) => ({
+      ...(wasCommitted ? { committed: true } : {}),
+      error: { code, message: safeMessage(message) }, ok: false, source, supported
+    });
+    const serialize = (value) => {
+      try {
+        const encoded = reflectApply(safeJsonStringify, clean.JSON, [value]);
+        if (utf8Bytes(encoded) > maxEnvelopeBytes) throw new clean.Error("envelope too large");
+        return encoded;
+      } catch {
+        return "{\"ok\":false,\"supported\":false,\"source\":null,\"error\":{\"code\":\"WEBMCP_OUTPUT_INVALID\",\"message\":\"WebMCP adapter could not serialize its result\"}}";
+      }
+    };
+    const delay = (milliseconds, kind) => new SafePromise((resolve) => {
+      const timer = safeSetTimeout(() => {
+        reflectApply(setDelete, timers, [timer]);
+        resolve({ kind });
+      }, milliseconds);
+      reflectApply(setAdd, timers, [timer]);
+    });
+    const settle = (promise) => reflectApply(SafePromise.prototype.then, promise, [
+      (value) => ({ kind: "fulfilled", value }),
+      (error) => ({ error, kind: "rejected" })
+    ]);
+
+    try {
+      const registrySymbol = reflectApply(symbolFor, clean.Symbol, ["opencode.webmcp.prepared.v1"]);
+      let registry = globalThis[registrySymbol];
+      if (!(registry instanceof SafeMap)) {
+        registry = new SafeMap();
+        SafeObject.defineProperty(globalThis, registrySymbol, { configurable: false, enumerable: false, value: registry });
+      }
+      const validRegistryConfig = Number.isInteger(payload.registryLimit) && payload.registryLimit > 0
+        && payload.registryLimit <= 16 && Number.isInteger(payload.ttlMs) && payload.ttlMs >= 1_000 && payload.ttlMs <= 60_000;
+      const validToken = typeof payload.token === "string" && /^[0-9a-f-]{36}$/u.test(payload.token);
+      if (["prepare", "commit", "cleanup"].includes(operation) && (!validRegistryConfig || !validToken)) {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP prepared invocation token is invalid", true));
+      }
+      const now = reflectApply(safeDateNow, clean.Date, []);
+      for (const [token, entry] of reflectApply(mapEntries, registry, [])) {
+        if (!entry || entry.expiresAt <= now) {
+          try { safeClearTimeout(entry?.timer); } catch {}
+          reflectApply(mapDelete, registry, [token]);
+        }
+      }
+      if (operation === "cleanup") {
+        const entry = reflectApply(mapGet, registry, [payload.token]);
+        if (entry) try { safeClearTimeout(entry.timer); } catch {}
+        reflectApply(mapDelete, registry, [payload.token]);
+        return serialize({ cleaned: true, ok: true });
+      }
+      if (operation === "commit") {
+        const entry = reflectApply(mapGet, registry, [payload.token]);
+        if (!entry || entry.expiresAt <= now || entry.toolName !== payload.toolName) {
+          return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP prepared invocation expired or was not found", true));
+        }
+        reflectApply(mapDelete, registry, [payload.token]);
+        try { safeClearTimeout(entry.timer); } catch {}
+        const abortSignalGetter = getOwnPropertyDescriptor(SafeAbortController.prototype, "signal")?.get;
+        if (typeof abortSignalGetter !== "function") return unsupported;
+        const signal = reflectApply(abortSignalGetter, controller, []);
+        committed = true;
+        const executionOutcome = await settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
+          () => reflectApply(entry.executeTool, entry.context, [entry.descriptor, payload.inputJson, { signal }])
+        ]));
+        if (executionOutcome.kind === "rejected") {
+          if (executionOutcome.error?.code === "WEBMCP_INVOCATION_UNSUPPORTED") {
+            return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, entry.source, true));
+          }
+          return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, entry.source, true));
+        }
+        let result;
+        try {
+          result = cloneJson(executionOutcome.value, "WebMCP output", 512 * 1024);
+        } catch (error) {
+          const message = SafeString(error?.message || error);
+          return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, entry.source, true));
+        }
+        return serialize({ committed: true, invocation: "executeTool", ok: true, result, source: entry.source,
+          supported: true, toolName: entry.toolName });
+      }
+      const documentContext = typeof document === "object" && document ? document.modelContext : null;
+      const navigatorContext = typeof navigator === "object" && navigator ? navigator.modelContext : null;
+      const context = documentContext && typeof documentContext === "object"
+        ? documentContext : navigatorContext && typeof navigatorContext === "object" ? navigatorContext : null;
+      const source = context === documentContext ? "document" : context === navigatorContext ? "navigator" : null;
+      if (!context) return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_UNSUPPORTED", message: "This page does not expose WebMCP" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_UNSUPPORTED", "This page does not expose WebMCP", false));
+      const officialGetTools = context.getTools;
+      if (typeof officialGetTools !== "function") return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
+      const discoveryBudgetMs = remainingMs();
+      if (discoveryBudgetMs <= 0) return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_DISCOVERY_TIMEOUT", message: "WebMCP discovery timed out" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_DISCOVERY_TIMEOUT", "WebMCP discovery timed out", true, source));
+      const discovery = settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
+        () => reflectApply(officialGetTools, context, [])
+      ]));
+      const discoveryOutcome = await reflectApply(SafePromise.race, SafePromise, [[
+        discovery, delay(discoveryBudgetMs, "discovery-timeout"), abortPromise
+      ]]);
+      if (discoveryOutcome.kind === "discovery-timeout") {
+        return serialize(operation === "list"
+          ? { error: { code: "WEBMCP_DISCOVERY_TIMEOUT", message: "WebMCP discovery timed out" }, source: null, supported: false, tools: [] }
+          : errorEnvelope("WEBMCP_DISCOVERY_TIMEOUT", "WebMCP discovery timed out", true, source));
+      }
+      if (discoveryOutcome.kind === "abort") return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP operation was aborted", true, source));
+      if (discoveryOutcome.kind === "rejected") {
+        if (discoveryOutcome.error?.code === "WEBMCP_DISCOVERY_UNSUPPORTED") return serialize(operation === "list"
+          ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
+          : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
+        throw discoveryOutcome.error;
+      }
+      const rawTools = discoveryOutcome.value;
+      if (!arrayIsArray(rawTools) || rawTools.length > 100) throw new clean.Error("WebMCP discovery returned an invalid tool list");
+      const seen = new SafeSet();
+      const entries = [];
+      const publicTools = [];
+      const metadataBudget = { bytes: 0, maxBytes: maxEnvelopeBytes };
+      for (let index = 0; index < rawTools.length; index += 1) {
+        const rawDescriptor = getOwnPropertyDescriptor(rawTools, SafeString(index));
+        if (!rawDescriptor || !("value" in rawDescriptor)) throw new clean.Error("WebMCP tool list contains an accessor or sparse entry");
+        const descriptor = rawDescriptor.value;
+        if (!descriptor || typeof descriptor !== "object" || !isPlainRecord(descriptor)) throw new clean.Error("WebMCP tool metadata must be a plain record");
+        const nameDescriptor = getOwnPropertyDescriptor(descriptor, "name");
+        if (!nameDescriptor || !("value" in nameDescriptor) || typeof nameDescriptor.value !== "string"
+          || !reflectApply(regexpTest, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u, [nameDescriptor.value])) throw new clean.Error("WebMCP tool name is invalid");
+        const name = nameDescriptor.value;
+        if (reflectApply(setHas, seen, [name])) throw new clean.Error("WebMCP tool names contain a duplicate");
+        reflectApply(setAdd, seen, [name]);
+        const descriptionDescriptor = getOwnPropertyDescriptor(descriptor, "description");
+        const description = descriptionDescriptor == null ? "" : "value" in descriptionDescriptor ? descriptionDescriptor.value : null;
+        if (typeof description !== "string" || description.length > 2_000) throw new clean.Error("WebMCP tool description is invalid or too large");
+        metadataBudget.bytes += utf8Bytes(name) + utf8Bytes(description);
+        if (metadataBudget.bytes > metadataBudget.maxBytes) throw new clean.Error("WebMCP metadata exceeds the total byte budget");
+        const schemaDescriptor = getOwnPropertyDescriptor(descriptor, "inputSchema");
+        const schema = schemaDescriptor == null ? objectCreate(null) : "value" in schemaDescriptor ? schemaDescriptor.value : null;
+        const publicTool = { description, inputSchema: cloneJson(schema, "WebMCP input schema", 64 * 1024, metadataBudget), name };
+        entries[index] = { descriptor, publicTool };
+        publicTools[index] = publicTool;
+      }
+      if (operation === "list") return serialize({ source, supported: true, tools: publicTools });
+      if (operation !== "prepare" || typeof payload.toolName !== "string") {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation request is invalid", true, source));
+      }
+      let selected = null;
+      for (let index = 0; index < entries.length; index += 1) {
+        if (entries[index].publicTool.name === payload.toolName) selected = selected === null ? entries[index] : false;
+      }
+      if (!selected) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
+      const descriptor = selected.descriptor;
+      const officialExecuteTool = context.executeTool;
+      if (typeof officialExecuteTool !== "function") {
+        return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
+      }
+      if (preDispatchAborted) return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP operation was aborted", true, source));
+      if (remainingMs() <= 0) return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP admission deadline expired before dispatch", true, source));
+      if (registry.size >= payload.registryLimit) {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "Too many prepared WebMCP invocations", true, source));
+      }
+      const expiresAt = now + payload.ttlMs;
+      const timer = safeSetTimeout(() => { reflectApply(mapDelete, registry, [payload.token]); }, payload.ttlMs);
+      try { timer?.unref?.(); } catch {}
+      reflectApply(mapSet, registry, [payload.token, {
+        context, descriptor, executeTool: officialExecuteTool, expiresAt, source, timer, toolName: payload.toolName
+      }]);
+      return serialize({ prepared: true, source, supported: true, tool: selected.publicTool, toolName: payload.toolName });
+    } catch (error) {
+      const message = safeMessage(error?.message || error);
+      if (operation === "list") return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
+      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true, null, committed));
+    } finally {
+      try { reflectApply(setForEach, timers, [(timer) => safeClearTimeout(timer)]); } catch {}
+      try { reflectApply(removeEventListener, globalThis, [payload.abortChannel, onAbort]); } catch {}
+    }
+  } catch {
+    return unsupported;
+  }
+}
+
+function assertWebMcpFields(value, allowed, label) {
+  if (!isRecord(value)) throw new Error(`${label} params must be an object`);
+  const extra = Object.keys(value).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`${label} contains unsupported fields: ${extra.join(", ")}`);
+}
+
+function requireWebMcpToolName(value) {
+  if (typeof value !== "string" || value.length > MAX_WEBMCP_NAME_CHARS || !WEBMCP_TOOL_NAME_RE.test(value)) {
+    throw new Error("WebMCP toolName must be an exact bounded tool name");
+  }
+  return value;
+}
+
+function cloneBoundedWebMcpJson(value, label, maxBytes) {
+  const ancestors = new Set();
+  let nodes = 0;
+  let characters = 0;
+  const spend = (count) => {
+    characters += count;
+    if (characters > maxBytes) throw new Error(`${label} is too large for the bounded WebMCP bridge`);
+  };
+  const isPlainRecord = (current) => {
+    const prototype = Object.getPrototypeOf(current);
+    if (prototype === null || prototype === Object.prototype) return true;
+    if (Object.getPrototypeOf(prototype) !== null) return false;
+    const constructorDescriptor = Object.getOwnPropertyDescriptor(prototype, "constructor");
+    return Boolean(constructorDescriptor && "value" in constructorDescriptor
+      && typeof constructorDescriptor.value === "function" && constructorDescriptor.value.name === "Object");
+  };
+  function visit(current, depth) {
+    nodes += 1;
+    if (nodes > MAX_WEBMCP_JSON_NODES || depth > MAX_WEBMCP_JSON_DEPTH) throw new Error(`${label} is not bounded JSON`);
+    if (current === null) { spend(4); return null; }
+    if (typeof current === "string") { spend(current.length + 2); return current; }
+    if (typeof current === "boolean") { spend(5); return current; }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new Error(`${label} contains a non-finite number`);
+      spend(24); return current;
+    }
+    if (typeof current !== "object") throw new Error(`${label} contains a value that is not JSON serializable`);
+    if (ancestors.has(current)) throw new Error(`${label} contains a cycle and is not JSON serializable`);
+    ancestors.add(current);
+    let copy;
+    if (Array.isArray(current)) {
+      copy = [];
+      spend(2 + current.length);
+      for (const key of Reflect.ownKeys(current)) {
+        if (key === "length") continue;
+        if (typeof key !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(key)
+          || Number(key) >= current.length) throw new Error(`${label} contains an ambiguous array key`);
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error(`${label} contains an accessor or hidden array value`);
+      }
+      for (let index = 0; index < current.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+        if (!descriptor || !("value" in descriptor)) throw new Error(`${label} contains an accessor or sparse array`);
+        copy[index] = visit(descriptor.value, depth + 1);
+      }
+    }
+    else {
+      if (!isPlainRecord(current)) throw new Error(`${label} must contain only plain records`);
+      copy = Object.create(null);
+      const keys = Reflect.ownKeys(current);
+      spend(2 + keys.length);
+      for (const key of keys) {
+        if (typeof key !== "string") throw new Error(`${label} contains a symbol key`);
+        if (key.length > MAX_WEBMCP_JSON_KEY_CHARS || ["__proto__", "constructor", "prototype"].includes(key)) {
+          throw new Error(`${label} contains an ambiguous key`);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error(`${label} contains an accessor or hidden value`);
+        spend(key.length + 3);
+        copy[key] = visit(descriptor.value, depth + 1);
+      }
+    }
+    ancestors.delete(current);
+    return copy;
+  }
+  const copy = visit(value, 0);
+  const serialized = JSON.stringify(copy);
+  if (typeof serialized !== "string") throw new Error(`${label} is not JSON serializable`);
+  if (new TextEncoder().encode(serialized).byteLength > maxBytes) throw new Error(`${label} is too large for the bounded WebMCP bridge`);
+  return JSON.parse(serialized);
+}
+
+function validateWebMcpTools(value) {
+  if (!Array.isArray(value) || value.length > MAX_WEBMCP_TOOLS) throw new Error("WebMCP tool list is invalid or too large");
+  const seen = new Set();
+  return value.map((tool) => {
+    if (!isRecord(tool) || Object.keys(tool).some((field) => !["description", "inputSchema", "name"].includes(field))) {
+      throw new Error("WebMCP tool metadata is invalid");
+    }
+    const name = requireWebMcpToolName(tool.name);
+    if (seen.has(name)) throw new Error("WebMCP tool metadata contains a duplicate name");
+    seen.add(name);
+    if (typeof tool.description !== "string" || tool.description.length > MAX_WEBMCP_DESCRIPTION_CHARS) {
+      throw new Error("WebMCP tool description is invalid or too large");
+    }
+    return {
+      description: tool.description,
+      inputSchema: cloneBoundedWebMcpJson(tool.inputSchema, "WebMCP input schema", MAX_WEBMCP_SCHEMA_BYTES),
+      name
+    };
+  });
+}
+
+function sanitizeWebMcpError(error) {
+  const raw = typeof error === "string" ? error : error?.message ?? String(error ?? "WebMCP error");
+  return truncateString(raw, 500)
+    .replace(/https?:\/\/[^\s]+/giu, "[redacted-url]")
+    .replace(/(?:token|secret|password|authorization|cookie)\s*[=:]\s*[^\s,;]+/giu, "$1=[redacted]")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .trim();
+}
+
+function validateWebMcpError(value) {
+  if (!isRecord(value) || typeof value.code !== "string" || value.code.length > 100) {
+    throw new Error("WebMCP error response is invalid");
+  }
+  return { code: value.code, message: sanitizeWebMcpError(value.message) };
+}
+
+function webMcpUnsupportedList(message) {
+  return { error: { code: "WEBMCP_UNSUPPORTED", message }, source: null, supported: false, tools: [] };
+}
+
+function webMcpInvocationError(code, message, supported) {
+  return { error: { code, message }, ok: false, source: null, supported };
+}
+
 async function activateTab(tabId, signal) {
   throwIfAborted(signal);
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await abortableChromeOperation(chrome.tabs.get(tabId), signal);
   throwIfAborted(signal);
   if (tab.windowId !== undefined) {
     await chrome.windows.update(tab.windowId, { focused: true });
@@ -853,32 +2980,43 @@ async function tabStillExists(tabId) {
   }
 }
 
-async function captureScreenshot(params, pageGuard) {
+async function captureScreenshot(params, signal, pageGuard) {
+  throwIfAborted(signal);
   const tabId = params.tabId == null ? null : requireTabId(params);
   let windowId = params.windowId;
   let targetTab = null;
   if (tabId !== null) {
-    targetTab = params.__alreadyActive === true ? await chrome.tabs.get(tabId) : await activateTab(tabId);
+    targetTab = params.__alreadyActive === true
+      ? await abortableChromeOperation(chrome.tabs.get(tabId), signal)
+      : await activateTab(tabId, signal);
+    throwIfAborted(signal);
     windowId = targetTab.windowId;
   }
   if (!Number.isInteger(windowId)) {
-    const current = await chrome.windows.getCurrent();
+    const current = await abortableChromeOperation(chrome.windows.getCurrent(), signal);
+    throwIfAborted(signal);
     windowId = current.id;
   }
   const format = params.format === "jpeg" ? "jpeg" : "png";
   const quality = format === "jpeg" ? clampInteger(params.quality, 1, 100, 80, "quality") : undefined;
   const captureOptions = quality === undefined ? { format } : { format, quality };
   if (targetTab === null) {
-    const active = await chrome.tabs.query({ active: true, windowId });
+    const active = await abortableChromeOperation(chrome.tabs.query({ active: true, windowId }), signal);
+    throwIfAborted(signal);
     if (active.length !== 1) throw new Error("Screenshot active tab cannot be resolved deterministically");
     targetTab = active[0];
   }
   await pageGuard?.();
-  const beforeBinding = await currentPageBinding(targetTab.id, targetTab.url);
+  throwIfAborted(signal);
+  const beforeBinding = await abortableChromeOperation(currentPageBinding(targetTab.id, targetTab.url), signal);
+  throwIfAborted(signal);
   const activationGeneration = windowActivationGenerations.get(windowId) ?? 0;
-  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, captureOptions);
-  const activeAfter = await chrome.tabs.query({ active: true, windowId });
-  const afterBinding = await currentPageBinding(targetTab.id);
+  const dataUrl = await abortableChromeOperation(chrome.tabs.captureVisibleTab(windowId, captureOptions), signal);
+  throwIfAborted(signal);
+  const activeAfter = await abortableChromeOperation(chrome.tabs.query({ active: true, windowId }), signal);
+  throwIfAborted(signal);
+  const afterBinding = await abortableChromeOperation(currentPageBinding(targetTab.id), signal);
+  throwIfAborted(signal);
   if (activeAfter.length !== 1
     || activeAfter[0].id !== targetTab.id
     || (windowActivationGenerations.get(windowId) ?? 0) !== activationGeneration
@@ -1309,6 +3447,7 @@ async function claimTab(params) {
     nextLeases.set(tabId, {
       claimedAt: Date.now(),
       groupId,
+      leaseId: typeof existing?.leaseId === "string" ? existing.leaseId : crypto.randomUUID(),
       origin,
       sessionId,
       state: "active",
@@ -1767,6 +3906,7 @@ function isValidStoredTabLease(tabId, value) {
     && typeof value.turnId === "string"
     && value.turnId.length > 0
     && value.turnId.length <= MAX_KEY_CHARS
+    && (value.leaseId === undefined || (typeof value.leaseId === "string" && value.leaseId.length > 0 && value.leaseId.length <= MAX_KEY_CHARS))
     && (value.origin === "agent" || value.origin === "user")
     && (value.state === "active" || value.state === "handoff")
     && Number.isFinite(value.claimedAt)
@@ -2210,7 +4350,7 @@ async function withScopedNavigationBarrier(tabId, pageGuard, operation, signal, 
     }
   }, async () => {
     if (navigationBarriers.get(tabId) === barrier) navigationBarriers.delete(tabId);
-  });
+  }, signal);
 }
 
 async function drainNavigationBarrier(barrier) {
@@ -2265,7 +4405,7 @@ function setMembership(set, value, present) {
   else set.delete(value);
 }
 
-async function withDebuggerTarget(debugTarget, callback, afterCleanup) {
+async function withDebuggerTarget(debugTarget, callback, afterCleanup, signal) {
   const key = debuggerKey(debugTarget);
   return withDebuggerLock(key, async () => {
     // Persistent attachment state can change while this operation waits for the lock.
@@ -2284,7 +4424,7 @@ async function withDebuggerTarget(debugTarget, callback, afterCleanup) {
       if (shouldDetach) await chrome.debugger.detach(debugTarget).catch(() => {});
       await afterCleanup?.();
     }
-  });
+  }, signal);
 }
 
 function debuggerKey(debugTarget) {
@@ -2298,18 +4438,29 @@ function isPersistentDebuggerAttached(tabId) {
   return consoleLogAttached.has(tabId) || cdpEventAttached.has(tabId) || networkTrackerAttached.has(tabId);
 }
 
-async function withDebuggerLock(key, callback) {
+async function withDebuggerLock(key, callback, signal) {
   const prev = debuggerQueue.get(key) ?? Promise.resolve();
   let resolveLock;
   const lock = new Promise((resolve) => { resolveLock = resolve; });
   debuggerQueue.set(key, lock);
 
-  await prev;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    resolveLock();
+    if (debuggerQueue.get(key) === lock) debuggerQueue.delete(key);
+  };
+  try {
+    await abortableChromeOperation(prev, signal);
+  } catch (error) {
+    Promise.resolve(prev).finally(release);
+    throw error;
+  }
   try {
     return await callback();
   } finally {
-    resolveLock();
-    if (debuggerQueue.get(key) === lock) debuggerQueue.delete(key);
+    release();
   }
 }
 
@@ -3578,7 +5729,7 @@ async function readPage(params, signal, pageGuard) {
       tabId,
       __alreadyActive: true,
       windowId: activatedTab.windowId
-    }, pageGuard);
+    }, signal, pageGuard);
     throwIfAborted(signal);
   }
   return {
@@ -3910,7 +6061,23 @@ async function waitFor(params, { signal } = {}) {
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
-  throw signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled");
+  if (signal.reason instanceof Error) throw signal.reason;
+  if (typeof signal.reason?.message === "string") throw new Error(signal.reason.message);
+  throw new Error("Chrome command was cancelled");
+}
+
+function abortableChromeOperation(operation, signal) {
+  if (!signal) return operation;
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      try { throwIfAborted(signal); } catch (error) { reject(error); }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(operation).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
 
 function abortableSleep(ms, signal) {

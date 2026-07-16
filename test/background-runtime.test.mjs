@@ -1499,7 +1499,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   const result = await harness.execute("handshake", {});
 
   assert.equal(result.extensionId, "test-extension");
-  assert.equal(result.extensionVersion, "1.3.0");
+  assert.equal(result.extensionVersion, "1.4.0");
   assert.equal(result.hostName, "com.opencode.chrome_bridge");
   assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
   assert.ok(result.capabilities.includes("bridge.handshake"));
@@ -1512,7 +1512,7 @@ test("popup status compares actual extension capabilities with host client requi
   const harness = createBackgroundHarness();
   const status = harness.popupStatus({
     name: "com.opencode.chrome_bridge",
-    version: "1.3.0",
+    version: "1.4.0",
     protocolMin: "1.0.0",
     protocolMax: "1.0.0",
     requiredCapabilities: ["browser.tabs", "browser.future", "bridge.handshake"]
@@ -1815,6 +1815,24 @@ test("readPage cancellation stops browser work before screenshot capture", async
   assert.equal(captures, 0);
 });
 
+test("readPage cancellation aborts a stalled screenshot capture", async () => {
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (injection) => injection.files ? [] : [{
+      result: {
+        accessibility: { nodeCount: 0, tree: "", truncated: false },
+        context: { visibleText: "Page text" }
+      }
+    }],
+    tabsCaptureVisibleTab: async () => new Promise(() => {})
+  });
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const result = harness.execute("readPage", { includeScreenshot: true, tabId: 7 }, { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("stalled capture cancelled")), 25);
+  await assert.rejects(result, /stalled capture cancelled/iu);
+  assert.ok(Date.now() - startedAt < 150);
+});
+
 test("tabContext and readPage fail closed on malformed isolated-world results", async () => {
   const malformedContext = createBackgroundHarness({
     scriptingExecuteScript: async (injection) => injection.files ? [] : [{ result: { visibleText: 42 } }]
@@ -1993,6 +2011,7 @@ test("waitFor observes URL and only navigation that starts after the wait baseli
     tabId: 7,
     timeoutMs: 200
   });
+  await new Promise((resolve) => setImmediate(resolve));
   status = "loading";
   await navigationHarness.events.tabsOnUpdated.emit(7, { status: "loading" }, {
     id: 7, status, url: "https://example.com/same-url", windowId: 1
@@ -3058,7 +3077,7 @@ test("navigation policy fails closed when configured storage cannot be read", as
 
   await assert.rejects(
     harness.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
-    /Could not read blockedUrlPatterns from local storage/u
+    /Could not read (?:blockedUrlPatterns from local storage|active workflow recording)/u
   );
 });
 
@@ -3930,7 +3949,1813 @@ test("notifications enforce title and message bounds and use packaged branded ic
   await assert.rejects(() => harness.execute("notify", { title: "ok", message: "x".repeat(1001) }), /message.*1000/iu);
 });
 
+test("workflow recording persists only successful typed non-sensitive steps and strips screenshot bytes", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    scriptingExecuteScript: async (injection) => {
+      if (!injection.func) return [];
+      if (injection.args.length === 2) return [{ result: { editable: true, focused: true, found: true } }];
+      return [{ result: { found: true, verified: true } }];
+    }
+  });
+  await harness.execute("workflowStartRecording", { name: "Checkout", shortcut: "  QUICK   BUY " });
+  await harness.execute("getTab", { tabId: 7 });
+  await harness.execute("screenshot", { tabId: 7, format: "png" });
+  await assert.rejects(() => harness.execute("navigate", { tabId: 7, url: "not-a-url" }));
+  await assert.rejects(() => harness.execute("navigate", { tabId: 7, url: "https://example.com/pay?token=url-secret" }), /sensitive|not recordable/iu);
+  await assert.rejects(() => harness.execute("fillElement", { tabId: 7, ref: "e1", text: "top-secret" }), /not recordable|sensitive/iu);
+  const workflow = await harness.execute("workflowStopRecording", {});
+  assert.equal(workflow.schemaVersion, 1);
+  assert.equal(workflow.shortcut, "quick-buy");
+  assert.equal(JSON.stringify(workflow.steps.map(({ method }) => method)), JSON.stringify(["getTab", "screenshot"]));
+  assert.equal(JSON.stringify(workflow).includes("iVBOR"), false);
+  assert.equal(JSON.stringify(workflow).includes("top-secret"), false);
+  assert.equal(JSON.stringify(workflow).includes("url-secret"), false);
+  assert.ok(stored.opencodeWorkflows);
+});
+
+test("workflow cancel discards a recording and shortcut uniqueness is normalized", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
+  });
+  await harness.execute("workflowStartRecording", { name: "Discard me", shortcut: "discard" });
+  await harness.execute("getTab", { tabId: 7 });
+  assert.equal(JSON.stringify(await harness.execute("workflowCancelRecording", {})), JSON.stringify({ cancelled: true }));
+  assert.equal(JSON.stringify(await harness.execute("workflowList", {})), JSON.stringify([]));
+  await harness.execute("workflowStartRecording", { name: "First", shortcut: "Quick Buy" });
+  await harness.execute("getTab", { tabId: 7 });
+  await harness.execute("workflowStopRecording", {});
+  await harness.execute("workflowStartRecording", { name: "Second", shortcut: " quick---buy " });
+  await harness.execute("getTab", { tabId: 7 });
+  await assert.rejects(() => harness.execute("workflowStopRecording", {}), /shortcut.*unique|already exists/iu);
+});
+
+test("workflow persisted/imported schemas migrate v0 narrowly and otherwise fail closed", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 0, id: "legacy-1", name: "Legacy", shortcut: "legacy",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: [],
+    steps: [{ command: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; } });
+  const migrated = await harness.execute("workflowGet", { id: "legacy-1" });
+  assert.equal(migrated.schemaVersion, 1);
+  assert.equal(migrated.steps[0].method, "getTab");
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "bad", steps: [{ method: "workflowRun", params: { id: "legacy-1" } }] } }), /not allowed|meta|recursive/iu);
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "future", schemaVersion: 99 } }), /schemaVersion|unsupported/iu);
+  const derivedOrigin = await harness.execute("workflowImport", { workflow: {
+    ...migrated, id: "missing-origin", name: "Missing origin", shortcut: "missing-origin",
+    requiredCapabilities: ["browser.navigation", "browser.tabs"], requiredOrigins: [],
+    steps: [{ method: "navigate", params: { tabId: 7, url: "https://outside.example/private" } }]
+  } });
+  assert.equal(JSON.stringify(derivedOrigin.requiredOrigins), JSON.stringify(["https://outside.example"]));
+  const rewritten = await harness.execute("workflowImport", { workflow: {
+    ...migrated, id: "unknown-cap", name: "Unknown capability", shortcut: "unknown-cap",
+    requiredCapabilities: ["browser.not-installed"], requiredOrigins: ["https://untrusted.example"]
+  } });
+  assert.equal(JSON.stringify(rewritten.requiredCapabilities), JSON.stringify(["browser.tabs"]));
+  assert.equal(JSON.stringify(rewritten.requiredOrigins), JSON.stringify(["https://untrusted.example"]));
+
+  for (const [id, condition] of [
+    ["sensitive-text", { type: "text", value: "one-time-token", match: "contains" }],
+    ["sensitive-url", { type: "url", value: "https://example.com/?token=one-time-token", match: "exact" }]
+  ]) {
+    await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+      ...migrated, id, name: id, shortcut: id,
+      steps: [{ method: "waitFor", params: { tabId: 7, condition } }]
+    } }), /sensitive|not allowed|waitFor/iu);
+  }
+  assert.equal(JSON.stringify(stored).includes("one-time-token"), false);
+});
+
+test("workflow structural operations do not require live tabs but run preflight does", async () => {
+  let stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+    schemaVersion: 1, id: "stale", name: "Stale", shortcut: "stale",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 404 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  }] } };
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async () => { tabReads += 1; throw new Error("No tab with id: 404"); }
+  });
+  assert.equal((await harness.execute("workflowList", {}))[0].id, "stale");
+  assert.equal((await harness.execute("workflowGet", { id: "stale" })).id, "stale");
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "imported", name: "Imported", shortcut: "imported",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 405 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  await harness.execute("workflowDelete", { id: "imported" });
+  assert.equal(tabReads, 0);
+  await assert.rejects(
+    () => harness.execute("workflowRun", { id: "stale", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }),
+    /No tab with id|resolve tab|preflight/iu
+  );
+  assert.ok(tabReads > 0);
+});
+
+test("origin-scoped commands record once with their approved origin", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
+  });
+  await harness.execute("workflowStartRecording", { name: "Scoped", shortcut: "scoped" });
+  await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/app"], method: "getTab", params: { tabId: 7 }
+  });
+  const workflow = await harness.execute("workflowStopRecording", {});
+  assert.equal(workflow.steps.length, 1);
+  assert.equal(workflow.steps[0].method, "getTab");
+  assert.equal(JSON.stringify(workflow.requiredOrigins), JSON.stringify(["https://example.com"]));
+});
+
+test("workflow playback preflights all capabilities and origins before deterministic indexed effects", async () => {
+  let stored = {};
+  const effects = [];
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => { effects.push(`get:${tabId}`); return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }; }
+  });
+  const base = {
+    schemaVersion: 1, id: "play-1", name: "Play", shortcut: "play",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 }, timeoutMs: 1000 }, { method: "getTab", params: { tabId: 8 }, timeoutMs: 1000 }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  await harness.execute("workflowImport", { workflow: base });
+  const result = await harness.execute("workflowRun", { shortcut: " PLAY ", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(JSON.stringify(result.results.map(({ index, ok }) => ({ index, ok }))), JSON.stringify([{ index: 0, ok: true }, { index: 1, ok: true }]));
+  assert.deepEqual([...new Set(effects)], ["get:7", "get:8"]);
+  effects.length = 0;
+  await assert.rejects(() => harness.execute("workflowRun", { id: "play-1", expectedOrigins: [], totalTimeoutMs: 5000 }), /origin.*preflight|authorized/iu);
+  assert.ok(effects.every((entry) => entry === "get:7" || entry === "get:8"));
+  stored.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.not-installed"];
+  const rewrittenRun = await harness.execute("workflowRun", { id: "play-1", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(rewrittenRun.ok, true);
+});
+
+test("workflow playback does not trust imported origin metadata for tab-bound steps", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://private.example/account", windowId: 1 })
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "untrusted-origin", name: "Untrusted origin", shortcut: "untrusted-origin",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: [],
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  await assert.rejects(
+    () => harness.execute("workflowRun", { id: "untrusted-origin", expectedOrigins: [], totalTimeoutMs: 5000 }),
+    /origin.*preflight|authorized/iu
+  );
+});
+
+test("scoped workflow playback rejects a document change before its first page effect", async () => {
+  let stored = {};
+  let running = false;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({
+      active: true, id: tabId, windowId: 1,
+      url: running ? "https://attacker.example/takeover" : "https://example.com/app"
+    }),
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }]
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "race-first", name: "Race first", shortcut: "race-first",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  running = true;
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/"], method: "workflowRun",
+    params: { id: "race-first", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }
+  }), /document|scope.*changed|not authorized/iu);
+  assert.equal(harness.calls.executeScript, 0);
+});
+
+test("workflow page mutations acquire the scoped navigation barrier before debugger effects", async () => {
+  let stored = {};
+  let navigated = false;
+  let inputEffects = 0;
+  let harness;
+  harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({
+      active: true, id: tabId, windowId: 1,
+      url: navigated ? "https://attacker.example/takeover" : "https://example.com/app"
+    }),
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }],
+    debuggerSendCommand: async (_target, method) => {
+      if (method === "Fetch.enable") {
+        navigated = true;
+        await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://attacker.example/takeover" });
+      }
+      if (method === "Input.dispatchMouseEvent") inputEffects += 1;
+      return {};
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "barrier-race", name: "Barrier race", shortcut: "barrier-race",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/"], method: "workflowRun",
+    params: { id: "barrier-race", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.equal(inputEffects, 0);
+});
+
+test("workflow abort during a delayed step binding cannot start page effects", async () => {
+  let stored = {};
+  let frameReads = 0;
+  let releaseBinding;
+  let markBindingPending;
+  const bindingPending = new Promise((resolve) => { markBindingPending = resolve; });
+  const delayedBinding = new Promise((resolve) => { releaseBinding = resolve; });
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    webNavigationGetFrame: async ({ tabId }) => {
+      frameReads += 1;
+      if (frameReads === 2) {
+        markBindingPending();
+        await delayedBinding;
+      }
+      return { documentId: `document-${tabId}`, frameId: 0 };
+    },
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }]
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "binding-abort", name: "Binding abort", shortcut: "binding-abort",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const controller = new AbortController();
+  const run = harness.execute("workflowRun", {
+    id: "binding-abort", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  }, { signal: controller.signal });
+  await bindingPending;
+  controller.abort(new Error("cancelled during binding"));
+  releaseBinding();
+  const result = await run;
+  assert.equal(result.ok, false);
+  assert.equal(harness.calls.debuggerCommands.length, 0);
+  assert.equal(harness.calls.executeScript, 0);
+  assert.equal(harness.calls.sendMessage, 0);
+});
+
+test("workflow activation timeout waits for an in-flight browser mutation to settle", async () => {
+  let stored = {};
+  let focusedMutations = 0;
+  let tabMutations = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      focusedMutations += 1;
+      return { id: windowId };
+    },
+    tabsUpdate: async (tabId) => {
+      tabMutations += 1;
+      return { active: true, id: tabId, url: "https://example.com", windowId: 1 };
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "activation-timeout", name: "Activation timeout", shortcut: "activation-timeout",
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "activateTab", params: { tabId: 7 }, timeoutMs: 50 }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const startedAt = Date.now();
+  const result = await harness.execute("workflowRun", {
+    id: "activation-timeout", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  });
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - startedAt >= 75);
+  assert.equal(focusedMutations, 1);
+  assert.equal(tabMutations, 0);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(focusedMutations, 1);
+  assert.equal(tabMutations, 0);
+});
+
+test("workflow redirect outside its preauthorized union stops before later steps", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com/start", windowId: 1 }),
+    tabsUpdate: async (tabId) => ({ id: tabId, url: "https://evil.example/redirect", windowId: 1 }),
+    scriptingExecuteScript: async () => { throw new Error("later click must not execute"); }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "redirect", name: "Redirect", shortcut: "redirect",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.navigation", "browser.tabs"],
+    requiredOrigins: ["https://example.com", "https://next.example"],
+    steps: [
+      { method: "navigate", params: { tabId: 7, url: "https://next.example/finish" } },
+      { method: "clickElement", params: { tabId: 7, ref: "e1" } }
+    ], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/start")],
+    expectedScopes: ["https://example.com:443/", "https://next.example:443/"], method: "workflowRun",
+    params: { id: "redirect", expectedOrigins: ["https://example.com", "https://next.example"], totalTimeoutMs: 5000 }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.equal(harness.calls.executeScript, 0);
+});
+
+test("workflow cancellation and timeout settle before any later effect", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => {
+      tabReads += 1;
+      if (tabReads > 2) await new Promise((resolve) => setTimeout(resolve, 80));
+      return { id: tabId, url: "https://example.com/app", windowId: 1 };
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "settle", name: "Settle", shortcut: "settle", requiredCapabilities: ["browser.tabs"],
+    requiredOrigins: ["https://example.com"], steps: [
+      { method: "getTab", params: { tabId: 7 }, timeoutMs: 50 },
+      { method: "getTab", params: { tabId: 8 }, timeoutMs: 50 }
+    ], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const aborted = new AbortController();
+  aborted.abort(new Error("cancelled-before-run"));
+  const readsBeforeAbort = tabReads;
+  await assert.rejects(() => harness.execute("workflowRun", {
+    id: "settle", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  }, { signal: aborted.signal }), /cancelled-before-run/iu);
+  assert.equal(tabReads, readsBeforeAbort);
+
+  tabReads = 0;
+  const startedAt = Date.now();
+  const result = await harness.execute("workflowRun", { id: "settle", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.ok(Date.now() - startedAt >= 75, "timed-out command must settle before workflow returns");
+});
+
+test("workflow screenshot capture obeys both per-step and total abort deadlines", async () => {
+  for (const [id, stepTimeout, totalTimeout] of [["step-capture", 50, 5000], ["total-capture", 1000, 50]]) {
+    let stored = {};
+    const harness = createBackgroundHarness({
+      storageLocalGet: async () => structuredClone(stored),
+      storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+      tabsCaptureVisibleTab: async () => new Promise(() => {})
+    });
+    await harness.execute("workflowImport", { workflow: {
+      schemaVersion: 1, id, name: id, shortcut: id,
+      requiredCapabilities: ["browser.screenshot", "browser.tabs", "browser.windows"], requiredOrigins: ["https://example.com"],
+      steps: [{ method: "screenshot", params: { tabId: 7 }, timeoutMs: stepTimeout }],
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+    } });
+    const startedAt = Date.now();
+    const result = await Promise.race([
+      harness.execute("workflowRun", { id, expectedOrigins: ["https://example.com"], totalTimeoutMs: totalTimeout }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("workflow capture did not settle")), 300))
+    ]);
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedAt, 0);
+    assert.ok(Date.now() - startedAt < 300);
+  }
+});
+
+test("workflow wait capabilities follow their condition and download waits need no page binding", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    downloadsSearch: async ({ id }) => [{ bytesReceived: 10, filename: "/tmp/file.txt", id, state: "complete" }],
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async () => { tabReads += 1; throw new Error("download workflow must not inspect tabs"); }
+  });
+  const workflow = (id, condition) => ({
+    schemaVersion: 1, id, name: id, shortcut: id, requiredCapabilities: [], requiredOrigins: [],
+    steps: [{ method: "waitFor", params: { condition, ...(condition.type === "download" ? {} : { tabId: 7 }) } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  const network = await harness.execute("workflowImport", { workflow: workflow("network-wait", { type: "networkIdle", idleMs: 10 }) });
+  assert.equal(JSON.stringify(network.requiredCapabilities), JSON.stringify(["browser.cdp", "browser.tabs", "browser.wait"]));
+  const download = await harness.execute("workflowImport", { workflow: workflow("download-wait", { type: "download", downloadId: 42 }) });
+  assert.equal(JSON.stringify(download.requiredCapabilities), JSON.stringify(["browser.downloads", "browser.wait"]));
+  const result = await harness.execute("workflowRun", { id: "download-wait", expectedOrigins: [], totalTimeoutMs: 5000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].value.download.id, 42);
+  assert.equal(tabReads, 0);
+});
+
+test("workflow recording rejects sensitive waits and a full recorder before browser effects", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/?token=secret", windowId: 1 }; }
+  });
+  await harness.execute("workflowStartRecording", { name: "Bounds", shortcut: "bounds" });
+  await assert.rejects(() => harness.execute("waitFor", {
+    tabId: 7, condition: { type: "url", value: "https://example.com/?token=secret", match: "exact" }
+  }), /record|sensitive|not allowed/iu);
+  assert.equal(tabReads, 0);
+  for (let index = 0; index < 100; index += 1) await harness.execute("getTab", { tabId: 7 });
+  const readsAtLimit = tabReads;
+  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /limited|100|full/iu);
+  assert.equal(tabReads, readsAtLimit);
+});
+
+test("workflow recording survives a service-worker restart and cancel clears it", async () => {
+  let stored = {};
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => { stored = { ...stored, ...structuredClone(value) }; };
+  const first = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  await first.execute("workflowStartRecording", { name: "Durable", shortcut: "durable" });
+  await first.execute("getTab", { tabId: 7 });
+  const second = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  const workflow = await second.execute("workflowStopRecording", {});
+  assert.equal(workflow.steps.length, 1);
+  await second.execute("workflowStartRecording", { name: "Cancel", shortcut: "cancel" });
+  await second.execute("workflowCancelRecording", {});
+  const third = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  await assert.rejects(() => third.execute("workflowStopRecording", {}), /No workflow recording/iu);
+});
+
+test("workflow append journal remains fail closed across a service-worker restart", async () => {
+  let stored = {};
+  let writes = 0;
+  let tabReads = 0;
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => {
+    writes += 1;
+    if (writes === 3) throw new Error("disk unavailable");
+    stored = { ...stored, ...structuredClone(value) };
+  };
+  const first = createBackgroundHarness({
+    storageLocalGet,
+    storageLocalSet,
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  await first.execute("workflowStartRecording", { name: "Persistence", shortcut: "persistence" });
+  const result = await first.execute("getTab", { tabId: 7 });
+  assert.equal(result.id, 7);
+  assert.equal(tabReads, 1);
+  assert.ok(first.calls.nativeMessages.some((message) => message.event?.type === "recordingFailed"));
+  assert.ok(stored.opencodeWorkflowRecording.pendingStep);
+
+  const restarted = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet,
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  await assert.rejects(() => restarted.execute("getTab", { tabId: 7 }), /recording is fail-closed|pending|journal/iu);
+  await assert.rejects(() => restarted.execute("workflowStopRecording", {}), /recording is fail-closed|pending|journal/iu);
+  assert.equal(tabReads, 1);
+  await restarted.execute("workflowCancelRecording", {});
+  await assert.rejects(() => restarted.execute("workflowStopRecording", {}), /No workflow recording/iu);
+});
+
+test("malformed durable workflow recording fails before browser effects", async () => {
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => ({ opencodeWorkflowRecording: { schemaVersion: 1, name: "Bad", unexpected: true } }),
+    tabsGet: async () => { tabReads += 1; return { id: 7, url: "https://example.com" }; }
+  });
+  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /recording.*unsupported fields|schema.*invalid/iu);
+  assert.equal(tabReads, 0);
+});
+
+test("workflow mutations serialize concurrent imports without lost updates", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => { await new Promise((resolve) => setTimeout(resolve, 5)); return structuredClone(stored); },
+    storageLocalSet: async (value) => { await new Promise((resolve) => setTimeout(resolve, 5)); stored = { ...stored, ...structuredClone(value) }; }
+  });
+  const workflow = (id) => ({
+    schemaVersion: 1, id, name: id, shortcut: id, requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 } }], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  await Promise.all([
+    harness.execute("workflowImport", { workflow: workflow("concurrent-a") }),
+    harness.execute("workflowImport", { workflow: workflow("concurrent-b") })
+  ]);
+  assert.equal((await harness.execute("workflowList", {})).length, 2);
+});
+
+test("workflow storage and playback enforce recursion, count, payload, and timeout bounds", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; } });
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "too-many", name: "Too many", shortcut: "many", requiredCapabilities: [], requiredOrigins: [],
+    steps: Array.from({ length: 101 }, () => ({ method: "getTab", params: { tabId: 7 } })), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } }), /steps.*100|too many/iu);
+  await assert.rejects(() => harness.execute("workflowRun", { id: "none", totalTimeoutMs: 49 }), /totalTimeoutMs/iu);
+
+  const origins = Array.from({ length: 100 }, (_, index) => `https://${index}.${"a".repeat(60)}.example`);
+  stored = { opencodeWorkflows: { schemaVersion: 1, workflows: Array.from({ length: 100 }, (_, index) => ({
+    schemaVersion: 1, id: `large-${index}`, name: `Large ${index}`, shortcut: `large-${index}`,
+    requiredCapabilities: ["browser.tabs"], requiredOrigins: origins,
+    steps: [{ method: "getTab", params: { tabId: 7 } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  })) } };
+  await assert.rejects(() => harness.execute("workflowList", {}), /storage payload.*too large|500000/iu);
+  stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [], unexpected: true } };
+  await assert.rejects(() => harness.execute("workflowList", {}), /unsupported fields|schema.*invalid/iu);
+});
+
+test("workflow final origin unions are bounded before collection writes or recorded effects", async () => {
+  const origins = Array.from({ length: 100 }, (_, index) => `https://origin-${index}.example`);
+  let stored = {};
+  let tabUpdates = 0;
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => { stored = { ...stored, ...structuredClone(value) }; };
+  const harness = createBackgroundHarness({
+    storageLocalGet,
+    storageLocalSet,
+    tabsUpdate: async (tabId, update) => {
+      tabUpdates += 1;
+      return { id: tabId, url: update.url, windowId: 1 };
+    }
+  });
+  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "origin-overflow", name: "Origin overflow", shortcut: "origin-overflow",
+    requiredCapabilities: [], requiredOrigins: origins,
+    steps: [{ method: "navigate", params: { tabId: 7, url: "https://destination.example/path" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } }), /origin.*100|too many/iu);
+  assert.equal(JSON.stringify(await harness.execute("workflowList", {})), JSON.stringify([]));
+
+  stored.opencodeWorkflowRecording = {
+    schemaVersion: 1, name: "Origin journal", shortcut: "origin-journal",
+    pendingStep: null, requiredCapabilities: [], requiredOrigins: origins,
+    revision: 0, startedAt: "2026-01-01T00:00:00.000Z", steps: []
+  };
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://new-origin.example:443/"], method: "navigate",
+    params: { tabId: 7, url: "https://new-origin.example/path" }
+  }), /origin.*100|too many/iu);
+  assert.equal(tabUpdates, 0);
+  assert.equal(stored.opencodeWorkflowRecording.pendingStep, null);
+});
+
+test("schedule recurrence uses local calendar boundaries without monthly, annual, or DST drift", async () => {
+  const harness = createBackgroundHarness();
+  const parts = (timestamp) => {
+    const value = new Date(timestamp);
+    return [value.getFullYear(), value.getMonth() + 1, value.getDate(), value.getHours(), value.getMinutes()];
+  };
+  const daily = { kind: "daily", hour: 2, minute: 30 };
+  const dstRun = harness.nextScheduleRun(daily, new Date(2026, 2, 28, 3, 0).getTime());
+  const localTwoThirty = new Date(2026, 2, 29, 2, 30);
+  const expectedDstHour = localTwoThirty.getHours();
+  assert.deepEqual(parts(dstRun), [2026, 3, 29, expectedDstHour, 30]);
+  assert.deepEqual(parts(harness.nextScheduleRun(daily, dstRun)), [2026, 3, 30, 2, 30]);
+
+  const monthly = { kind: "monthly", day: 31, hour: 10, minute: 0 };
+  const february = harness.nextScheduleRun(monthly, new Date(2027, 0, 31, 10, 0).getTime());
+  assert.deepEqual(parts(february), [2027, 2, 28, 10, 0]);
+  assert.deepEqual(parts(harness.nextScheduleRun(monthly, february)), [2027, 3, 31, 10, 0]);
+
+  const leap = { kind: "annual", month: 2, day: 29, hour: 8, minute: 15 };
+  assert.deepEqual(parts(harness.nextScheduleRun(leap, new Date(2026, 1, 28, 8, 15).getTime())), [2027, 2, 28, 8, 15]);
+  assert.deepEqual(parts(harness.nextScheduleRun(leap, new Date(2027, 1, 28, 8, 15).getTime())), [2028, 2, 29, 8, 15]);
+});
+
+function managedScheduleState(steps = [{ method: "getTab", params: { tabId: 7 } }]) {
+  return {
+    local: { opencodeWorkflows: { schemaVersion: 1, workflows: [{
+      schemaVersion: 1, id: "workflow-managed", name: "Managed", shortcut: "managed",
+      requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"], steps,
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+    }] } },
+    session: { opencodeTabLeases: { "7": {
+      claimedAt: 1, groupId: 3, leaseId: "lease-a", origin: "agent", sessionId: "session-a",
+      state: "active", tabId: 7, turnId: "turn-a", windowId: 1
+    } } }
+  };
+}
+
+function scheduleDraft(overrides = {}) {
+  return {
+    enabled: true, name: "Managed daily", notify: "failure",
+    recurrence: { kind: "daily", hour: 9, minute: 30 },
+    requiredOrigins: ["https://example.com"], workflowId: "workflow-managed",
+    ...overrides
+  };
+}
+
+async function createApprovedSchedule(harness, draft = scheduleDraft()) {
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  return harness.execute("scheduleCreate", { ...draft, approval });
+}
+
+test("schedule approval is an exact canonical fingerprint and every policy change needs reapproval", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  assert.match(approval.pattern, /^v1:[a-f0-9]{64}$/u);
+  assert.match(approval.scheduleId, /^[0-9a-f-]{36}$/iu);
+  assert.equal(approval.workflowId, "workflow-managed");
+  assert.equal(approval.workflowSchemaVersion, 1);
+  assert.match(approval.workflowFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(approval.managedTabs.length, 1);
+  assert.equal(approval.managedTabs[0].leaseId, "lease-a");
+  assert.equal(approval.managedTabs[0].sessionId, "session-a");
+  assert.equal(approval.managedTabs[0].tabId, 7);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval: { ...approval, notificationPolicy: "always" } }),
+    /approval.*exact|fingerprint/iu
+  );
+  const schedule = await harness.execute("scheduleCreate", { ...draft, approval });
+  assert.equal(schedule.id, approval.scheduleId);
+  assert.equal(schedule.approval.pattern, approval.pattern);
+  assert.equal(Object.hasOwn(schedule, "unattendedApproved"), false);
+
+  await assert.rejects(
+    () => harness.execute("scheduleUpdate", { id: schedule.id, recurrence: { kind: "daily", hour: 10, minute: 0 } }),
+    /dedicated.*approval|approval.*required/iu
+  );
+  const update = { id: schedule.id, notify: "always" };
+  const updatedApproval = await harness.execute("scheduleApprovalPreview", update);
+  const updated = await harness.execute("scheduleUpdate", { ...update, approval: updatedApproval });
+  assert.notEqual(updated.approval.pattern, approval.pattern);
+});
+
+test("schedule creation approval is single-use and cannot overwrite history", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  const schedule = await harness.execute("scheduleCreate", { ...draft, approval });
+  state.local.opencodeSchedules.schedules[0].history.push({
+    id: "history-a", finishedAt: "2026-01-01T00:00:01.000Z", ok: true,
+    startedAt: "2026-01-01T00:00:00.000Z", trigger: "manual"
+  });
+  const alarmCreates = harness.calls.alarmsCreate.length;
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, name: "Overwrite", approval }),
+    /single-use|must not replace|already consumed|stale/iu
+  );
+  assert.equal(state.local.opencodeSchedules.schedules[0].id, schedule.id);
+  assert.equal(state.local.opencodeSchedules.schedules[0].name, schedule.name);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 1);
+  assert.equal(harness.calls.alarmsCreate.length, alarmCreates);
+
+  await harness.execute("scheduleDelete", { id: schedule.id });
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /already consumed|stale/iu
+  );
+});
+
+test("approved schedule create and manual run-now completes successfully", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const result = await harness.execute("scheduleRunNow", { id: schedule.id });
+  assert.equal(result.ok, true);
+  assert.equal(result.trigger, "manual");
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 1);
+});
+
+test("scheduled workflows reject incognito tabs and recycled managed-tab identities before effects", async () => {
+  const state = managedScheduleState([{ method: "activateTab", params: { tabId: 7 } }]);
+  let incognito = false;
+  let effects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ active: true, id: tabId, incognito, url: "https://example.com/app", windowId: 1 }),
+    windowsUpdate: async (windowId) => { effects += 1; return { id: windowId }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  incognito = true;
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal(effects, 0);
+
+  incognito = false;
+  state.session.opencodeTabLeases["7"].leaseId = "lease-recycled";
+  await harness.reloadTabLeases();
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal(effects, 0);
+});
+
+test("scheduled workflows reject a deleted and reimported workflow with the same id", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.screenshots", "browser.tabs", "browser.windows"];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).at(-1).ok, false);
+});
+
+test("manual schedule cancellation reaches workflow playback and starts no later effect", async () => {
+  const state = managedScheduleState([
+    { method: "activateTab", params: { tabId: 7 } },
+    { method: "activateTab", params: { tabId: 8 } }
+  ]);
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.tabs", "browser.windows"];
+  state.session.opencodeTabLeases["8"] = {
+    ...state.session.opencodeTabLeases["7"], leaseId: "lease-b", tabId: 8
+  };
+  let release;
+  let started;
+  const firstEffectStarted = new Promise((resolve) => { started = resolve; });
+  const firstEffectBlocked = new Promise((resolve) => { release = resolve; });
+  let windowEffects = 0;
+  let tabEffects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => {
+      windowEffects += 1;
+      started();
+      await firstEffectBlocked;
+      return { id: windowId };
+    },
+    tabsUpdate: async (tabId) => { tabEffects += 1; return { active: true, id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const controller = new AbortController();
+  const run = harness.execute("scheduleRunNow", { id: schedule.id }, { signal: controller.signal });
+  await firstEffectStarted;
+  controller.abort(new Error("manual schedule cancelled"));
+  release();
+  await assert.rejects(run, /manual schedule cancelled/u);
+  assert.equal(windowEffects, 1);
+  assert.equal(tabEffects, 0);
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 0);
+});
+
+test("failed alarm creation leaves a durable create journal that restart commits", async () => {
+  const state = managedScheduleState();
+  let failCreate = true;
+  const harness = createBackgroundHarness({
+    alarmsCreate: async () => { if (failCreate) throw new Error("alarm create failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  await assert.rejects(() => harness.execute("scheduleCreate", { ...draft, approval }), /alarm create failed/u);
+  assert.equal(state.local.opencodeSchedules.schedules.length, 0);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /pending schedule alarm transition/iu
+  );
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  failCreate = false;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.schedules.length, 1);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, approval }),
+    /already consumed|stale/iu
+  );
+});
+
+test("failed alarm clear keeps the prior enabled schedule until restart commits disable", async () => {
+  const state = managedScheduleState();
+  let failClear = false;
+  const harness = createBackgroundHarness({
+    alarmsClear: async () => { if (failClear) throw new Error("alarm clear failed"); return true; },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const update = { id: schedule.id, enabled: false };
+  const approval = await harness.execute("scheduleApprovalPreview", update);
+  failClear = true;
+  await assert.rejects(() => harness.execute("scheduleUpdate", { ...update, approval }), /alarm clear failed/u);
+  assert.equal(state.local.opencodeSchedules.schedules[0].enabled, true);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  failClear = false;
+  await assert.rejects(
+    () => harness.execute("scheduleUpdate", { ...update, approval }),
+    /pending schedule alarm transition/iu
+  );
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.schedules[0].enabled, false);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+});
+
+test("failed completion rearm journals the completed history and restart arms it once", async () => {
+  const state = managedScheduleState();
+  let failCreate = false;
+  const harness = createBackgroundHarness({
+    alarmsCreate: async () => { if (failCreate) throw new Error("completion rearm failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  failCreate = true;
+  await harness.events.alarmsOnAlarm.emit({
+    name: `opencode-workflow-schedule:${schedule.id}`,
+    scheduledTime: schedule.nextRunAt
+  });
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 0);
+  failCreate = false;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 1);
+});
+
+test("restart converts a claimed alarm into one sanitized interrupted audit entry without replay", async () => {
+  const state = managedScheduleState();
+  let effects = 0;
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    windowsUpdate: async (windowId) => { effects += 1; return { id: windowId }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  state.local.opencodeSchedules.schedules[0].executionClaim = {
+    executionId: "execution-a", phase: "workflow", scheduledFor: schedule.nextRunAt,
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+  await harness.events.runtimeOnStartup.emit();
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].executionId, "execution-a");
+  assert.equal(history[0].phase, "workflow");
+  assert.equal(history[0].status, "interrupted");
+  assert.equal(effects, 0);
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 1);
+});
+
+test("service-worker module load reconciles a durable alarm journal without runtime startup", async () => {
+  const state = managedScheduleState();
+  const first = createBackgroundHarness({
+    alarmsCreate: async () => { throw new Error("alarm create failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await first.execute("scheduleApprovalPreview", draft);
+  await assert.rejects(() => first.execute("scheduleCreate", { ...draft, approval }), /alarm create failed/u);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+
+  let rearmed = 0;
+  const reloaded = createBackgroundHarness({
+    alarmsCreate: async () => { rearmed += 1; },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  await reloaded.waitForScheduleRestore();
+  assert.equal(rearmed, 1);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  assert.equal(state.local.opencodeSchedules.schedules.length, 1);
+});
+
+test("schedules create named alarms, restore them, and deduplicate one occurrence", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft({
+    enabled: true, name: "Daily workflow", notify: "success",
+    recurrence: { kind: "daily", hour: 9, minute: 30 }
+  });
+  const schedule = await createApprovedSchedule(harness, draft);
+  assert.match(harness.calls.alarmsCreate[0].name, /^opencode-workflow-schedule:/u);
+  assert.equal(harness.calls.alarmsCreate[0].info.when, schedule.nextRunAt);
+
+  state.local.opencodeSchedules.schedules[0].lastScheduledFor = schedule.nextRunAt;
+  harness.calls.alarmsCreate.length = 0;
+  await harness.events.runtimeOnStartup.emit();
+  assert.equal(harness.calls.alarmsCreate.length, 1);
+  assert.ok(harness.calls.alarmsCreate[0].info.when > schedule.nextRunAt);
+  const restored = (await harness.execute("scheduleList"))[0];
+  assert.equal(restored.nextRunAt, harness.calls.alarmsCreate[0].info.when);
+  assert.equal(restored.historyCount, 0);
+  state.local.opencodeSchedules.schedules[0].lastScheduledFor = null;
+  state.local.opencodeSchedules.schedules[0].nextRunAt = schedule.nextRunAt;
+  await harness.events.alarmsOnAlarm.emit({
+    name: `opencode-workflow-schedule:${schedule.id}`,
+    scheduledTime: schedule.nextRunAt - 60_000
+  });
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 0);
+  const alarm = { name: `opencode-workflow-schedule:${schedule.id}`, scheduledTime: schedule.nextRunAt };
+  await Promise.all([harness.events.alarmsOnAlarm.emit(alarm), harness.events.alarmsOnAlarm.emit(alarm)]);
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].ok, true);
+  assert.equal(harness.calls.notifications.length, 1);
+});
+
+test("scheduled execution fails closed and sanitizes bounded history and notifications", async () => {
+  const state = managedScheduleState();
+  let currentUrl = "https://example.com/app";
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => {
+      if (currentUrl === "throw") throw new Error("locked https://private.example/?token=top-secret");
+      return { active: true, id: tabId, url: currentUrl, windowId: 1 };
+    }
+  });
+  const schedule = await createApprovedSchedule(harness, scheduleDraft({
+    enabled: true, name: "Locked workflow", notify: "failure",
+    recurrence: { kind: "weekly", weekday: 1, hour: 8, minute: 0 }
+  }));
+
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "screenshot", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.screenshots", "browser.tabs", "browser.windows"];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  state.local.opencodeWorkflows.workflows[0].steps = [{ method: "getTab", params: { tabId: 7 } }];
+  state.local.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.tabs"];
+  currentUrl = "https://changed.example/app";
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  currentUrl = "chrome://settings";
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  currentUrl = "throw";
+  for (let index = 0; index < 55; index += 1) {
+    assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  }
+  const history = await harness.execute("scheduleHistory", { id: schedule.id });
+  assert.equal(history.length, 50);
+  assert.equal(JSON.stringify(history).includes("top-secret"), false);
+  assert.equal(JSON.stringify(history).includes("private.example"), false);
+  assert.ok(harness.calls.notifications.length >= 1);
+
+  const originalPattern = state.local.opencodeSchedules.schedules[0].approval.pattern;
+  state.local.opencodeSchedules.schedules[0].approval.pattern = `v1:${"d".repeat(64)}`;
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+  state.local.opencodeSchedules.schedules[0].approval.pattern = originalPattern;
+  state.local.opencodeWorkflows.workflows = [];
+  assert.equal((await harness.execute("scheduleRunNow", { id: schedule.id })).ok, false);
+});
+
+function webMcpMainWorld({ bootstrapPoison = null, cleanRealmAvailable = true, documentContext, navigatorContext, onRun, pageSetup, trustPageSetupContext = false } = {}) {
+  let framesCreated = 0;
+  let framesRemoved = 0;
+  const listeners = new WeakMap();
+  const officialContexts = new WeakMap();
+  const officialMethods = new WeakSet();
+  const frameStates = new WeakMap();
+  class CleanEvent {
+    constructor(type) { this.type = type; }
+  }
+  class CleanEventTarget {
+    addEventListener(type, listener) {
+      let byType = listeners.get(this);
+      if (!byType) { byType = new Map(); listeners.set(this, byType); }
+      let values = byType.get(type);
+      if (!values) { values = new Set(); byType.set(type, values); }
+      values.add(listener);
+    }
+    removeEventListener(type, listener) { listeners.get(this)?.get(type)?.delete(listener); }
+    dispatchEvent(event) {
+      for (const listener of [...(listeners.get(this)?.get(event.type) ?? [])]) listener.call(this, event);
+      return true;
+    }
+  }
+  class CleanElement {
+    remove() {
+      const state = frameStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      if (!state.removed) { state.removed = true; framesRemoved += 1; }
+    }
+  }
+  class CleanModelContext {}
+  Object.defineProperties(CleanModelContext.prototype, {
+    getTools: { configurable: true, enumerable: true, writable: true, value: function getTools() {
+      const implementation = officialContexts.get(this);
+      if (!implementation) throw new TypeError("Illegal invocation");
+      if (typeof implementation.getTools !== "function") {
+        const error = new Error("Discovery unsupported");
+        error.code = "WEBMCP_DISCOVERY_UNSUPPORTED";
+        throw error;
+      }
+      return implementation.getTools.call(this);
+    } },
+    executeTool: { configurable: true, enumerable: true, writable: true, value: function executeTool(descriptor, inputJson, options) {
+      const implementation = officialContexts.get(this);
+      if (!implementation) throw new TypeError("Illegal invocation");
+      if (typeof implementation.executeTool !== "function") {
+        const error = new Error("Invocation unsupported");
+        error.code = "WEBMCP_INVOCATION_UNSUPPORTED";
+        throw error;
+      }
+      return implementation.executeTool.call(this, descriptor, inputJson, options);
+    } }
+  });
+  officialMethods.add(CleanModelContext.prototype.getTools);
+  officialMethods.add(CleanModelContext.prototype.executeTool);
+  const cleanContext = vm.createContext({
+    __officialMethods: officialMethods,
+    AbortController,
+    clearTimeout,
+    document: {},
+    Element: CleanElement,
+    Event: CleanEvent,
+    EventTarget: CleanEventTarget,
+    setTimeout
+  });
+  vm.runInContext(`
+    const nativeToString = Function.prototype.toString;
+    Function.prototype.toString = function toString() {
+      if (__officialMethods.has(this)) {
+        return this.name === "getTools"
+          ? "function getTools() { [native code] }"
+          : "function executeTool() { [native code] }";
+      }
+      return Reflect.apply(nativeToString, this, []);
+    };
+  `, cleanContext);
+  const cleanRealm = vm.runInContext("globalThis", cleanContext);
+  const makeOfficialContext = (implementation) => {
+    if (!implementation || typeof implementation !== "object") return implementation;
+    const context = Object.create(CleanModelContext.prototype);
+    officialContexts.set(context, implementation);
+    return context;
+  };
+  const officialDocumentContext = makeOfficialContext(documentContext);
+  const officialNavigatorContext = makeOfficialContext(navigatorContext);
+  class PageFrame extends CleanElement {}
+  Object.defineProperty(PageFrame.prototype, "contentWindow", {
+    configurable: true,
+    get() { return frameStates.get(this)?.contentWindow ?? null; }
+  });
+  class PageDocument {
+    createElement(tagName) {
+    assert.equal(tagName, "iframe");
+    framesCreated += 1;
+    const frame = new PageFrame();
+    frame.hidden = false;
+    frame.setAttribute = () => {};
+    frameStates.set(frame, { contentWindow: cleanRealmAvailable ? cleanRealm : null, removed: false });
+    if (bootstrapPoison === "contentWindow") {
+      const value = frame.contentWindow;
+      Object.defineProperty(frame, "contentWindow", { configurable: true, get: () => value });
+    }
+    if (bootstrapPoison === "remove") {
+      const nativeRemove = frame.remove;
+      frame.remove = function replacedRemove() { return nativeRemove.call(this); };
+    }
+    return frame;
+    }
+  }
+  class PageNode {
+    appendChild(frame) { return frame; }
+  }
+  const documentMock = new PageDocument();
+  if (documentContext !== undefined) documentMock.modelContext = officialDocumentContext;
+  const nativeCreateElement = documentMock.createElement;
+  if (bootstrapPoison === "createElement") {
+    documentMock.createElement = function replacedCreateElement(...args) { return nativeCreateElement.apply(this, args); };
+  }
+  documentMock.documentElement = new PageNode();
+  const nativeAppendChild = documentMock.documentElement.appendChild;
+  if (["appendChild", "retain", "mutationObserver"].includes(bootstrapPoison)) {
+    documentMock.documentElement.appendChild = function replacedAppendChild(frame) {
+      if (bootstrapPoison === "retain") globalThis.__retainedWebMcpFrame = frame;
+      if (bootstrapPoison === "mutationObserver") {
+        Promise.resolve().then(() => {
+          globalThis.__retainedWebMcpFrame = frame;
+          frame.contentWindow.Object = { create() { throw new Error("retained frame tamper"); } };
+        });
+      }
+      return nativeAppendChild.call(this, frame);
+    };
+  }
+  const page = vm.createContext({
+    AbortController,
+    clearTimeout,
+    document: documentMock,
+    navigator: navigatorContext === undefined ? {} : { modelContext: officialNavigatorContext },
+    setTimeout
+  });
+  if (typeof pageSetup === "string") vm.runInContext(pageSetup, page);
+  if (trustPageSetupContext && page.document?.modelContext) {
+    page.document.modelContext = makeOfficialContext(page.document.modelContext);
+  }
+  const isolatedDocument = documentContext === undefined ? {} : { modelContext: officialDocumentContext };
+  const isolated = vm.createContext({
+    AbortController,
+    addEventListener: CleanEventTarget.prototype.addEventListener,
+    clearTimeout,
+    dispatchEvent: CleanEventTarget.prototype.dispatchEvent,
+    document: isolatedDocument,
+    Event: CleanEvent,
+    EventTarget: CleanEventTarget,
+    navigator: navigatorContext === undefined ? {} : { modelContext: officialNavigatorContext },
+    removeEventListener: CleanEventTarget.prototype.removeEventListener,
+    setTimeout
+  });
+  const execute = async (details) => {
+    assert.equal(details.world, "ISOLATED");
+    assert.equal(Array.isArray(details.files), false);
+    onRun?.();
+    const injected = vm.runInContext(`(${details.func.toString()})`, isolated);
+    return [{ result: await injected(...(details.args ?? [])) }];
+  };
+  execute.page = page;
+  execute.setOfficialDocumentContext = (context) => {
+    isolatedDocument.modelContext = makeOfficialContext(context);
+  };
+  Object.defineProperties(execute, {
+    framesCreated: { get: () => framesCreated },
+    framesRemoved: { get: () => framesRemoved }
+  });
+  return execute;
+}
+
+function webMcpEnvelope(method, params, origin = "https://example.com:443/") {
+  return {
+    expectedBindings: [pageBinding(7, origin)],
+    expectedScopes: [origin],
+    method,
+    params: { tabId: 7, ...params }
+  };
+}
+
+test("WebMCP list reports unsupported page and unsupported discovery shape structurally", async () => {
+  for (const [documentContext, expectedCode] of [[undefined, "WEBMCP_UNSUPPORTED"], [{}, "WEBMCP_DISCOVERY_UNSUPPORTED"]]) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext }) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, false);
+    assert.equal(result.error.code, expectedCode);
+    assert.equal(result.tools.length, 0);
+  }
+});
+
+test("WebMCP list supports documented getTools on document and deprecated navigator alias", async () => {
+  const variants = [
+    { source: "document", documentContext: { getTools: async () => [{ name: "cart.add", description: "Add item", inputSchema: { type: "object" } }] } },
+    { source: "navigator", navigatorContext: { getTools: async () => [{ name: "cart.remove", description: "Remove item", inputSchema: { type: "object" } }] } }
+  ];
+  for (const variant of variants) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld(variant) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, true);
+    assert.equal(result.source, variant.source);
+    assert.equal(result.tools.length, 1);
+    assert.match(result.tools[0].name, /^cart\./u);
+    assert.equal(typeof result.tools[0].inputSchema, "object");
+  }
+});
+
+test("WebMCP rejects speculative discovery variants", async () => {
+  for (const context of [{ listTools: async () => [] }, { tools: [] }]) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: context }) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {}));
+    assert.equal(result.supported, false);
+    assert.equal(result.error.code, "WEBMCP_DISCOVERY_UNSUPPORTED");
+  }
+});
+
+test("WebMCP list rejects duplicate, unserializable, and oversized page tool metadata", async () => {
+  const cycle = {};
+  cycle.self = cycle;
+  const cases = [
+    [{ name: "duplicate", description: "a" }, { name: "duplicate", description: "b" }],
+    [{ name: "bad space", description: "bad" }],
+    [{ name: "cycle", description: "bad", inputSchema: cycle }],
+    Array.from({ length: 101 }, (_, index) => ({ name: `tool-${index}`, description: "x" })),
+    [{ name: "huge", description: "x".repeat(2001) }]
+  ];
+  for (const tools of cases) {
+    const harness = createBackgroundHarness({
+      scriptingExecuteScript: webMcpMainWorld({ documentContext: { getTools: async () => tools } })
+    });
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpList", {})),
+      /WebMCP.*(?:invalid|bounded|duplicate|serializ|large|name|description)/iu
+    );
+  }
+});
+
+test("WebMCP invoke uses the exact discovered descriptor, JSON input string, and AbortSignal", async () => {
+  const invocations = [];
+  const documentDescriptor = { name: "cart.add", description: "Add" };
+  const navigatorDescriptor = { name: "cart.add", description: "Add" };
+  const variants = [
+    { documentContext: {
+      getTools: async () => [documentDescriptor],
+      executeTool: async (descriptor, inputJson, options) => {
+        invocations.push([descriptor, inputJson, options]);
+        return { received: JSON.parse(inputJson) };
+      }
+    } },
+    { navigatorContext: {
+      getTools: async () => [navigatorDescriptor],
+      executeTool: async (descriptor, inputJson, options) => {
+        invocations.push([descriptor, inputJson, options]);
+        return { received: JSON.parse(inputJson) };
+      }
+    } }
+  ];
+  for (const variant of variants) {
+    const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld(variant) });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+      input: { sku: "A1" }, timeoutMs: 1000, toolName: "cart.add"
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(result.toolName, "cart.add");
+    assert.equal(result.result.received.sku, "A1");
+  }
+  assert.equal(invocations[0][0], documentDescriptor);
+  assert.equal(invocations[1][0], navigatorDescriptor);
+  assert.equal(typeof invocations[0][1], "string");
+  assert.deepEqual(JSON.parse(invocations[0][1]), { sku: "A1" });
+  assert.equal(invocations[0][2].signal instanceof AbortSignal, true);
+});
+
+test("WebMCP invoke returns bounded structured page errors and lets committed work settle", async () => {
+  const thrown = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "explode", description: "Explode" }],
+    executeTool: async () => { throw new Error("page exploded token=secret"); }
+  } }) });
+  const thrownResult = await thrown.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1000, toolName: "explode"
+  }));
+  assert.equal(thrownResult.ok, false);
+  assert.equal(thrownResult.error.code, "WEBMCP_TOOL_ERROR");
+  assert.equal(thrownResult.error.message.includes("secret"), false);
+
+  const timed = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "wait", description: "Wait" }],
+    executeTool: async () => new Promise((resolve) => setTimeout(() => resolve({ settled: true }), 70))
+  } }) });
+  const timedResult = await timed.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "wait"
+  }));
+  assert.equal(timedResult.ok, true);
+  assert.equal(JSON.stringify(timedResult.result), '{"settled":true}');
+});
+
+test("WebMCP invoke rejects invalid inputs and page outputs without lossy serialization", async () => {
+  let pageRuns = 0;
+  const context = {
+    getTools: async () => [{ name: "echo", description: "Echo" }],
+    executeTool: async (_descriptor, inputJson) => JSON.parse(inputJson)
+  };
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: webMcpMainWorld({ documentContext: context, onRun: () => { pageRuns += 1; } })
+  });
+  const cycle = {};
+  cycle.self = cycle;
+  for (const input of [cycle, { value: () => 1 }, { value: 1n }, { value: "x".repeat(70_000) }]) {
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input, timeoutMs: 1000, toolName: "echo" })),
+      /WebMCP input.*(?:JSON|serializ|large|bounded)/iu
+    );
+  }
+  assert.equal(pageRuns, 0);
+
+  const badOutputs = [() => 1, (() => { const value = {}; value.self = value; return value; })(), "x".repeat(600_000)];
+  for (const output of badOutputs) {
+    const outputHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "bad", description: "Bad" }], executeTool: async () => output
+    } }) });
+    const result = await outputHarness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+      input: {}, timeoutMs: 1000, toolName: "bad"
+    }));
+    assert.equal(result.ok, false);
+    assert.match(result.error.code, /^WEBMCP_OUTPUT_/u);
+  }
+});
+
+test("WebMCP committed invocation preserves output after cancellation and rejects navigation races", async () => {
+  let currentUrl = "https://example.com";
+  let release;
+  let started;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const began = new Promise((resolve) => { started = resolve; });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "slow", description: "Slow" }],
+      executeTool: async () => { started(); await pending; return { done: true }; }
+    } })
+  });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1000, toolName: "slow"
+  }), { signal: controller.signal });
+  const reachedPage = await Promise.race([
+    began.then(() => true),
+    run.then(() => false, () => false),
+    new Promise((resolve) => setTimeout(() => resolve(false), 500))
+  ]);
+  assert.equal(reachedPage, true, "WebMCP invocation must reach the page without hanging the test");
+  controller.abort(new Error("cancel WebMCP"));
+  release();
+  assert.equal(JSON.stringify((await run).result), '{"done":true}');
+
+  currentUrl = "https://example.com";
+  const navigated = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    scriptingExecuteScript: webMcpMainWorld({
+      documentContext: { getTools: async () => [{ name: "go", description: "Go" }], executeTool: async () => ({ done: true }) },
+      onRun: () => { currentUrl = "https://attacker.example/"; }
+    })
+  });
+  await assert.rejects(
+    () => navigated.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input: {}, timeoutMs: 1000, toolName: "go" })),
+    /scope.*changed|not authorized|document/iu
+  );
+});
+
+test("WebMCP exact-document dispatch never runs getTools in a raced destination document", async () => {
+  let currentUrl = "https://a.example/app";
+  let documentId = "document-a";
+  let destinationEffects = 0;
+  const destination = webMcpMainWorld({ documentContext: {
+    getTools: async () => { destinationEffects += 1; return []; }
+  } });
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: currentUrl, windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId, frameId: 0 }),
+    scriptingExecuteScript: async (details) => {
+      currentUrl = "https://b.example/app";
+      documentId = "document-b";
+      if (Array.isArray(details.target.documentIds) && !details.target.documentIds.includes(documentId)) {
+        throw new Error("The exact approved document no longer exists");
+      }
+      return destination(details);
+    }
+  });
+  await assert.rejects(
+    () => harness.execute("scopedCommand", {
+      expectedBindings: [pageBinding(7, "https://a.example:443/app", "document-a")],
+      expectedScopes: ["https://a.example:443/app"],
+      method: "webMcpList",
+      params: { tabId: 7 }
+    }),
+    /document|scope|authorized/iu
+  );
+  assert.equal(destinationEffects, 0);
+});
+
+test("WebMCP external cancellation after commit does not abort the page tool", async () => {
+  let effects = 0;
+  let started;
+  const began = new Promise((resolve) => { started = resolve; });
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "slow", description: "Slow" }],
+    executeTool: async (_name, _input, options) => new Promise((resolve) => {
+      started();
+      const timer = setTimeout(() => { effects += 1; resolve({ late: true }); }, 80);
+      options?.signal?.addEventListener("abort", () => clearTimeout(timer), { once: true });
+    })
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "slow"
+  }), { signal: controller.signal });
+  await began;
+  controller.abort(new Error("cancel exact WebMCP"));
+  assert.equal(JSON.stringify((await run).result), '{"late":true}');
+  assert.equal(effects, 1);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP cancellation during discovery never starts the page tool and leaves no global abort state", async () => {
+  let releaseDiscovery;
+  let discoveryStarted;
+  let effects = 0;
+  const discoveryGate = new Promise((resolve) => { releaseDiscovery = resolve; });
+  const began = new Promise((resolve) => { discoveryStarted = resolve; });
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => { discoveryStarted(); await discoveryGate; return [{ name: "late", description: "Late" }]; },
+    executeTool: async () => { effects += 1; return { late: true }; }
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "late"
+  }), { signal: controller.signal });
+  await began;
+  controller.abort(new Error("cancel during discovery"));
+  releaseDiscovery();
+  await assert.rejects(run, /cancel during discovery/u);
+  assert.equal(effects, 0);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP cancellation observed after prepare but before service-worker commit has zero effects", async () => {
+  let effects = 0;
+  const controller = new AbortController();
+  const isolated = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "race", description: "Race" }],
+    executeTool: async () => { effects += 1; return { raced: true }; }
+  } });
+  const harness = createBackgroundHarness({
+    scriptingExecuteScript: async (details) => {
+      const result = await isolated(details);
+      if (details.args?.[0] === "prepare") controller.abort(new Error("abort before atomic commit"));
+      return result;
+    }
+  });
+  await assert.rejects(() => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "race"
+  }), { signal: controller.signal }), /abort before atomic commit/u);
+  assert.equal(effects, 0);
+});
+
+test("queued same-tab WebMCP invoke expires before commit while the committed barrier remains held", async () => {
+  let release;
+  let effects = 0;
+  const isolated = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "serial", description: "Serial" }],
+    executeTool: async () => { effects += 1; return new Promise((resolve) => { release = resolve; }); }
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: isolated });
+  const first = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "serial"
+  }));
+  while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+  await assert.rejects(() => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "serial"
+  })), /abort|timeout|deadline/iu);
+  assert.equal(effects, 1);
+  release({ done: true });
+  await first;
+});
+
+test("WebMCP admission timeout after discovery has zero tool effects", async () => {
+  let effects = 0;
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); return [{ name: "timeout", description: "Timeout" }]; },
+    executeTool: async () => { effects += 1; return { late: true }; }
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "timeout"
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_DISCOVERY_TIMEOUT");
+  assert.equal(effects, 0);
+  assert.equal(mainWorld.page.__opencodeWebMcpInvocationRegistryV1, undefined);
+});
+
+test("WebMCP input rejects accessors, exotic records, and ambiguous keys without reading them", async () => {
+  let getterReads = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "secret", { enumerable: true, get() { getterReads += 1; return "read"; } });
+  const dangerous = {};
+  Object.defineProperty(dangerous, "__proto__", { enumerable: true, value: "ambiguous" });
+  const symbolKey = {};
+  symbolKey[Symbol("hidden")] = "ambiguous";
+  const nonEnumerable = {};
+  Object.defineProperty(nonEnumerable, "hidden", { value: "ambiguous" });
+  const decoratedArray = [1];
+  decoratedArray.extra = 2;
+  class CustomRecord { constructor() { this.value = 1; } }
+  let deep = {};
+  for (let index = 0; index < 22; index += 1) deep = { child: deep };
+  const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "echo", description: "Echo" }],
+    executeTool: async (_descriptor, inputJson) => JSON.parse(inputJson)
+  } }) });
+  for (const input of [accessor, new Date(), new Map([["a", 1]]), new CustomRecord(), dangerous,
+    { constructor: "ambiguous" }, { prototype: "ambiguous" },
+    { ["k".repeat(1_001)]: 1 }, deep, Array.from({ length: 5_001 }, () => 0), { value: Symbol("bad") },
+    symbolKey, nonEnumerable, decoratedArray]) {
+    await assert.rejects(
+      () => harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", { input, timeoutMs: 1_000, toolName: "echo" })),
+      /WebMCP input.*(?:plain|accessor|ambiguous|JSON|serializ|large|bounded|symbol|hidden)/iu
+    );
+  }
+  assert.equal(getterReads, 0);
+
+  const nullRecord = Object.create(null);
+  nullRecord.safe = [1, "two"];
+  const accepted = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: nullRecord, timeoutMs: 1_000, toolName: "echo"
+  }));
+  assert.equal(JSON.stringify(accepted.result), '{"safe":[1,"two"]}');
+});
+
+test("WebMCP output and metadata reject accessors and non-plain objects without invoking getters", async () => {
+  let outputGetterReads = 0;
+  const accessorOutput = {};
+  Object.defineProperty(accessorOutput, "secret", { enumerable: true, get() { outputGetterReads += 1; return "read"; } });
+  const outputHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "bad", description: "Bad" }],
+    executeTool: async () => accessorOutput
+  } }) });
+  const result = await outputHarness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "bad"
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_OUTPUT_INVALID");
+  assert.equal(outputGetterReads, 0);
+
+  for (const inputSchema of [new Date(), new Map(), Object.create({ inherited: true })]) {
+    const listHarness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+      getTools: async () => [{ name: "bad-schema", description: "Bad", inputSchema }]
+    } }) });
+    await assert.rejects(
+      () => listHarness.execute("scopedCommand", webMcpEnvelope("webMcpList", {})),
+      /WebMCP.*(?:plain|schema|invalid)/iu
+    );
+  }
+});
+
+test("WebMCP isolated-world intrinsics ignore page-global monkeypatches", async () => {
+  const mainWorld = webMcpMainWorld({
+    documentContext: {
+      async getTools() { return [{ name: "safe", description: "Safe", inputSchema: { type: "object" } }]; },
+      async executeTool(descriptor, inputJson, { signal }) { return { name: descriptor.name, input: JSON.parse(inputJson), aborted: signal.aborted }; }
+    },
+    pageSetup: `
+      globalThis.AbortController = function PoisonAbort() { throw new Error("poison AbortController"); };
+      globalThis.JSON = { parse() { throw new Error("poison JSON.parse"); }, stringify() { throw new Error("poison JSON.stringify"); } };
+      globalThis.Object = { create() { throw new Error("poison Object"); } };
+      globalThis.Promise = { race() { throw new Error("poison Promise.race"); } };
+      globalThis.setTimeout = () => { throw new Error("poison setTimeout"); };
+    `
+  });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: { value: 1 }, timeoutMs: 1_000, toolName: "safe"
+  }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(JSON.stringify(result.result), '{"name":"safe","input":{"value":1},"aborted":false}');
+});
+
+test("WebMCP discovery hard deadline returns structurally and releases the scoped barrier", async () => {
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => new Promise(() => {})
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const outcome = await Promise.race([
+    harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 50 }))
+      .catch((error) => ({ threw: error.message })),
+    new Promise((resolve) => setTimeout(() => resolve("still-pending"), 400))
+  ]);
+  assert.notEqual(outcome, "still-pending");
+  assert.equal(outcome.error?.code, "WEBMCP_DISCOVERY_TIMEOUT");
+
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
+  const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+  assert.equal(followup.supported, true);
+});
+
+test("WebMCP committed execution ignores cancellation and deadline until natural success", async () => {
+  let releaseExecution;
+  let executionSignal;
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "stuck", description: "Stuck" }],
+    executeTool: async (_descriptor, _inputJson, { signal }) => {
+      executionSignal = signal;
+      return new Promise((resolve) => { releaseExecution = resolve; });
+    }
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  let settled = false;
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "stuck"
+  }), { signal: controller.signal }).finally(() => { settled = true; });
+  while (!releaseExecution) await new Promise((resolve) => setTimeout(resolve, 1));
+  controller.abort(new Error("client disconnected after commit"));
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(settled, false);
+  assert.equal(executionSignal.aborted, false);
+  releaseExecution({ stopped: true });
+  const outcome = await run;
+  assert.equal(outcome.ok, true);
+  assert.equal(JSON.stringify(outcome.result), '{"stopped":true}');
+
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
+  const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+  assert.equal(followup.supported, true);
+});
+
+test("WebMCP enforces output limits by incremental UTF-8 bytes", async () => {
+  const harness = createBackgroundHarness({ scriptingExecuteScript: webMcpMainWorld({ documentContext: {
+    getTools: async () => [{ name: "multibyte", description: "Multibyte" }],
+    executeTool: async () => "é".repeat(300_000)
+  } }) });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "multibyte"
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_OUTPUT_TOO_LARGE");
+});
+
+test("WebMCP committed execution ignores cancellation until natural rejection and then cleans up", async () => {
+  let rejectExecution;
+  let executionSignal;
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    async getTools() { return [{ name: "slow", description: "Slow" }]; },
+    async executeTool(_descriptor, _inputJson, { signal }) {
+      executionSignal = signal;
+      return new Promise((_resolve, reject) => { rejectExecution = reject; });
+    }
+  } });
+  const controller = new AbortController();
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 1_000, toolName: "slow"
+  }), { signal: controller.signal });
+  while (!rejectExecution) await new Promise((resolve) => setTimeout(resolve, 1));
+  controller.abort(new Error("hidden-channel abort"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(executionSignal.aborted, false);
+  rejectExecution(new Error("natural page rejection"));
+  const result = await run;
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_TOOL_ERROR");
+  assert.match(result.error.message, /natural page rejection/u);
+  const exposedKeys = Reflect.ownKeys(mainWorld.page)
+    .filter((key) => typeof key === "string" && /opencode.*webmcp/i.test(key));
+  assert.deepEqual(exposedKeys, []);
+  mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
+  assert.equal((await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }))).supported, true);
+});
+
+test("WebMCP isolated execution ignores pre-poisoned MAIN globals", async () => {
+  let callbacks = 0;
+  const mainWorld = webMcpMainWorld({
+    documentContext: { getTools: async () => { callbacks += 1; return []; } },
+    pageSetup: `
+      globalThis.AbortController = function PoisonAbort() { throw new Error("poison AbortController"); };
+      globalThis.Promise = { resolve() { throw new Error("poison Promise"); } };
+      globalThis.Object = { create() { throw new Error("poison Object"); } };
+      globalThis.Reflect = { apply() { throw new Error("poison Reflect"); } };
+      globalThis.Set = function PoisonSet() { throw new Error("poison Set"); };
+      globalThis.setTimeout = () => { throw new Error("poison setTimeout"); };
+    `
+  });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+  assert.equal(result.supported, true);
+  assert.equal(callbacks, 1);
+  assert.equal(mainWorld.framesCreated, 0);
+});
+
+test("WebMCP does not require a page-created clean realm", async () => {
+  let callbacks = 0;
+  const mainWorld = webMcpMainWorld({
+    cleanRealmAvailable: false,
+    documentContext: { getTools: async () => { callbacks += 1; return []; } }
+  });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+  assert.equal(result.supported, true);
+  assert.equal(callbacks, 1);
+  assert.equal(mainWorld.framesCreated, 0);
+});
+
+test("WebMCP deadline is admission-only once execution commits", async () => {
+  const startedAt = Date.now();
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    getTools: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      return [{ name: "budget", description: "Budget" }];
+    },
+    executeTool: async (_descriptor, _inputJson, { signal }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ tooLate: true }), 35);
+      signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+    })
+  } });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "budget"
+  }));
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.ok, true);
+  assert.equal(JSON.stringify(result.result), '{"tooLate":true}');
+  assert.ok(elapsed >= 60, `committed execution must settle naturally (${elapsed}ms)`);
+});
+
+test("WebMCP rejects monkeypatched noncooperative methods before any delayed side effect", async () => {
+  const mainWorld = webMcpMainWorld({ pageSetup: `
+    globalThis.hostileCallbacks = 0;
+    globalThis.hostileEffects = 0;
+    document.modelContext = {
+      async getTools() {
+        globalThis.hostileCallbacks += 1;
+        return [{ name: "hostile", description: "Hostile" }];
+      },
+      async executeTool() {
+        globalThis.hostileCallbacks += 1;
+        return new Promise((resolve) => setTimeout(() => {
+          globalThis.hostileEffects += 1;
+          resolve({ late: true });
+        }, 80));
+      }
+    };
+  ` });
+  const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+  const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "hostile"
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "WEBMCP_UNSUPPORTED");
+  assert.equal(mainWorld.page.hostileCallbacks, 0);
+  assert.equal(mainWorld.page.hostileEffects, 0);
+});
+
+test("WebMCP does not mistake Proxy or bound callables for native modelContext methods", async () => {
+  for (const wrapper of ["proxy", "bound"]) {
+    const mainWorld = webMcpMainWorld({ pageSetup: `
+      globalThis.spoofCallbacks = 0;
+      const implementation = function getTools() {
+        globalThis.spoofCallbacks += 1;
+        return [{ name: "spoof", description: "Spoof" }];
+      };
+      const callable = ${wrapper === "proxy" ? "new Proxy(implementation, {})" : "implementation.bind(null)"};
+      const prototype = Object.create(null);
+      Object.defineProperty(prototype, "getTools", { configurable: true, writable: true, value: callable });
+      document.modelContext = Object.create(prototype);
+    ` });
+    const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+    assert.equal(result.supported, false, wrapper);
+    assert.equal(result.error.code, "WEBMCP_UNSUPPORTED", wrapper);
+    assert.equal(mainWorld.page.spoofCallbacks, 0, wrapper);
+  }
+});
+
+test("WebMCP isolated adapter never touches poisoned page DOM bootstrap hooks", async () => {
+  for (const bootstrapPoison of ["createElement", "appendChild", "contentWindow", "remove", "retain", "mutationObserver"]) {
+    let callbacks = 0;
+    const mainWorld = webMcpMainWorld({
+      bootstrapPoison,
+      documentContext: { getTools: async () => { callbacks += 1; return []; } }
+    });
+    const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
+    const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
+    assert.equal(result.supported, true, bootstrapPoison);
+    assert.equal(callbacks, 1, bootstrapPoison);
+    assert.equal(mainWorld.framesCreated, mainWorld.framesRemoved, bootstrapPoison);
+    assert.equal(mainWorld.framesCreated, 0, bootstrapPoison);
+  }
+});
+
 function createBackgroundHarness({
+  alarmsClear = async () => true,
+  alarmsCreate = async () => {},
+  alarmsGetAll = async () => [],
   storageGet = async () => ({}),
   storageSet = async () => {},
   debuggerAttach = async () => {},
@@ -3943,6 +5768,7 @@ function createBackgroundHarness({
   notificationsCreate = async () => "notification-id",
   scriptingExecuteScript = null,
   storageLocalGet = async () => ({}),
+  storageLocalSet = async () => {},
   storageManagedGet = null,
   tabsCaptureVisibleTab = async () => "data:image/png;base64,iVBORw0KGgo=",
   tabsCreate = async () => ({ active: false, id: 8, index: 0, title: "", url: "about:blank", windowId: 1 }),
@@ -3961,9 +5787,10 @@ function createBackgroundHarness({
   windowsUpdate = async (windowId) => ({ id: windowId }),
   webNavigationGetFrame = async ({ tabId }) => ({ documentId: `document-${tabId}`, frameId: 0 })
 } = {}) {
-  const calls = { debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], notifications: [], overlayMessages: [], sendMessage: 0 };
+  const calls = { alarmsClear: [], alarmsCreate: [], debuggerAttach: [], debuggerCommands: [], debuggerDetach: [], executeScript: 0, nativeMessages: [], notifications: [], overlayMessages: [], sendMessage: 0 };
   let debuggerTargets = [];
   const events = {
+    alarmsOnAlarm: createEvent(),
     debuggerOnDetach: createEvent(),
     debuggerOnEvent: createEvent((args) => {
       if (!fillNetworkProvenance || args[1] !== "Network.requestWillBeSent") return args;
@@ -3977,6 +5804,7 @@ function createBackgroundHarness({
     nativeOnDisconnect: createEvent(),
     nativeOnMessage: createEvent(),
     runtimeOnMessage: createEvent(),
+    runtimeOnStartup: createEvent(),
     tabsOnRemoved: createEvent(),
     tabsOnActivated: createEvent(),
     tabsOnReplaced: createEvent(),
@@ -3995,7 +5823,7 @@ function createBackgroundHarness({
     }
   };
   const storage = {
-    local: { get: storageLocalGet },
+    local: { get: storageLocalGet, set: storageLocalSet },
     session: {
       get: storageGet,
       set: storageSet
@@ -4004,9 +5832,10 @@ function createBackgroundHarness({
   if (storageManagedGet) storage.managed = { get: storageManagedGet };
   const chrome = {
     alarms: {
-      clear: async () => true,
-      create: async () => {},
-      onAlarm: createEvent()
+      clear: async (name) => { calls.alarmsClear.push(name); return alarmsClear(name); },
+      create: async (name, info) => { calls.alarmsCreate.push({ name, info }); return alarmsCreate(name, info); },
+      getAll: alarmsGetAll,
+      onAlarm: events.alarmsOnAlarm
     },
     bookmarks: { search: async () => [] },
     debugger: {
@@ -4047,11 +5876,11 @@ function createBackgroundHarness({
     },
     runtime: {
       connectNative: () => nativePort,
-      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.3.0" }),
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.4.0" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,
-      onStartup: createEvent()
+      onStartup: events.runtimeOnStartup
     },
     scripting: {
       executeScript: async (injection) => {
@@ -4104,6 +5933,7 @@ function createBackgroundHarness({
   harnessConsole.error = consoleError;
   const context = vm.createContext({
     AbortController,
+    AbortSignal,
     atob,
     chrome,
     console: harnessConsole,
@@ -4117,6 +5947,9 @@ function createBackgroundHarness({
   vm.runInContext(backgroundSource, context, { filename: "extension/background.js" });
 
   return {
+    async waitForScheduleRestore() {
+      await vm.runInContext("scheduleMutationQueue", context);
+    },
     activeNativeCommandCount() {
       return vm.runInContext("activeNativeCommands.size", context);
     },
@@ -4176,6 +6009,11 @@ function createBackgroundHarness({
       context.__testParams = params;
       context.__testOptions = options;
       return vm.runInContext("executeCommand(__testMethod, __testParams, __testOptions)", context);
+    },
+    nextScheduleRun(recurrence, afterMs) {
+      context.__testRecurrence = recurrence;
+      context.__testAfterMs = afterMs;
+      return vm.runInContext("nextScheduleRunAt(__testRecurrence, __testAfterMs)", context);
     },
     reloadTabLeases() {
       return vm.runInContext(

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { parseJsonc } from "./lib/opencode-config.mjs";
+import { scanTrackedFiles } from "./lib/release-artifact-scan.mjs";
 import {
   createLauncher,
   isSupportedNodeVersion,
@@ -54,12 +55,42 @@ for (const [name, version] of [
   ["package-lock root", packageLock.packages?.[""]?.version],
   ["extension manifest", manifest.version]
 ]) {
-  if (version !== "1.3.0") throw new Error(`${name} release version must be 1.3.0`);
+  if (version !== "1.4.0") throw new Error(`${name} release version must be 1.4.0`);
 }
 const popupHtml = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
 const popupJs = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
-if (!popupHtml.includes('id="version">v1.3.0</span>') || !popupJs.includes('"v1.3.0"')) {
-  throw new Error("popup release metadata must be v1.3.0");
+if (!popupHtml.includes('id="version">v1.4.0</span>') || !popupJs.includes('"v1.4.0"')) {
+  throw new Error("popup release metadata must be v1.4.0");
+}
+const bridgeClientSource = await readFile(path.join(repoRoot, "src", "bridge-client.js"), "utf8");
+const nativeHostSource = await readFile(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"), "utf8");
+const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+const changelog = await readFile(path.join(repoRoot, "CHANGELOG.md"), "utf8");
+const security = await readFile(path.join(repoRoot, "SECURITY.md"), "utf8");
+for (const [name, source] of [
+  ["bridge client", bridgeClientSource],
+  ["native host", nativeHostSource]
+]) {
+  if (!source.includes('"1.4.0"')) throw new Error(`${name} release metadata must be v1.4.0`);
+}
+for (const required of [
+  "chrome_workflow_start",
+  "chrome_schedule_create",
+  "chrome_webmcp_list",
+  "chrome://flags/#enable-webmcp-testing",
+  "browser.schedule-unattended"
+]) {
+  if (!readme.includes(required)) throw new Error(`README must document ${required}`);
+}
+if (!changelog.includes("## v1.4.0 — 2026-07-16")) throw new Error("CHANGELOG must contain the v1.4.0 release");
+if (!security.includes("committed semantics") || !security.includes("irrevocable")) {
+  throw new Error("SECURITY must document committed schedule and irrevocable WebMCP semantics");
+}
+const { stdout: trackedOutput } = await execFileAsync("git", ["ls-files", "-z"], { cwd: repoRoot, encoding: "buffer", windowsHide: true });
+const trackedPaths = trackedOutput.toString("utf8").split("\0").filter(Boolean);
+const releaseIssues = await scanTrackedFiles({ root: repoRoot, trackedPaths });
+if (releaseIssues.length > 0) {
+  throw new Error(`Release artifact scan failed: ${releaseIssues.map((issue) => `${issue.path}: ${issue.reason}`).join("; ")}`);
 }
 
 const csp = manifest.content_security_policy?.extension_pages;

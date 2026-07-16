@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { access, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
+const execFileAsync = promisify(execFile);
 
 test("README documents first-class Windows installation and verification", async () => {
   const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
@@ -86,8 +89,8 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
-test("release metadata is synchronized for v1.3.0", async () => {
-  const expectedVersion = "1.3.0";
+test("release metadata is synchronized for v1.4.0", async () => {
+  const expectedVersion = "1.4.0";
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
   const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
@@ -101,16 +104,45 @@ test("release metadata is synchronized for v1.3.0", async () => {
   assert.equal(packageLock.version, expectedVersion);
   assert.equal(packageLock.packages[""].version, expectedVersion);
   assert.equal(manifest.version, expectedVersion);
-  assert.match(popupHtml, /<span id="version">v1\.3\.0<\/span>/u);
-  assert.match(popupJs, /"v1\.3\.0"/u);
-  assert.match(readme, /Version-v1\.3\.0-/u);
-  assert.match(readme, /alt="Version v1\.3\.0"/u);
-  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.3\.0"/u);
-  assert.match(nativeHost, /HOST_VERSION = "1\.3\.0"/u);
+  assert.match(popupHtml, /<span id="version">v1\.4\.0<\/span>/u);
+  assert.match(popupJs, /"v1\.4\.0"/u);
+  assert.match(readme, /Version-v1\.4\.0-/u);
+  assert.match(readme, /alt="Version v1\.4\.0"/u);
+  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.4\.0"/u);
+  assert.match(nativeHost, /HOST_VERSION = "1\.4\.0"/u);
   assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");
   assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.17.20");
+});
+
+test("v1.4 documentation covers every new workflow, schedule, and WebMCP contract", async () => {
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  const changelog = await readFile(path.join(repoRoot, "CHANGELOG.md"), "utf8");
+  const security = await readFile(path.join(repoRoot, "SECURITY.md"), "utf8");
+  for (const tool of [
+    "chrome_workflow_start", "chrome_workflow_stop", "chrome_workflow_cancel", "chrome_workflows",
+    "chrome_workflow_get", "chrome_workflow_import", "chrome_workflow_delete", "chrome_workflow_run",
+    "chrome_schedule_create", "chrome_schedules", "chrome_schedule_update", "chrome_schedule_delete",
+    "chrome_schedule_run_now", "chrome_schedule_history", "chrome_webmcp_list", "chrome_webmcp_invoke"
+  ]) assert.ok(readme.includes(`\`${tool}\``), `README is missing ${tool}`);
+  for (const text of [
+    "schemaVersion", "browser.schedule-unattended", "chrome://flags/#enable-webmcp-testing",
+    "origin-isolated", "document.modelContext.getTools()", "document.modelContext.executeTool(descriptor, inputJson, { signal })",
+    "ISOLATED", "admission", "irrevocable", "8", "30,000 ms", "upgrade", "repair", "privacy"
+  ]) assert.match(readme, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"), `README is missing ${text}`);
+  assert.match(changelog, /## v1\.4\.0 — 2026-07-16/u);
+  assert.match(changelog, /workflow|schedule|WebMCP/iu);
+  assert.match(security, /unattended[\s\S]*explicit approval/iu);
+  assert.match(security, /WebMCP[\s\S]*irrevocable|irrevocable[\s\S]*WebMCP/iu);
+  assert.match(readme, /smoke:installed/iu);
+});
+
+test("release tree excludes internal audits, competitor downloads, credentials, screenshots, and superpowers docs", async () => {
+  const { stdout } = await execFileAsync("git", ["ls-files"], { cwd: repoRoot });
+  const tracked = stdout.trim().split(/\r?\n/u).filter(Boolean);
+  const forbidden = tracked.filter((file) => /(?:^|\/)(?:audit-copies?|competitor-extensions?|downloaded-extensions?|credentials?|screenshots?|docs\/superpowers|superpowers)(?:\/|$)/iu.test(file));
+  assert.deepEqual(forbidden, []);
 });
 
 test("README documents v1.3 session control, privacy, assets, notifications, and recovery limits", async () => {

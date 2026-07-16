@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.4.0 — 2026-07-16
+
+### Added
+
+- **Reusable browser workflows.** Recording, import, inspection, deletion, and bounded
+  sequential execution use a versioned typed schema whose capabilities and origins are
+  derived from an explicit operation allowlist.
+- **Local workflow schedules.** Daily, weekly, monthly, and annual recurrences provide
+  explicit unattended approval, manual execution, notification policy, and sanitized history.
+- **Experimental WebMCP.** `chrome_webmcp_list` and `chrome_webmcp_invoke` discover and
+  execute the current origin-isolated document's model-context tools through an `ISOLATED`
+  content-script adapter and the official Chrome API signatures.
+
+### Security
+
+- Workflow and schedule storage, step counts, timeouts, origins, history, and serialized data
+  are bounded. Imported capability/origin claims are ignored and recomputed before persistence.
+- Unattended schedules require a dedicated exact `browser.schedule-unattended` approval bound
+  to workflow, recurrence, notification policy, origins, and managed tabs. Material changes
+  require reapproval; the client cannot submit an approval bypass flag.
+- Schedule/alarm mutations use durable committed journal transitions, restart repair, and
+  occurrence claims so an acknowledged operation is durable and a completed occurrence is not
+  replayed after a crash.
+- WebMCP admissions bind an exact descriptor to an exact live document, enforce one committed
+  invocation per tab and eight globally, and expire after 30 seconds. The pre-dispatch deadline
+  cannot revoke an invocation after its irreversible page commit.
+
+### Changed
+
+- Package, lockfile, manifest, popup, bridge client, native host, smoke fixtures, and release
+  verification now report version 1.4.0 together.
+- Installation, upgrade, repair, privacy, WebMCP experimental prerequisites, schemas, limits,
+  and failure semantics are documented in the README and security policy.
+
 ## v1.3.0 — 2026-07-16
 
 ### Added

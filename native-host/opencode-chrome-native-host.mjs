@@ -12,10 +12,11 @@ const MAX_NATIVE_OUTBOUND_MESSAGE_BYTES = 1 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_COMMAND_METHOD_CHARS = 128;
 const MAX_PENDING_COMMANDS = 100;
+const MAX_NO_TIMEOUT_WEBMCP_INVOKES = 8;
 const MAX_EVENT_SUBSCRIBERS = 16;
 const COMMAND_METHOD_RE = /^[A-Za-z][A-Za-z0-9]*$/u;
 const HOST_NAME = "com.opencode.chrome_bridge";
-const HOST_VERSION = "1.3.0";
+const HOST_VERSION = "1.4.0";
 const HOST_PROTOCOL_MIN = "1.0.0";
 const HOST_PROTOCOL_MAX = "1.0.0";
 const DEFAULT_CLIENT_NAME = "opencode-plugin";
@@ -39,16 +40,20 @@ const HOST_REQUIRED_EXTENSION_CAPABILITIES = Object.freeze([
   "browser.network",
   "browser.notifications",
   "browser.page-context",
+  "browser.schedules",
   "browser.screenshots",
   "browser.tab-groups",
   "browser.tabs",
   "browser.wait",
+  "browser.webmcp",
   "browser.windows",
+  "browser.workflows",
   "session.resume",
   "session.tab-leases"
 ]);
 
 const pending = new Map();
+const noTimeoutWebMcpInvokes = new Set();
 const eventSubscribers = new Set();
 const eventBuffer = [];
 const EVENT_BUFFER_MAX = 500;
@@ -118,12 +123,17 @@ function handleNativeMessage(payload) {
     return;
   }
   if (message?.type === "response" && typeof message.id === "string") {
+    noTimeoutWebMcpInvokes.delete(message.id);
     const entry = pending.get(message.id);
     if (!entry) return;
     pending.delete(message.id);
-    clearTimeout(entry.timeout);
+    if (entry.timeout !== null) clearTimeout(entry.timeout);
     if (message.ok) entry.resolve(message.result);
     else entry.reject(new ExtensionCommandError(message.error || "Chrome extension command failed"));
+    return;
+  }
+  if (message?.type === "settled" && typeof message.id === "string") {
+    noTimeoutWebMcpInvokes.delete(message.id);
     return;
   }
   if (message?.type === "event") {
@@ -155,7 +165,16 @@ async function handleHttp(req, res) {
     if (req.method === "POST" && requestUrl.pathname === "/command") {
       requireJsonRequest(req);
       const body = await readJsonBody(req);
-      const command = sendCommand(body.method, body.params ?? {}, body.timeoutMs);
+      const noTimeout = body.timeoutMs === 0
+        && body.method === "scopedCommand"
+        && body.params?.method === "webMcpInvoke";
+      if (body.timeoutMs === 0 && !noTimeout) {
+        throw new HttpError(400, "No-timeout transport is restricted to WebMCP invoke");
+      }
+      if (noTimeout && noTimeoutWebMcpInvokes.size >= MAX_NO_TIMEOUT_WEBMCP_INVOKES) {
+        throw new HttpError(429, "Too many committed WebMCP invocations");
+      }
+      const command = sendCommand(body.method, body.params ?? {}, body.timeoutMs, { noTimeout });
       const cancelOnDisconnect = () => {
         if (!res.writableEnded) cancelPendingCommand(
           command.commandId,
@@ -455,7 +474,7 @@ function readJsonBody(req) {
   });
 }
 
-function sendCommand(method, params, timeoutMs = 15000) {
+function sendCommand(method, params, timeoutMs = 15000, { noTimeout = false } = {}) {
   if (typeof method !== "string" || method.length === 0 || method.length > MAX_COMMAND_METHOD_CHARS || !COMMAND_METHOD_RE.test(method)) {
     throw new HttpError(400, "method must be a valid bridge command name");
   }
@@ -468,13 +487,15 @@ function sendCommand(method, params, timeoutMs = 15000) {
   const id = `opencode:${nextId++}`;
   const message = { type: "command", id, method, params };
   const command = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const timeout = timeoutMs === 0 ? null : setTimeout(() => {
       cancelPendingCommand(id, new CommandTimeoutError(`Timed out waiting for Chrome command ${method}`));
     }, clampTimeout(timeoutMs));
     pending.set(id, { resolve, reject, timeout });
+    if (noTimeout) noTimeoutWebMcpInvokes.add(id);
     writeNativeMessage(message).catch((error) => {
-      clearTimeout(timeout);
+      if (timeout !== null) clearTimeout(timeout);
       pending.delete(id);
+      noTimeoutWebMcpInvokes.delete(id);
       reject(error);
     });
   });
@@ -486,7 +507,7 @@ function cancelPendingCommand(id, reason) {
   const entry = pending.get(id);
   if (!entry) return false;
   pending.delete(id);
-  clearTimeout(entry.timeout);
+  if (entry.timeout !== null) clearTimeout(entry.timeout);
   writeNativeMessage({ type: "cancel", id }).catch((error) => {
     log(`could not cancel Chrome command ${id}: ${error?.message ?? error}`);
   });
