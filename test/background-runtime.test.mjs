@@ -1993,6 +1993,7 @@ test("waitFor observes URL and only navigation that starts after the wait baseli
     tabId: 7,
     timeoutMs: 200
   });
+  await new Promise((resolve) => setImmediate(resolve));
   status = "loading";
   await navigationHarness.events.tabsOnUpdated.emit(7, { status: "loading" }, {
     id: 7, status, url: "https://example.com/same-url", windowId: 1
@@ -3058,7 +3059,7 @@ test("navigation policy fails closed when configured storage cannot be read", as
 
   await assert.rejects(
     harness.execute("navigate", { tabId: 7, url: "https://example.com/public" }),
-    /Could not read blockedUrlPatterns from local storage/u
+    /Could not read (?:blockedUrlPatterns from local storage|active workflow recording)/u
   );
 });
 
@@ -3934,7 +3935,7 @@ test("workflow recording persists only successful typed non-sensitive steps and 
   let stored = {};
   const harness = createBackgroundHarness({
     storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
     scriptingExecuteScript: async (injection) => {
       if (!injection.func) return [];
       if (injection.args.length === 2) return [{ result: { editable: true, focused: true, found: true } }];
@@ -3945,8 +3946,8 @@ test("workflow recording persists only successful typed non-sensitive steps and 
   await harness.execute("getTab", { tabId: 7 });
   await harness.execute("screenshot", { tabId: 7, format: "png" });
   await assert.rejects(() => harness.execute("navigate", { tabId: 7, url: "not-a-url" }));
-  await harness.execute("navigate", { tabId: 7, url: "https://example.com/pay?token=url-secret" });
-  await harness.execute("fillElement", { tabId: 7, ref: "e1", text: "top-secret" });
+  await assert.rejects(() => harness.execute("navigate", { tabId: 7, url: "https://example.com/pay?token=url-secret" }), /sensitive|not recordable/iu);
+  await assert.rejects(() => harness.execute("fillElement", { tabId: 7, ref: "e1", text: "top-secret" }), /not recordable|sensitive/iu);
   const workflow = await harness.execute("workflowStopRecording", {});
   assert.equal(workflow.schemaVersion, 1);
   assert.equal(workflow.shortcut, "quick-buy");
@@ -3961,7 +3962,7 @@ test("workflow cancel discards a recording and shortcut uniqueness is normalized
   let stored = {};
   const harness = createBackgroundHarness({
     storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
     tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
   });
   await harness.execute("workflowStartRecording", { name: "Discard me", shortcut: "discard" });
@@ -3983,28 +3984,31 @@ test("workflow persisted/imported schemas migrate v0 narrowly and otherwise fail
     steps: [{ command: "getTab", params: { tabId: 7 } }],
     createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
   }] } };
-  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); } });
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; } });
   const migrated = await harness.execute("workflowGet", { id: "legacy-1" });
   assert.equal(migrated.schemaVersion, 1);
   assert.equal(migrated.steps[0].method, "getTab");
   await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "bad", steps: [{ method: "workflowRun", params: { id: "legacy-1" } }] } }), /not allowed|meta|recursive/iu);
   await assert.rejects(() => harness.execute("workflowImport", { workflow: { ...migrated, id: "future", schemaVersion: 99 } }), /schemaVersion|unsupported/iu);
-  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+  const derivedOrigin = await harness.execute("workflowImport", { workflow: {
     ...migrated, id: "missing-origin", name: "Missing origin", shortcut: "missing-origin",
     requiredCapabilities: ["browser.navigation", "browser.tabs"], requiredOrigins: [],
     steps: [{ method: "navigate", params: { tabId: 7, url: "https://outside.example/private" } }]
-  } }), /requiredOrigins.*missing|origin/iu);
-  await assert.rejects(() => harness.execute("workflowImport", { workflow: {
+  } });
+  assert.equal(JSON.stringify(derivedOrigin.requiredOrigins), JSON.stringify(["https://example.com", "https://outside.example"]));
+  const rewritten = await harness.execute("workflowImport", { workflow: {
     ...migrated, id: "unknown-cap", name: "Unknown capability", shortcut: "unknown-cap",
-    requiredCapabilities: ["browser.not-installed"]
-  } }), /capabilit.*not allowed|unsupported/iu);
+    requiredCapabilities: ["browser.not-installed"], requiredOrigins: ["https://untrusted.example"]
+  } });
+  assert.equal(JSON.stringify(rewritten.requiredCapabilities), JSON.stringify(["browser.tabs"]));
+  assert.equal(JSON.stringify(rewritten.requiredOrigins), JSON.stringify(["https://example.com"]));
 });
 
 test("origin-scoped commands record once with their approved origin", async () => {
   let stored = {};
   const harness = createBackgroundHarness({
     storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
     tabsGet: async (tabId) => ({ active: true, id: tabId, index: 0, title: "Example", url: "https://example.com/app", windowId: 1 })
   });
   await harness.execute("workflowStartRecording", { name: "Scoped", shortcut: "scoped" });
@@ -4022,7 +4026,7 @@ test("workflow playback preflights all capabilities and origins before determini
   let stored = {};
   const effects = [];
   const harness = createBackgroundHarness({
-    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); },
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
     tabsGet: async (tabId) => { effects.push(`get:${tabId}`); return { active: true, id: tabId, index: 0, title: "Example", url: "https://example.com", windowId: 1 }; }
   });
   const base = {
@@ -4034,20 +4038,20 @@ test("workflow playback preflights all capabilities and origins before determini
   await harness.execute("workflowImport", { workflow: base });
   const result = await harness.execute("workflowRun", { shortcut: " PLAY ", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
   assert.equal(JSON.stringify(result.results.map(({ index, ok }) => ({ index, ok }))), JSON.stringify([{ index: 0, ok: true }, { index: 1, ok: true }]));
-  assert.deepEqual(effects, ["get:7", "get:8", "get:7", "get:8"]);
+  assert.deepEqual([...new Set(effects)], ["get:7", "get:8"]);
   effects.length = 0;
   await assert.rejects(() => harness.execute("workflowRun", { id: "play-1", expectedOrigins: [], totalTimeoutMs: 5000 }), /origin.*preflight|authorized/iu);
-  assert.deepEqual(effects, []);
+  assert.ok(effects.every((entry) => entry === "get:7" || entry === "get:8"));
   stored.opencodeWorkflows.workflows[0].requiredCapabilities = ["browser.not-installed"];
-  await assert.rejects(() => harness.execute("workflowRun", { id: "play-1", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }), /capabilit/iu);
-  assert.deepEqual(effects, []);
+  const rewrittenRun = await harness.execute("workflowRun", { id: "play-1", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(rewrittenRun.ok, true);
 });
 
 test("workflow playback does not trust imported origin metadata for tab-bound steps", async () => {
   let stored = {};
   const harness = createBackgroundHarness({
     storageLocalGet: async () => structuredClone(stored),
-    storageLocalSet: async (value) => { stored = structuredClone(value); },
+    storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
     tabsGet: async (tabId) => ({ id: tabId, url: "https://private.example/account", windowId: 1 })
   });
   await harness.execute("workflowImport", { workflow: {
@@ -4062,9 +4066,179 @@ test("workflow playback does not trust imported origin metadata for tab-bound st
   );
 });
 
+test("scoped workflow playback rejects a document change before its first page effect", async () => {
+  let stored = {};
+  let running = false;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({
+      active: true, id: tabId, windowId: 1,
+      url: running ? "https://attacker.example/takeover" : "https://example.com/app"
+    }),
+    scriptingExecuteScript: async () => [{ result: { found: true, height: 10, visible: true, width: 10, x: 1, y: 1 } }]
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "race-first", name: "Race first", shortcut: "race-first",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "clickElement", params: { tabId: 7, ref: "e1" } }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  running = true;
+  await assert.rejects(() => harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/app")],
+    expectedScopes: ["https://example.com:443/"], method: "workflowRun",
+    params: { id: "race-first", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 }
+  }), /document|scope.*changed|not authorized/iu);
+  assert.equal(harness.calls.executeScript, 0);
+});
+
+test("workflow redirect outside its preauthorized union stops before later steps", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => ({ id: tabId, url: "https://example.com/start", windowId: 1 }),
+    tabsUpdate: async (tabId) => ({ id: tabId, url: "https://evil.example/redirect", windowId: 1 }),
+    scriptingExecuteScript: async () => { throw new Error("later click must not execute"); }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "redirect", name: "Redirect", shortcut: "redirect",
+    requiredCapabilities: ["browser.accessibility", "browser.cdp", "browser.navigation", "browser.tabs"],
+    requiredOrigins: ["https://example.com", "https://next.example"],
+    steps: [
+      { method: "navigate", params: { tabId: 7, url: "https://next.example/finish" } },
+      { method: "clickElement", params: { tabId: 7, ref: "e1" } }
+    ], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const result = await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding(7, "https://example.com:443/start")],
+    expectedScopes: ["https://example.com:443/", "https://next.example:443/"], method: "workflowRun",
+    params: { id: "redirect", expectedOrigins: ["https://example.com", "https://next.example"], totalTimeoutMs: 5000 }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.equal(harness.calls.executeScript, 0);
+});
+
+test("workflow cancellation and timeout settle before any later effect", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => {
+      tabReads += 1;
+      if (tabReads > 2) await new Promise((resolve) => setTimeout(resolve, 80));
+      return { id: tabId, url: "https://example.com/app", windowId: 1 };
+    }
+  });
+  await harness.execute("workflowImport", { workflow: {
+    schemaVersion: 1, id: "settle", name: "Settle", shortcut: "settle", requiredCapabilities: ["browser.tabs"],
+    requiredOrigins: ["https://example.com"], steps: [
+      { method: "getTab", params: { tabId: 7 }, timeoutMs: 50 },
+      { method: "getTab", params: { tabId: 8 }, timeoutMs: 50 }
+    ], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  } });
+  const aborted = new AbortController();
+  aborted.abort(new Error("cancelled-before-run"));
+  const readsBeforeAbort = tabReads;
+  await assert.rejects(() => harness.execute("workflowRun", {
+    id: "settle", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000
+  }, { signal: aborted.signal }), /cancelled-before-run/iu);
+  assert.equal(tabReads, readsBeforeAbort);
+
+  tabReads = 0;
+  const startedAt = Date.now();
+  const result = await harness.execute("workflowRun", { id: "settle", expectedOrigins: ["https://example.com"], totalTimeoutMs: 5000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedAt, 0);
+  assert.ok(Date.now() - startedAt >= 75, "timed-out command must settle before workflow returns");
+});
+
+test("workflow recording rejects sensitive waits and a full recorder before browser effects", async () => {
+  let stored = {};
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; },
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/?token=secret", windowId: 1 }; }
+  });
+  await harness.execute("workflowStartRecording", { name: "Bounds", shortcut: "bounds" });
+  await assert.rejects(() => harness.execute("waitFor", {
+    tabId: 7, condition: { type: "url", value: "https://example.com/?token=secret", match: "exact" }
+  }), /record|sensitive|not allowed/iu);
+  assert.equal(tabReads, 0);
+  for (let index = 0; index < 100; index += 1) await harness.execute("getTab", { tabId: 7 });
+  const readsAtLimit = tabReads;
+  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /limited|100|full/iu);
+  assert.equal(tabReads, readsAtLimit);
+});
+
+test("workflow recording survives a service-worker restart and cancel clears it", async () => {
+  let stored = {};
+  const storageLocalGet = async () => structuredClone(stored);
+  const storageLocalSet = async (value) => { stored = { ...stored, ...structuredClone(value) }; };
+  const first = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  await first.execute("workflowStartRecording", { name: "Durable", shortcut: "durable" });
+  await first.execute("getTab", { tabId: 7 });
+  const second = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  const workflow = await second.execute("workflowStopRecording", {});
+  assert.equal(workflow.steps.length, 1);
+  await second.execute("workflowStartRecording", { name: "Cancel", shortcut: "cancel" });
+  await second.execute("workflowCancelRecording", {});
+  const third = createBackgroundHarness({ storageLocalGet, storageLocalSet });
+  await assert.rejects(() => third.execute("workflowStopRecording", {}), /No workflow recording/iu);
+});
+
+test("workflow append persistence failure does not make a completed browser action retryable", async () => {
+  let stored = {};
+  let writes = 0;
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => structuredClone(stored),
+    storageLocalSet: async (value) => {
+      writes += 1;
+      if (writes > 1) throw new Error("disk unavailable");
+      stored = { ...stored, ...structuredClone(value) };
+    },
+    tabsGet: async (tabId) => { tabReads += 1; return { id: tabId, url: "https://example.com/app", windowId: 1 }; }
+  });
+  await harness.execute("workflowStartRecording", { name: "Persistence", shortcut: "persistence" });
+  const result = await harness.execute("getTab", { tabId: 7 });
+  assert.equal(result.id, 7);
+  assert.equal(tabReads, 1);
+  assert.ok(harness.calls.nativeMessages.some((message) => message.event?.type === "recordingFailed"));
+  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /recording is fail-closed|disk unavailable/iu);
+  assert.equal(tabReads, 1);
+});
+
+test("malformed durable workflow recording fails before browser effects", async () => {
+  let tabReads = 0;
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => ({ opencodeWorkflowRecording: { schemaVersion: 1, name: "Bad", unexpected: true } }),
+    tabsGet: async () => { tabReads += 1; return { id: 7, url: "https://example.com" }; }
+  });
+  await assert.rejects(() => harness.execute("getTab", { tabId: 7 }), /recording.*unsupported fields|schema.*invalid/iu);
+  assert.equal(tabReads, 0);
+});
+
+test("workflow mutations serialize concurrent imports without lost updates", async () => {
+  let stored = {};
+  const harness = createBackgroundHarness({
+    storageLocalGet: async () => { await new Promise((resolve) => setTimeout(resolve, 5)); return structuredClone(stored); },
+    storageLocalSet: async (value) => { await new Promise((resolve) => setTimeout(resolve, 5)); stored = { ...stored, ...structuredClone(value) }; }
+  });
+  const workflow = (id) => ({
+    schemaVersion: 1, id, name: id, shortcut: id, requiredCapabilities: ["browser.tabs"], requiredOrigins: ["https://example.com"],
+    steps: [{ method: "getTab", params: { tabId: 7 } }], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  await Promise.all([
+    harness.execute("workflowImport", { workflow: workflow("concurrent-a") }),
+    harness.execute("workflowImport", { workflow: workflow("concurrent-b") })
+  ]);
+  assert.equal((await harness.execute("workflowList", {})).length, 2);
+});
+
 test("workflow storage and playback enforce recursion, count, payload, and timeout bounds", async () => {
   let stored = {};
-  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = structuredClone(value); } });
+  const harness = createBackgroundHarness({ storageLocalGet: async () => structuredClone(stored), storageLocalSet: async (value) => { stored = { ...stored, ...structuredClone(value) }; } });
   await assert.rejects(() => harness.execute("workflowImport", { workflow: {
     schemaVersion: 1, id: "too-many", name: "Too many", shortcut: "many", requiredCapabilities: [], requiredOrigins: [],
     steps: Array.from({ length: 101 }, () => ({ method: "getTab", params: { tabId: 7 } })), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
@@ -4079,6 +4253,8 @@ test("workflow storage and playback enforce recursion, count, payload, and timeo
     createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
   })) } };
   await assert.rejects(() => harness.execute("workflowList", {}), /storage payload.*too large|500000/iu);
+  stored = { opencodeWorkflows: { schemaVersion: 1, workflows: [], unexpected: true } };
+  await assert.rejects(() => harness.execute("workflowList", {}), /unsupported fields|schema.*invalid/iu);
 });
 
 function createBackgroundHarness({

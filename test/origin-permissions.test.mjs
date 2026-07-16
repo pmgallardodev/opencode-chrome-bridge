@@ -99,10 +99,13 @@ test("workflow run preflights its complete origin union in one approval before p
   const asks = [];
   const bridge = installBridge(({ method, params }) => {
     if (method === "workflowGet") return {
-      id: "checkout", requiredOrigins: ["https://shop.example", "https://pay.example"],
-      steps: [{ method: "getTab", params: { tabId: 7 } }]
+      id: "checkout", requiredOrigins: ["https://untrusted-superset.example"],
+      steps: [{ method: "getTab", params: { tabId: 7 } }, { method: "getTab", params: { tabId: 8 } }]
     };
-    if (method === "getTab") return { id: 7, url: "https://shop.example/cart" };
+    if (method === "getTab") return {
+      documentId: `document-${params.tabId}`, id: params.tabId, navigationGeneration: 3,
+      url: params.tabId === 7 ? "https://shop.example/cart" : "https://pay.example/checkout"
+    };
     if (method === "workflowRun") {
       assert.deepEqual(params.expectedOrigins, ["https://pay.example:443/", "https://shop.example:443/"]);
       return { ok: true, results: [], workflowId: "checkout" };
@@ -117,7 +120,10 @@ test("workflow run preflights its complete origin union in one approval before p
   const originAsks = asks.filter((entry) => entry.permission === "browser.origin");
   assert.equal(originAsks.length, 1);
   assert.deepEqual(originAsks[0].patterns, ["https://pay.example:443/", "https://shop.example:443/"]);
-  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["workflowGet", "getTab", "workflowRun"]);
+  assert.deepEqual(bridge.calls.map((entry) => entry.method), ["workflowGet", "getTab", "getTab", "workflowGet", "workflowRun"]);
+  const runCall = bridge.calls.at(-1);
+  assert.equal(runCall.scoped, true);
+  assert.deepEqual(runCall.expectedBindings.map((entry) => entry.tabId), [7, 8]);
 });
 
 test("evaluate asks once for the origin root and a prior path grant does not cover it", async () => {

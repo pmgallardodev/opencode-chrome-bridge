@@ -1595,13 +1595,14 @@ async function resolvePageScopes(name, args, pageMetadata) {
   if (name === "chrome_batch") return resolveBatchPageScopes(args.actions, pageMetadata);
   if (name === "chrome_workflow_run") {
     const workflow = await bridgeCommand("workflowGet", workflowSelector(args));
-    if (!Array.isArray(workflow?.requiredOrigins)) throw new Error("Workflow requiredOrigins must be an array");
     if (!Array.isArray(workflow.steps)) throw new Error("Workflow steps must be an array");
     const tabIds = [...new Set(workflow.steps.map((step) => step?.params?.tabId).filter(Number.isInteger))];
     const currentScopes = await scopesForTabIds(tabIds, pageMetadata);
     const origins = [...new Set([
-      ...workflow.requiredOrigins.map((origin) => canonicalPageScope(`${new URL(origin).origin}/`)),
-      ...currentScopes.map(originRootPageScope)
+      ...currentScopes.map(originRootPageScope),
+      ...workflow.steps
+        .filter((step) => step?.method === "navigate" && typeof step.params?.url === "string")
+        .map((step) => originRootPageScope(canonicalPageScope(step.params.url)))
     ])].sort();
     args.expectedOrigins = origins;
     return origins;
@@ -1655,6 +1656,11 @@ function workflowSelector(args) {
 async function resolvePageBindings(name, args, pageMetadata) {
   let tabIds = [];
   if (name === "chrome_batch") tabIds = batchTabIds(args.actions);
+  else if (name === "chrome_workflow_run") {
+    const workflow = await bridgeCommand("workflowGet", workflowSelector(args));
+    if (!Array.isArray(workflow?.steps)) throw new Error("Workflow steps must be an array");
+    tabIds = [...new Set(workflow.steps.map((step) => step?.params?.tabId).filter(Number.isInteger))];
+  }
   else if (Number.isInteger(args?.tabId)) tabIds = [args.tabId];
   if (tabIds.length === 0) return [];
   const bindings = [];

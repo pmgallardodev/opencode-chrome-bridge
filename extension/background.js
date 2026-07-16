@@ -102,6 +102,7 @@ const DEFAULT_BATCH_ACTION_TIMEOUT_MS = 10_000;
 const DEFAULT_BATCH_TOTAL_TIMEOUT_MS = 60_000;
 const WORKFLOW_SCHEMA_VERSION = 1;
 const WORKFLOW_STORAGE_KEY = "opencodeWorkflows";
+const WORKFLOW_RECORDING_STORAGE_KEY = "opencodeWorkflowRecording";
 const MAX_WORKFLOWS = 100;
 const MAX_WORKFLOW_STEPS = 100;
 const MAX_WORKFLOW_STORAGE_BYTES = 500_000;
@@ -122,6 +123,10 @@ const WORKFLOW_STEP_METHODS = Object.freeze({
   tabContext: { capability: ["browser.page-context", "browser.tabs"], type: "tabContext" },
   waitFor: { capability: ["browser.tabs", "browser.wait"], type: "waitFor" }
 });
+const WORKFLOW_CONTROL_METHODS = new Set([
+  "workflowStartRecording", "workflowStopRecording", "workflowCancelRecording",
+  "workflowList", "workflowGet", "workflowImport", "workflowDelete", "workflowRun"
+]);
 const BATCH_ACTION_METHODS = Object.freeze({
   activateTab: "activateTab",
   back: "back",
@@ -141,6 +146,7 @@ const ORIGIN_SCOPED_COMMANDS = new Set([
   "fileUploadCommit", "forward", "getConsoleLogs", "getTab", "hover", "keypress", "moveSequence",
   "navigate", "networkRequests", "pageText", "readPage", "reload", "resetViewport",
   "pageAssets",
+  "workflowRun",
   "screenshot", "screenshotRegion", "scroll", "setCursorState", "setFaviconBadge",
   "setViewport", "subscribeCdpEvents", "tabContext", "unsubscribeCdpEvents", "uploadFiles",
   "waitFor", "type"
@@ -201,7 +207,8 @@ let navigationAttemptSequence = 1;
 const activeNativeCommands = new Map();
 const tabLeases = new Map();
 const uploadTransfers = new Map();
-let activeWorkflowRecording = null;
+let workflowMutationQueue = Promise.resolve();
+let workflowRecordingFault = null;
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
 chrome.runtime.onStartup.addListener(connectNativeHost);
@@ -452,9 +459,27 @@ function postNativeResponse(message) {
 }
 
 async function executeCommand(method, params, options = {}) {
-  const result = await executeCommandCore(method, params, options);
-  if (options.workflowInternal !== true) await recordSuccessfulWorkflowStep(method, params);
-  return result;
+  if (options.workflowInternal === true || WORKFLOW_CONTROL_METHODS.has(method)) {
+    return executeCommandCore(method, params, options);
+  }
+  const decision = await queueWorkflowMutation(async () => {
+    throwIfAborted(options.signal);
+    const recording = await loadWorkflowRecording();
+    if (!recording) return { recording: false };
+    if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    const plan = await prepareWorkflowRecordingStep(recording, method, params);
+    throwIfAborted(options.signal);
+    const result = await executeCommandCore(method, params, options);
+    try {
+      await appendWorkflowRecordingStep(recording, plan);
+    } catch (error) {
+      workflowRecordingFault = error?.message ?? String(error);
+      sendEvent({ category: "workflow", type: "recordingFailed", error: workflowRecordingFault });
+    }
+    return { recording: true, result };
+  });
+  if (decision.recording) return decision.result;
+  return executeCommandCore(method, params, { ...options, workflowInternal: true });
 }
 
 async function executeCommandCore(method, params, options = {}) {
@@ -644,75 +669,142 @@ async function executeCommandCore(method, params, options = {}) {
 }
 
 function startWorkflowRecording(params) {
-  if (activeWorkflowRecording) throw new Error("A workflow recording is already active");
-  if (!isRecord(params)) throw new Error("workflow recording params must be an object");
-  const name = requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "name");
-  const shortcut = normalizeWorkflowShortcut(params.shortcut ?? name);
-  activeWorkflowRecording = {
-    name,
-    shortcut,
-    requiredCapabilities: new Set(),
-    requiredOrigins: new Set(),
-    steps: [],
-    startedAt: new Date().toISOString()
-  };
-  return { name, recording: true, shortcut };
+  return queueWorkflowMutation(async () => {
+    if (await loadWorkflowRecording()) throw new Error("A workflow recording is already active");
+    if (!isRecord(params)) throw new Error("workflow recording params must be an object");
+    const name = requireBoundedWorkflowString(params.name, MAX_WORKFLOW_NAME_CHARS, "name");
+    const shortcut = normalizeWorkflowShortcut(params.shortcut ?? name);
+    const recording = {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      name, shortcut, requiredCapabilities: [], requiredOrigins: [], steps: [],
+      startedAt: new Date().toISOString()
+    };
+    await saveWorkflowRecording(recording);
+    workflowRecordingFault = null;
+    return { name, recording: true, shortcut };
+  });
 }
 
 async function stopWorkflowRecording() {
-  if (!activeWorkflowRecording) throw new Error("No workflow recording is active");
-  if (activeWorkflowRecording.steps.length === 0) throw new Error("A workflow must contain at least one recorded step");
-  const recording = activeWorkflowRecording;
-  const collection = await loadWorkflowCollection();
-  if (collection.workflows.some((entry) => entry.shortcut === recording.shortcut)) {
-    throw new Error(`Workflow shortcut ${recording.shortcut} already exists and must be unique`);
-  }
-  if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
-  const now = new Date().toISOString();
-  const workflow = await validateWorkflowSchema({
-    schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    id: crypto.randomUUID(),
-    name: recording.name,
-    shortcut: recording.shortcut,
-    requiredCapabilities: [...recording.requiredCapabilities].sort(),
-    requiredOrigins: [...recording.requiredOrigins].sort(),
-    steps: recording.steps,
-    createdAt: recording.startedAt,
-    updatedAt: now
+  return queueWorkflowMutation(async () => {
+    const recording = await loadWorkflowRecording();
+    if (!recording) throw new Error("No workflow recording is active");
+    if (workflowRecordingFault) throw new Error(`Workflow recording is fail-closed: ${workflowRecordingFault}`);
+    if (recording.steps.length === 0) throw new Error("A workflow must contain at least one recorded step");
+    const collection = await loadWorkflowCollection();
+    if (collection.workflows.some((entry) => entry.shortcut === recording.shortcut)) {
+      throw new Error(`Workflow shortcut ${recording.shortcut} already exists and must be unique`);
+    }
+    if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+    const now = new Date().toISOString();
+    const workflow = await validateWorkflowSchema({
+      schemaVersion: WORKFLOW_SCHEMA_VERSION, id: crypto.randomUUID(), name: recording.name,
+      shortcut: recording.shortcut, requiredCapabilities: recording.requiredCapabilities,
+      requiredOrigins: recording.requiredOrigins, steps: recording.steps,
+      createdAt: recording.startedAt, updatedAt: now
+    }, { hydrateOrigins: true });
+    await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+    await clearWorkflowRecording();
+    workflowRecordingFault = null;
+    return workflow;
   });
-  await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
-  activeWorkflowRecording = null;
-  return workflow;
 }
 
 function cancelWorkflowRecording() {
-  if (!activeWorkflowRecording) throw new Error("No workflow recording is active");
-  activeWorkflowRecording = null;
-  return { cancelled: true };
+  return queueWorkflowMutation(async () => {
+    if (!await loadWorkflowRecording()) throw new Error("No workflow recording is active");
+    await clearWorkflowRecording();
+    workflowRecordingFault = null;
+    return { cancelled: true };
+  });
 }
 
-async function recordSuccessfulWorkflowStep(method, params) {
-  if (!activeWorkflowRecording) return;
+async function prepareWorkflowRecordingStep(recording, method, params) {
   let recordedMethod = method;
   let recordedParams = params;
   let expectedOrigins = [];
   if (method === "scopedCommand") {
-    if (!isRecord(params)) return;
+    if (!isRecord(params)) throw new Error("Scoped workflow recording params are invalid");
     recordedMethod = params.method;
     recordedParams = params.params;
     expectedOrigins = Array.isArray(params.expectedScopes) ? params.expectedScopes : [];
   }
-  if (!Object.hasOwn(WORKFLOW_STEP_METHODS, recordedMethod) || containsSensitiveWorkflowField(recordedParams)) return;
-  if (activeWorkflowRecording.steps.length >= MAX_WORKFLOW_STEPS) {
+  if (!Object.hasOwn(WORKFLOW_STEP_METHODS, recordedMethod)) throw new Error(`Command ${recordedMethod} is not recordable while workflow recording is active`);
+  if (recordedMethod === "waitFor" && ["text", "url"].includes(recordedParams?.condition?.type)) {
+    throw new Error(`Sensitive waitFor ${recordedParams.condition.type} conditions are not recordable`);
+  }
+  if (containsSensitiveWorkflowField(recordedParams)) throw new Error(`Command ${recordedMethod} contains sensitive fields and is not recordable`);
+  if (recording.steps.length >= MAX_WORKFLOW_STEPS) {
     throw new Error(`Workflow recording is limited to ${MAX_WORKFLOW_STEPS} steps`);
   }
   const step = await validateWorkflowStep({ method: recordedMethod, params: cloneWorkflowValue(recordedParams) });
-  activeWorkflowRecording.steps.push(step);
-  for (const capability of WORKFLOW_STEP_METHODS[recordedMethod].capability) {
-    activeWorkflowRecording.requiredCapabilities.add(capability);
+  return { expectedOrigins, recordedMethod, recordedParams, step };
+}
+
+async function appendWorkflowRecordingStep(recording, plan) {
+  recording.steps.push(plan.step);
+  const capabilities = new Set(recording.requiredCapabilities);
+  const origins = new Set(recording.requiredOrigins);
+  for (const capability of WORKFLOW_STEP_METHODS[plan.recordedMethod].capability) {
+    capabilities.add(capability);
   }
-  for (const scope of expectedOrigins) activeWorkflowRecording.requiredOrigins.add(workflowOrigin(scope));
-  if (recordedMethod === "navigate") activeWorkflowRecording.requiredOrigins.add(workflowOrigin(recordedParams.url));
+  for (const scope of plan.expectedOrigins) origins.add(workflowOrigin(scope));
+  if (plan.recordedMethod === "navigate") origins.add(workflowOrigin(plan.recordedParams.url));
+  recording.requiredCapabilities = [...capabilities].sort();
+  recording.requiredOrigins = [...origins].sort();
+  await saveWorkflowRecording(recording);
+}
+
+function queueWorkflowMutation(operation) {
+  const next = workflowMutationQueue.then(operation, operation);
+  workflowMutationQueue = next.catch(() => {});
+  return next;
+}
+
+async function loadWorkflowRecording() {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(WORKFLOW_RECORDING_STORAGE_KEY);
+  } catch (error) {
+    throw new Error(`Could not read active workflow recording: ${error?.message ?? String(error)}`);
+  }
+  const raw = stored?.[WORKFLOW_RECORDING_STORAGE_KEY];
+  if (raw == null) return null;
+  if (!isRecord(raw) || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Active workflow recording schema is invalid or unsupported");
+  const allowed = ["schemaVersion", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "startedAt"];
+  const extra = Object.keys(raw).filter((field) => !allowed.includes(field));
+  if (extra.length > 0) throw new Error(`Active workflow recording contains unsupported fields: ${extra.join(", ")}`);
+  const name = requireBoundedWorkflowString(raw.name, MAX_WORKFLOW_NAME_CHARS, "name");
+  const shortcut = normalizeWorkflowShortcut(raw.shortcut);
+  if (!Array.isArray(raw.steps) || raw.steps.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording steps are invalid");
+  const steps = await Promise.all(raw.steps.map(validateWorkflowStep));
+  const derivedCapabilities = [...new Set(steps.flatMap((step) => WORKFLOW_STEP_METHODS[step.method].capability))].sort();
+  if (!Array.isArray(raw.requiredCapabilities)
+    || JSON.stringify([...new Set(raw.requiredCapabilities)].sort()) !== JSON.stringify(derivedCapabilities)) {
+    throw new Error("Active workflow recording capabilities do not match its typed steps");
+  }
+  if (!Array.isArray(raw.requiredOrigins) || raw.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Active workflow recording origins are invalid");
+  const requiredOrigins = [...new Set(raw.requiredOrigins.map(workflowOrigin))].sort();
+  const startedAt = requireWorkflowTimestamp(raw.startedAt, "startedAt");
+  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, name, shortcut, requiredCapabilities: derivedCapabilities, requiredOrigins, steps, startedAt };
+}
+
+async function saveWorkflowRecording(recording) {
+  const serialized = JSON.stringify(recording);
+  if (new TextEncoder().encode(serialized).byteLength > MAX_WORKFLOW_STORAGE_BYTES) throw new Error("Active workflow recording payload is too large");
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_RECORDING_STORAGE_KEY]: recording });
+  } catch (error) {
+    throw new Error(`Could not persist active workflow recording: ${error?.message ?? String(error)}`);
+  }
+}
+
+async function clearWorkflowRecording() {
+  try {
+    await chrome.storage.local.set({ [WORKFLOW_RECORDING_STORAGE_KEY]: null });
+  } catch (error) {
+    throw new Error(`Could not clear active workflow recording: ${error?.message ?? String(error)}`);
+  }
 }
 
 function containsSensitiveWorkflowField(value, key = "") {
@@ -743,31 +835,37 @@ async function getWorkflow(params) {
 }
 
 async function importWorkflow(params) {
-  if (!isRecord(params) || !isRecord(params.workflow)) throw new Error("workflowImport requires a workflow object");
-  const collection = await loadWorkflowCollection();
-  const workflow = await validateWorkflowSchema(params.workflow);
-  if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
-  if (collection.workflows.some((entry) => entry.id === workflow.id || entry.name === workflow.name || entry.shortcut === workflow.shortcut)) {
-    throw new Error("Imported workflow id, name, and shortcut must be unique");
-  }
-  await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
-  return workflow;
+  return queueWorkflowMutation(async () => {
+    if (!isRecord(params) || !isRecord(params.workflow)) throw new Error("workflowImport requires a workflow object");
+    const collection = await loadWorkflowCollection();
+    const workflow = await validateWorkflowSchema(params.workflow, { hydrateOrigins: true });
+    if (collection.workflows.length >= MAX_WORKFLOWS) throw new Error(`Workflow storage is full; max ${MAX_WORKFLOWS} workflows`);
+    if (collection.workflows.some((entry) => entry.id === workflow.id || entry.name === workflow.name || entry.shortcut === workflow.shortcut)) {
+      throw new Error("Imported workflow id, name, and shortcut must be unique");
+    }
+    await saveWorkflowCollection({ schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows: [...collection.workflows, workflow] });
+    return workflow;
+  });
 }
 
 async function deleteWorkflow(params) {
-  const collection = await loadWorkflowCollection();
-  const workflow = resolveWorkflow(collection, params);
-  await saveWorkflowCollection({
-    schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    workflows: collection.workflows.filter((entry) => entry.id !== workflow.id)
+  return queueWorkflowMutation(async () => {
+    const collection = await loadWorkflowCollection();
+    const workflow = resolveWorkflow(collection, params);
+    await saveWorkflowCollection({
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      workflows: collection.workflows.filter((entry) => entry.id !== workflow.id)
+    });
+    return { deleted: true, id: workflow.id };
   });
-  return { deleted: true, id: workflow.id };
 }
 
 async function runWorkflow(params, options = {}) {
+  throwIfAborted(options.signal);
   if (!isRecord(params)) throw new Error("workflowRun params must be an object");
   const totalTimeoutMs = strictBatchInteger(params.totalTimeoutMs, MIN_BATCH_TIMEOUT_MS, MAX_BATCH_TOTAL_TIMEOUT_MS, DEFAULT_WORKFLOW_TOTAL_TIMEOUT_MS, "totalTimeoutMs");
   const collection = await loadWorkflowCollection();
+  throwIfAborted(options.signal);
   const workflow = resolveWorkflow(collection, params);
   const missingCapabilities = workflow.requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
   if (missingCapabilities.length > 0) throw new Error(`Workflow capability preflight failed: ${missingCapabilities.join(", ")}`);
@@ -778,20 +876,56 @@ async function runWorkflow(params, options = {}) {
   // Validate every step before any browser effect. This also rejects meta/recursive
   // commands and malformed values that may have reached persisted storage.
   const steps = await Promise.all(workflow.steps.map(validateWorkflowStep));
+  throwIfAborted(options.signal);
   const runtimeOrigins = await resolveWorkflowRuntimeOrigins(steps);
   const unauthorizedRuntimeOrigins = runtimeOrigins.filter((origin) => !expectedOrigins.has(origin));
   if (unauthorizedRuntimeOrigins.length > 0) {
     throw new Error(`Workflow origin preflight failed; current tab origins are not authorized: ${unauthorizedRuntimeOrigins.join(", ")}`);
   }
+  const authorizedScopes = options.workflowExpectedScopes
+    ?? [...expectedOrigins].map((origin) => canonicalPermissionScope(`${origin}/`));
+  const bindings = new Map((options.workflowExpectedBindings ?? []).map((binding) => [binding.tabId, binding]));
+  for (const tabId of [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))]) {
+    const current = await currentPageBinding(tabId);
+    if (!workflowScopeAuthorized(current.pageScope, authorizedScopes)) {
+      throw new Error(`Workflow origin preflight failed; current page scope is not authorized: ${current.pageScope}`);
+    }
+    const expected = bindings.get(tabId);
+    if (expected && !workflowBindingMatches(current, expected)) {
+      throw new Error(`Workflow document binding changed before playback for tab ${tabId}`);
+    }
+    if (!expected) bindings.set(tabId, current);
+  }
   const startedAt = Date.now();
   const deadline = startedAt + totalTimeoutMs;
   const results = [];
   for (let index = 0; index < steps.length; index += 1) {
+    throwIfAborted(options.signal);
     const step = steps[index];
     const remainingMs = deadline - Date.now();
     if (remainingMs < MIN_BATCH_TIMEOUT_MS) throw new Error(`Workflow total timeout after ${totalTimeoutMs}ms at step ${index}`);
     try {
+      const hasTab = Number.isInteger(step.params.tabId);
+      const expected = hasTab ? bindings.get(step.params.tabId) : null;
+      if (hasTab) {
+        const current = await currentPageBinding(step.params.tabId);
+        if (!expected || !workflowBindingMatches(current, expected)) {
+          throw new Error(`Workflow document binding changed before step ${index}`);
+        }
+      }
+      if (step.method === "navigate" && !workflowScopeAuthorized(canonicalPermissionScope(step.params.url), authorizedScopes)) {
+        throw new Error(`Workflow navigation destination was not included in origin preflight: ${step.params.url}`);
+      }
       const value = await executeWorkflowStep(step, Math.min(step.timeoutMs, remainingMs), options.signal);
+      const after = hasTab ? await currentPageBinding(step.params.tabId, value?.url) : null;
+      if (step.method === "navigate") {
+        if (!workflowScopeAuthorized(after.pageScope, authorizedScopes)) {
+          throw new Error(`Workflow navigation left its preauthorized origin union: ${after.pageScope}`);
+        }
+        bindings.set(step.params.tabId, after);
+      } else if (hasTab && !workflowBindingMatches(after, expected)) {
+        throw new Error(`Workflow document binding changed during step ${index}`);
+      }
       results.push({ index, method: step.method, ok: true, value });
     } catch (error) {
       results.push({ error: error?.message ?? String(error), index, method: step.method, ok: false });
@@ -799,6 +933,22 @@ async function runWorkflow(params, options = {}) {
     }
   }
   return { completed: results.length, elapsedMs: Date.now() - startedAt, ok: true, results, stoppedAt: null, totalSteps: steps.length, workflowId: workflow.id };
+}
+
+function workflowBindingMatches(current, expected) {
+  return current.documentId === expected.documentId
+    && current.navigationGeneration === expected.navigationGeneration
+    && current.pageScope === expected.pageScope;
+}
+
+function workflowScopeAuthorized(scope, authorizedScopes) {
+  const actual = new URL(canonicalPermissionScope(scope));
+  return authorizedScopes.some((allowedScope) => {
+    const allowed = new URL(canonicalPermissionScope(allowedScope));
+    if (actual.protocol !== allowed.protocol || actual.hostname !== allowed.hostname || actual.port !== allowed.port) return false;
+    const prefix = allowed.pathname === "/" ? "/" : allowed.pathname.replace(/\/$/u, "");
+    return prefix === "/" || actual.pathname === prefix || actual.pathname.startsWith(`${prefix}/`);
+  });
 }
 
 async function resolveWorkflowRuntimeOrigins(steps) {
@@ -822,7 +972,10 @@ function executeWorkflowStep(step, timeoutMs, parentSignal) {
   });
   const timer = setTimeout(() => controller.abort(new Error(`Workflow step ${step.method} timed out after ${timeoutMs}ms`)), timeoutMs);
   const execution = Promise.resolve().then(() => executeCommand(step.method, cloneWorkflowValue(step.params), { signal: controller.signal, workflowInternal: true }));
-  return Promise.race([execution, abortPromise]).finally(() => {
+  return Promise.race([execution, abortPromise]).catch(async (error) => {
+    if (controller.signal.aborted) await execution.catch(() => {});
+    throw error;
+  }).finally(() => {
     clearTimeout(timer);
     parentSignal?.removeEventListener("abort", onParentAbort);
     controller.signal.removeEventListener("abort", rejectOnAbort);
@@ -841,17 +994,16 @@ async function loadWorkflowCollection() {
   if (new TextEncoder().encode(JSON.stringify(raw)).byteLength > MAX_WORKFLOW_STORAGE_BYTES) {
     throw new Error(`Workflow storage payload is too large; max ${MAX_WORKFLOW_STORAGE_BYTES} bytes`);
   }
-  if (!isRecord(raw) || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION || !Array.isArray(raw.workflows) || raw.workflows.length > MAX_WORKFLOWS) {
+  const collectionExtra = isRecord(raw) ? Object.keys(raw).filter((field) => !["schemaVersion", "workflows"].includes(field)) : [];
+  if (!isRecord(raw) || collectionExtra.length > 0 || raw.schemaVersion !== WORKFLOW_SCHEMA_VERSION || !Array.isArray(raw.workflows) || raw.workflows.length > MAX_WORKFLOWS) {
     throw new Error("Persisted workflow collection schema is invalid or unsupported");
   }
-  let migrated = false;
   const workflows = await Promise.all(raw.workflows.map(async (entry) => {
-    if (entry?.schemaVersion === 0) migrated = true;
-    return validateWorkflowSchema(migrateWorkflow(entry));
+    const migratedEntry = migrateWorkflow(entry);
+    return validateWorkflowSchema(migratedEntry, { hydrateOrigins: true });
   }));
   assertUniqueWorkflows(workflows);
   const collection = { schemaVersion: WORKFLOW_SCHEMA_VERSION, workflows };
-  if (migrated) await saveWorkflowCollection(collection);
   return collection;
 }
 
@@ -884,7 +1036,7 @@ function migrateWorkflow(value) {
   };
 }
 
-async function validateWorkflowSchema(value) {
+async function validateWorkflowSchema(value, { hydrateOrigins = false } = {}) {
   if (!isRecord(value) || value.schemaVersion !== WORKFLOW_SCHEMA_VERSION) throw new Error("Workflow schemaVersion is unsupported");
   const allowed = ["schemaVersion", "id", "name", "shortcut", "requiredCapabilities", "requiredOrigins", "steps", "createdAt", "updatedAt"];
   const extra = Object.keys(value).filter((field) => !allowed.includes(field));
@@ -893,25 +1045,26 @@ async function validateWorkflowSchema(value) {
   const name = requireBoundedWorkflowString(value.name, MAX_WORKFLOW_NAME_CHARS, "name");
   const shortcut = normalizeWorkflowShortcut(value.shortcut);
   if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_WORKFLOW_STEPS) throw new Error(`Workflow steps must contain 1 to ${MAX_WORKFLOW_STEPS} entries`);
-  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > BRIDGE_CAPABILITIES.length) throw new Error("Workflow requiredCapabilities is invalid");
-  const requiredCapabilities = [...new Set(value.requiredCapabilities.map((entry) => requireBoundedWorkflowString(entry, 100, "capability")))].sort();
-  const unsupportedCapabilities = requiredCapabilities.filter((capability) => !BRIDGE_CAPABILITIES.includes(capability));
-  if (unsupportedCapabilities.length > 0) throw new Error(`Workflow capabilities are not allowed or unsupported: ${unsupportedCapabilities.join(", ")}`);
+  if (!Array.isArray(value.requiredCapabilities) || value.requiredCapabilities.length > 100) throw new Error("Workflow requiredCapabilities is invalid");
   if (!Array.isArray(value.requiredOrigins) || value.requiredOrigins.length > MAX_WORKFLOW_STEPS) throw new Error("Workflow requiredOrigins is invalid");
-  const requiredOrigins = [...new Set(value.requiredOrigins.map(workflowOrigin))].sort();
   const steps = await Promise.all(value.steps.map(validateWorkflowStep));
-  for (const step of steps) {
-    for (const capability of WORKFLOW_STEP_METHODS[step.method].capability) {
-      if (!requiredCapabilities.includes(capability)) throw new Error(`Workflow requiredCapabilities is missing ${capability}`);
+  const requiredCapabilities = [...new Set(steps.flatMap((step) => WORKFLOW_STEP_METHODS[step.method].capability))].sort();
+  const requiredOrigins = new Set(steps
+    .filter((step) => step.method === "navigate")
+    .map((step) => workflowOrigin(step.params.url)));
+  if (hydrateOrigins) {
+    const tabIds = [...new Set(steps.map((step) => step.params.tabId).filter(Number.isInteger))];
+    for (const tabId of tabIds) {
+      const tab = await chrome.tabs.get(tabId);
+      if (typeof tab?.url !== "string") throw new Error(`Workflow origin metadata could not resolve tab ${tabId}`);
+      requiredOrigins.add(workflowOrigin(tab.url));
     }
-    if (step.method === "navigate") {
-      const destinationOrigin = workflowOrigin(step.params.url);
-      if (!requiredOrigins.includes(destinationOrigin)) throw new Error(`Workflow requiredOrigins is missing ${destinationOrigin}`);
-    }
+  } else {
+    for (const origin of value.requiredOrigins) requiredOrigins.add(workflowOrigin(origin));
   }
   const createdAt = requireWorkflowTimestamp(value.createdAt, "createdAt");
   const updatedAt = requireWorkflowTimestamp(value.updatedAt, "updatedAt");
-  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins, steps, createdAt, updatedAt };
+  return { schemaVersion: WORKFLOW_SCHEMA_VERSION, id, name, shortcut, requiredCapabilities, requiredOrigins: [...requiredOrigins].sort(), steps, createdAt, updatedAt };
 }
 
 async function validateWorkflowStep(value) {
@@ -987,10 +1140,16 @@ async function executeScopedPageCommand(envelope, options) {
   if (!isRecord(envelope) || !ORIGIN_SCOPED_COMMANDS.has(envelope.method) || !isRecord(envelope.params)) {
     throw new Error("scoped page command is invalid or not allowed");
   }
-  const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes);
-  const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const method = envelope.method;
+  const expectedScopes = validateExpectedPageScopes(envelope.expectedScopes, method === "workflowRun" ? 100 : 25);
+  const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const params = envelope.params;
+  if (method === "workflowRun") {
+    return executeCommand(method, params, {
+      ...options, workflowExpectedBindings: expectedBindings,
+      workflowExpectedScopes: expectedScopes, workflowInternal: true
+    });
+  }
   if (method === "evaluate" || (method === "cdpCommand" && params.method === "Runtime.evaluate")) {
     params.__expectedScopes = expectedScopes;
   }
@@ -1129,8 +1288,8 @@ async function currentPageBinding(tabId, knownUrl) {
   };
 }
 
-function validateExpectedPageScopes(value) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 25) {
+function validateExpectedPageScopes(value, maxScopes = 25) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxScopes) {
     throw new Error("scoped page command expectedScopes must be a bounded non-empty array");
   }
   return [...new Set(value.map(canonicalPermissionScope))].sort();
@@ -4296,7 +4455,9 @@ async function waitFor(params, { signal } = {}) {
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
-  throw signal.reason instanceof Error ? signal.reason : new Error("Chrome command was cancelled");
+  if (signal.reason instanceof Error) throw signal.reason;
+  if (typeof signal.reason?.message === "string") throw new Error(signal.reason.message);
+  throw new Error("Chrome command was cancelled");
 }
 
 function abortableSleep(ms, signal) {
