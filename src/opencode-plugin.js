@@ -1200,10 +1200,14 @@ export default async function OpenCodeChromeBridgePlugin() {
       chrome_webmcp_list: tool({
         description: "List the bounded declarative WebMCP tools exposed by the current document. This experimental adapter only reads feature-detected document.modelContext or navigator.modelContext APIs in Chrome's MAIN world.",
         args: {
-          tabId: schema.number().int().describe("Chrome tab id whose approved current origin and exact document will be bound to this discovery call.")
+          tabId: schema.number().int().describe("Chrome tab id whose approved current origin and exact document will be bound to this discovery call."),
+          timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("WebMCP discovery deadline in milliseconds.")
         },
         async execute(args, context) {
-          return JSON.stringify(await bridgeCommand("webMcpList", args, { signal: context.abort }), null, 2);
+          return JSON.stringify(await bridgeCommand("webMcpList", args, {
+            signal: context.abort,
+            timeoutMs: Math.min(35_000, args.timeoutMs + 5_000)
+          }), null, 2);
         }
       }),
       chrome_webmcp_invoke: tool({

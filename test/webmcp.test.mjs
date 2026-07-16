@@ -16,6 +16,8 @@ test("plugin publishes two page-scoped WebMCP tools with one negotiated capabili
     assert.equal(TOOL_ORIGIN_SCOPE_CLASSIFICATION[name], "page");
   }
   assert.equal(tool.chrome_webmcp_list.args.tabId.safeParse(7).success, true);
+  assert.equal(tool.chrome_webmcp_list.args.timeoutMs.safeParse(50).success, true);
+  assert.equal(tool.chrome_webmcp_list.args.timeoutMs.safeParse(30_001).success, false);
   assert.equal(tool.chrome_webmcp_invoke.args.toolName.safeParse("cart.add-item").success, true);
   assert.equal(tool.chrome_webmcp_invoke.args.toolName.safeParse(" cart.add-item ").success, false);
   assert.equal(tool.chrome_webmcp_invoke.args.timeoutMs.safeParse(50).success, true);
@@ -38,6 +40,13 @@ test("WebMCP dispatch is exact-document targeted and guarded by the scoped navig
 test("WebMCP uses only documented discovery and abortable invocation methods", async () => {
   const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
   assert.match(source, /const getTools = context\.getTools/u);
-  assert.match(source, /reflectApply\(executeTool,[\s\S]{0,120}payload\.toolName, payload\.input, \{ signal:/u);
+  assert.match(source, /reflectApply\(executeTool,[\s\S]{0,160}descriptor,[\s\S]{0,80}inputJson,[\s\S]{0,80}\{ signal:/u);
   assert.doesNotMatch(source, /\.listTools\(|\.invokeTool\(|\.callTool\(|context\.tools/u);
+});
+
+test("WebMCP uses an ephemeral clean realm and no fixed page-global registry", async () => {
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  assert.match(source, /createElement\(["']iframe["']\)[\s\S]{0,500}contentWindow/u);
+  assert.match(source, /finally[\s\S]{0,500}(?:remove|removeChild)/u);
+  assert.doesNotMatch(source, /__opencodeWebMcpInvocationRegistry|registryKey/u);
 });

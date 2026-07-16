@@ -2248,12 +2248,17 @@ function requireTabId(params) {
 }
 
 async function listWebMcpTools(params, signal, pageGuard) {
-  assertWebMcpFields(params, ["tabId"], "WebMCP list");
+  assertWebMcpFields(params, ["tabId", "timeoutMs"], "WebMCP list");
   const tabId = requireTabId(params);
+  const timeoutMs = strictBatchInteger(
+    params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+    DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+  );
   const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
-  const envelope = await runWebMcpMainAdapter(tabId, documentId, "list", {}, signal);
+  const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
+  const envelope = await runWebMcpMainAdapter(tabId, documentId, "list", { abortChannel, timeoutMs }, signal);
   if (envelope.supported === false) {
-    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED"].includes(envelope.error?.code)) {
+    if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_DISCOVERY_TIMEOUT"].includes(envelope.error?.code)) {
       throw new Error(`WebMCP metadata is invalid: ${sanitizeWebMcpError(envelope.error?.message)}`);
     }
     return {
@@ -2286,14 +2291,16 @@ async function invokeWebMcpTool(params, signal, pageGuard) {
     "WebMCP input",
     MAX_WEBMCP_INPUT_BYTES
   );
+  const inputJson = JSON.stringify(input);
   const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
-  const token = crypto.randomUUID();
-  const envelope = await runWebMcpMainAdapter(tabId, documentId, "invoke", { input, timeoutMs, token, toolName }, signal);
+  const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
+  const envelope = await runWebMcpMainAdapter(tabId, documentId, "invoke", { abortChannel, inputJson, timeoutMs, toolName }, signal);
   if (!isRecord(envelope)) throw new Error("WebMCP invocation response is invalid");
   if (envelope.ok === false) {
     const error = validateWebMcpError(envelope.error);
     if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_INVOCATION_UNSUPPORTED",
       "WEBMCP_TOOL_NOT_FOUND", "WEBMCP_TOOL_ERROR", "WEBMCP_TIMEOUT",
+      "WEBMCP_DISCOVERY_TIMEOUT", "WEBMCP_EXECUTION_UNSETTLED",
       "WEBMCP_OUTPUT_INVALID", "WEBMCP_OUTPUT_TOO_LARGE"].includes(error.code)) {
       throw new Error("WebMCP invocation returned an invalid error code");
     }
@@ -2342,10 +2349,10 @@ async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signa
   let abortExecution = null;
   let aborted = false;
   const abortInvocation = () => {
-    if (operation !== "invoke" || aborted) return;
+    if (aborted) return;
     aborted = true;
     abortExecution = chrome.scripting.executeScript({
-      args: [payload.token],
+      args: [payload.abortChannel],
       func: webMcpAbortAdapter,
       target,
       world: "MAIN"
@@ -2389,16 +2396,29 @@ async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signa
   }
 }
 
-function webMcpAbortAdapter(token) {
+function webMcpAbortAdapter(abortChannel) {
+  let frame = null;
+  let removeFrame = null;
   try {
-    const registry = globalThis.__opencodeWebMcpInvocationRegistryV1;
-    if (!registry || typeof registry !== "object") return false;
-    const entry = registry[token];
-    if (!entry || typeof entry.abort !== "function") return false;
-    entry.abort();
+    frame = document.createElement("iframe");
+    frame.hidden = true;
+    document.documentElement.appendChild(frame);
+    const clean = frame.contentWindow;
+    if (!clean || typeof abortChannel !== "string" || typeof clean.Event !== "function"
+      || typeof clean.EventTarget?.prototype?.dispatchEvent !== "function"
+      || typeof clean.Reflect?.apply !== "function") return false;
+    removeFrame = frame.remove;
+    const event = new clean.Event(abortChannel);
+    clean.Reflect.apply(removeFrame, frame, []);
+    clean.Reflect.apply(clean.EventTarget.prototype.dispatchEvent, globalThis, [event]);
     return true;
   } catch {
     return false;
+  } finally {
+    try {
+      if (frame && typeof removeFrame === "function") removeFrame.call(frame);
+      else frame?.remove();
+    } catch {}
   }
 }
 
@@ -2406,336 +2426,287 @@ function webMcpAbortAdapter(token) {
 // MAIN world. Keep every dependency local and return only a JSON string so page
 // functions, prototypes, and object identities never cross into the extension.
 async function webMcpMainAdapter(operation, payload) {
-  // Capturing references before invoking page callbacks prevents a callback from
-  // swapping globals underneath this adapter. A realm already poisoned before
-  // entry is not treated as trusted: injection fails closed at the extension
-  // boundary rather than attempting to repair or permanently modify the page.
-  const SafeObject = Object;
-  const SafeArray = Array;
-  const SafeNumber = Number;
-  const SafeString = String;
-  const SafePromise = Promise;
-  const SafeSet = Set;
-  const SafeAbortController = AbortController;
-  const safeSetTimeout = setTimeout;
-  const safeClearTimeout = clearTimeout;
-  const objectCreate = SafeObject.create;
-  const objectKeys = SafeObject.keys;
-  const getOwnPropertyDescriptor = SafeObject.getOwnPropertyDescriptor;
-  const getPrototypeOf = SafeObject.getPrototypeOf;
-  const defineProperty = SafeObject.defineProperty;
-  const arrayIsArray = SafeArray.isArray;
-  const numberIsFinite = SafeNumber.isFinite;
-  const promiseResolve = SafePromise.resolve;
-  const promiseRace = SafePromise.race;
-  const promiseThen = SafePromise.prototype.then;
-  const reflectApply = Reflect.apply;
-  const reflectOwnKeys = Reflect.ownKeys;
-  const regexpTest = RegExp.prototype.test;
-  const setAdd = SafeSet.prototype.add;
-  const setDelete = SafeSet.prototype.delete;
-  const setHas = SafeSet.prototype.has;
-  const stringCharCodeAt = String.prototype.charCodeAt;
-  const stringIncludes = String.prototype.includes;
-  const stringSlice = String.prototype.slice;
-  const abortControllerAbort = SafeAbortController.prototype.abort;
-  const objectPrototype = SafeObject.prototype;
-  const maxTools = 100;
-  const maxDescriptionChars = 2_000;
-  const maxSchemaBytes = 64 * 1024;
-  const maxOutputBytes = 512 * 1024;
-  const maxEnvelopeBytes = 768 * 1024;
-  const maxDepth = 20;
-  const maxNodes = 5_000;
-  const maxKeyChars = 1_000;
-  const namePattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u;
-  const dangerousKeys = new SafeSet(["__proto__", "constructor", "prototype"]);
-  const isPlainRecord = (value) => {
-    const prototype = getPrototypeOf(value);
-    if (prototype === null || prototype === objectPrototype) return true;
-    if (getPrototypeOf(prototype) !== null) return false;
-    const constructorDescriptor = getOwnPropertyDescriptor(prototype, "constructor");
-    return Boolean(constructorDescriptor && "value" in constructorDescriptor
-      && typeof constructorDescriptor.value === "function" && constructorDescriptor.value.name === "Object");
-  };
-
-  const cloneJson = (value, label, maxBytes, sharedBudget = null) => {
-    const ancestors = new SafeSet();
-    let nodes = 0;
-    let characters = 0;
-    const spend = (count) => {
-      characters += count;
-      if (characters > maxBytes) throw new Error(`${label} is too large`);
-      if (sharedBudget) {
-        sharedBudget.characters += count;
-        if (sharedBudget.characters > sharedBudget.maxCharacters) throw new Error("WebMCP metadata exceeds the total character budget");
-      }
-    };
-    const visit = (current, depth) => {
-      nodes += 1;
-      if (nodes > maxNodes || depth > maxDepth) throw new Error(`${label} is not bounded JSON`);
-      if (current === null) { spend(4); return null; }
-      if (typeof current === "string") { spend(current.length + 2); return current; }
-      if (typeof current === "boolean") { spend(5); return current; }
-      if (typeof current === "number") {
-        if (!numberIsFinite(current)) throw new Error(`${label} contains a non-finite number`);
-        spend(24);
-        return current;
-      }
-      if (typeof current !== "object") throw new Error(`${label} contains a non-JSON value`);
-      if (reflectApply(setHas, ancestors, [current])) throw new Error(`${label} contains a cycle`);
-      reflectApply(setAdd, ancestors, [current]);
-      let copy;
-      if (arrayIsArray(current)) {
-        copy = [];
-        spend(2 + current.length);
-        const ownKeys = reflectOwnKeys(current);
-        for (let keyIndex = 0; keyIndex < ownKeys.length; keyIndex += 1) {
-          const key = ownKeys[keyIndex];
-          if (key === "length") continue;
-          if (typeof key !== "string" || !reflectApply(regexpTest, /^(?:0|[1-9][0-9]*)$/u, [key])
-            || Number(key) >= current.length) throw new Error(`${label} contains an ambiguous array key`);
-          const descriptor = getOwnPropertyDescriptor(current, key);
-          if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error(`${label} contains an accessor or hidden array value`);
-        }
-        for (let index = 0; index < current.length; index += 1) {
-          const descriptor = getOwnPropertyDescriptor(current, SafeString(index));
-          if (!descriptor || !("value" in descriptor)) throw new Error(`${label} contains an accessor or sparse array`);
-          copy[index] = visit(descriptor.value, depth + 1);
-        }
-      } else {
-        if (!isPlainRecord(current)) throw new Error(`${label} must contain only plain records`);
-        copy = objectCreate(null);
-        const keys = reflectOwnKeys(current);
-        spend(2 + keys.length);
-        for (let index = 0; index < keys.length; index += 1) {
-          const key = keys[index];
-          if (typeof key !== "string") throw new Error(`${label} contains a symbol key`);
-          if (key.length > maxKeyChars || reflectApply(setHas, dangerousKeys, [key])) throw new Error(`${label} contains an ambiguous key`);
-          const descriptor = getOwnPropertyDescriptor(current, key);
-          if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error(`${label} contains an accessor or hidden value`);
-          spend(key.length + 3);
-          copy[key] = visit(descriptor.value, depth + 1);
-        }
-      }
-      reflectApply(setDelete, ancestors, [current]);
-      return copy;
-    };
-    return visit(value, 0);
-  };
-  const quoteJsonString = (text, state) => {
-    const hex = "0123456789abcdef";
-    let output = "\"";
-    state.bytes += 1;
-    for (let index = 0; index < text.length; index += 1) {
-      const code = reflectApply(stringCharCodeAt, text, [index]);
-      if (code === 34 || code === 92) { output += `\\${text[index]}`; state.bytes += 2; }
-      else if (code === 8) { output += "\\b"; state.bytes += 2; }
-      else if (code === 9) { output += "\\t"; state.bytes += 2; }
-      else if (code === 10) { output += "\\n"; state.bytes += 2; }
-      else if (code === 12) { output += "\\f"; state.bytes += 2; }
-      else if (code === 13) { output += "\\r"; state.bytes += 2; }
-      else if (code < 32) {
-        output += `\\u00${hex[(code >> 4) & 15]}${hex[code & 15]}`;
-        state.bytes += 6;
-      } else {
-        output += text[index];
-        if (code < 0x80) state.bytes += 1;
-        else if (code < 0x800) state.bytes += 2;
-        else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length
-          && reflectApply(stringCharCodeAt, text, [index + 1]) >= 0xdc00
-          && reflectApply(stringCharCodeAt, text, [index + 1]) <= 0xdfff) {
-          output += text[index + 1];
-          state.bytes += 4;
-          index += 1;
-        } else state.bytes += 3;
-      }
-      if (state.bytes > state.maxBytes) throw new Error("WebMCP serialized envelope is too large");
-    }
-    state.bytes += 1;
-    return `${output}\"`;
-  };
-  const serializeJson = (value, maxBytes = maxEnvelopeBytes) => {
-    const state = { bytes: 0, maxBytes };
-    const write = (current) => {
-      if (current === null) { state.bytes += 4; return "null"; }
-      if (typeof current === "string") return quoteJsonString(current, state);
-      if (typeof current === "boolean") { state.bytes += current ? 4 : 5; return current ? "true" : "false"; }
-      if (typeof current === "number" && numberIsFinite(current)) {
-        const encoded = SafeString(current);
-        state.bytes += encoded.length;
-        return encoded;
-      }
-      if (arrayIsArray(current)) {
-        let encoded = "[";
-        state.bytes += 1;
-        for (let index = 0; index < current.length; index += 1) {
-          if (index > 0) { encoded += ","; state.bytes += 1; }
-          encoded += write(current[index]);
-        }
-        state.bytes += 1;
-        if (state.bytes > state.maxBytes) throw new Error("WebMCP serialized envelope is too large");
-        return `${encoded}]`;
-      }
-      if (current && typeof current === "object") {
-        const keys = objectKeys(current);
-        let encoded = "{";
-        state.bytes += 1;
-        for (let index = 0; index < keys.length; index += 1) {
-          if (index > 0) { encoded += ","; state.bytes += 1; }
-          encoded += `${quoteJsonString(keys[index], state)}:${write(current[keys[index]])}`;
-          state.bytes += 1;
-        }
-        state.bytes += 1;
-        if (state.bytes > state.maxBytes) throw new Error("WebMCP serialized envelope is too large");
-        return `${encoded}}`;
-      }
-      throw new Error("WebMCP envelope contains a non-JSON value");
-    };
-    return write(value);
-  };
-  const errorEnvelope = (code, message, supported, source = null) => ({
-    error: { code, message: reflectApply(stringSlice, SafeString(message || code), [0, 500]) },
-    ok: false,
-    source,
-    supported
-  });
-  const serialize = (value) => {
-    try { return serializeJson(value); } catch { return "{\"ok\":false,\"supported\":false,\"source\":null,\"error\":{\"code\":\"WEBMCP_OUTPUT_INVALID\",\"message\":\"WebMCP adapter could not serialize its result\"}}"; }
-  };
-  const registryKey = "__opencodeWebMcpInvocationRegistryV1";
-  let invocationController = null;
-  let invocationRegistry = null;
-  let invocationToken = null;
-
+  let frame = null;
+  let removeFrame = null;
+  const unsupported = operation === "list"
+    ? "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"A clean WebMCP execution realm is unavailable\"},\"source\":null,\"supported\":false,\"tools\":[]}"
+    : "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"A clean WebMCP execution realm is unavailable\"},\"ok\":false,\"source\":null,\"supported\":false}";
   try {
-    if (operation === "invoke") {
-      if (!payload || typeof payload !== "object" || typeof payload.token !== "string") {
-        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation token is invalid", false));
+    frame = document.createElement("iframe");
+    frame.hidden = true;
+    frame.setAttribute?.("aria-hidden", "true");
+    document.documentElement.appendChild(frame);
+    const clean = frame.contentWindow;
+    removeFrame = frame.remove;
+    if (!clean || clean === globalThis || typeof clean.Object?.create !== "function" || typeof clean.Object?.getOwnPropertyDescriptor !== "function"
+      || typeof clean.Object?.getPrototypeOf !== "function" || typeof clean.Array?.isArray !== "function"
+      || typeof clean.Number?.isFinite !== "function" || typeof clean.Promise?.race !== "function"
+      || typeof clean.Set !== "function" || typeof clean.AbortController !== "function"
+      || typeof clean.Reflect?.apply !== "function" || typeof clean.Reflect?.ownKeys !== "function"
+      || typeof clean.JSON?.stringify !== "function" || typeof clean.EventTarget?.prototype?.addEventListener !== "function"
+      || typeof clean.EventTarget?.prototype?.removeEventListener !== "function" || typeof clean.setTimeout !== "function") return unsupported;
+
+    const SafeObject = clean.Object;
+    const SafeArray = clean.Array;
+    const SafeNumber = clean.Number;
+    const SafeString = clean.String;
+    const SafePromise = clean.Promise;
+    const SafeSet = clean.Set;
+    const SafeAbortController = clean.AbortController;
+    const objectCreate = SafeObject.create;
+    const getOwnPropertyDescriptor = SafeObject.getOwnPropertyDescriptor;
+    const getPrototypeOf = SafeObject.getPrototypeOf;
+    const arrayIsArray = SafeArray.isArray;
+    const numberIsFinite = SafeNumber.isFinite;
+    const reflectApply = clean.Reflect.apply;
+    const reflectOwnKeys = clean.Reflect.ownKeys;
+    const regexpTest = clean.RegExp.prototype.test;
+    const setAdd = SafeSet.prototype.add;
+    const setDelete = SafeSet.prototype.delete;
+    const setForEach = SafeSet.prototype.forEach;
+    const setHas = SafeSet.prototype.has;
+    const stringCharCodeAt = SafeString.prototype.charCodeAt;
+    const stringIncludes = SafeString.prototype.includes;
+    const stringSlice = SafeString.prototype.slice;
+    const abortControllerAbort = SafeAbortController.prototype.abort;
+    const addEventListener = clean.EventTarget.prototype.addEventListener;
+    const removeEventListener = clean.EventTarget.prototype.removeEventListener;
+    const safeSetTimeout = clean.setTimeout;
+    const safeClearTimeout = clean.clearTimeout;
+    const safeJsonStringify = clean.JSON.stringify;
+    const objectPrototype = SafeObject.prototype;
+    reflectApply(removeFrame, frame, []);
+    const timers = new SafeSet();
+    const maxEnvelopeBytes = 768 * 1024;
+    const dangerousKeys = new SafeSet(["__proto__", "constructor", "prototype"]);
+    const controller = new SafeAbortController();
+    let abortResolve;
+    const abortPromise = new SafePromise((resolve) => { abortResolve = resolve; });
+    const onAbort = () => {
+      reflectApply(abortControllerAbort, controller, []);
+      abortResolve({ kind: "abort" });
+    };
+    if (!payload || typeof payload !== "object" || typeof payload.abortChannel !== "string"
+      || typeof payload.timeoutMs !== "number") return unsupported;
+    reflectApply(addEventListener, globalThis, [payload.abortChannel, onAbort]);
+
+    const utf8Bytes = (text, jsonString = false) => {
+      let bytes = 0;
+      for (let index = 0; index < text.length; index += 1) {
+        const code = reflectApply(stringCharCodeAt, text, [index]);
+        if (jsonString && (code === 34 || code === 92 || code === 8 || code === 9
+          || code === 10 || code === 12 || code === 13)) bytes += 2;
+        else if (jsonString && code < 32) bytes += 6;
+        else if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
+          const next = reflectApply(stringCharCodeAt, text, [index + 1]);
+          if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index += 1; } else bytes += 3;
+        } else bytes += 3;
       }
-      invocationToken = payload.token;
-      invocationController = new SafeAbortController();
-      const registryDescriptor = getOwnPropertyDescriptor(globalThis, registryKey);
-      if (registryDescriptor == null) {
-        invocationRegistry = objectCreate(null);
-        defineProperty(globalThis, registryKey, { configurable: true, value: invocationRegistry });
-      } else if ("value" in registryDescriptor) {
-        invocationRegistry = registryDescriptor.value;
-      }
-      if (!invocationRegistry || getPrototypeOf(invocationRegistry) !== null) {
-        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation registry is invalid", false));
-      }
-      invocationRegistry[invocationToken] = {
-        abort: () => reflectApply(abortControllerAbort, invocationController, [])
+      return bytes;
+    };
+    const isPlainRecord = (value) => {
+      const prototype = getPrototypeOf(value);
+      if (prototype === null || prototype === objectPrototype) return true;
+      if (getPrototypeOf(prototype) !== null) return false;
+      const descriptor = getOwnPropertyDescriptor(prototype, "constructor");
+      return Boolean(descriptor && "value" in descriptor && typeof descriptor.value === "function"
+        && descriptor.value.name === "Object");
+    };
+    const cloneJson = (value, label, maxBytes, sharedBudget = null) => {
+      const ancestors = new SafeSet();
+      let nodes = 0;
+      let bytes = 0;
+      const spend = (count) => {
+        bytes += count;
+        if (bytes > maxBytes) throw new clean.Error(`${label} is too large`);
+        if (sharedBudget) {
+          sharedBudget.bytes += count;
+          if (sharedBudget.bytes > sharedBudget.maxBytes) throw new clean.Error("WebMCP metadata exceeds the total byte budget");
+        }
       };
-    }
-    const documentContext = typeof document === "object" && document ? document.modelContext : null;
-    const navigatorContext = typeof navigator === "object" && navigator ? navigator.modelContext : null;
-    const context = documentContext && typeof documentContext === "object"
-      ? documentContext
-      : navigatorContext && typeof navigatorContext === "object" ? navigatorContext : null;
-    const source = context === documentContext ? "document" : context === navigatorContext ? "navigator" : null;
-    if (!context) {
-      return serialize(operation === "list"
+      const visit = (current, depth) => {
+        nodes += 1;
+        if (nodes > 5_000 || depth > 20) throw new clean.Error(`${label} is not bounded JSON`);
+        if (current === null) { spend(4); return null; }
+        if (typeof current === "string") { spend(utf8Bytes(current, true) + 2); return current; }
+        if (typeof current === "boolean") { spend(5); return current; }
+        if (typeof current === "number") {
+          if (!numberIsFinite(current)) throw new clean.Error(`${label} contains a non-finite number`);
+          spend(24); return current;
+        }
+        if (typeof current !== "object") throw new clean.Error(`${label} contains a non-JSON value`);
+        if (reflectApply(setHas, ancestors, [current])) throw new clean.Error(`${label} contains a cycle`);
+        reflectApply(setAdd, ancestors, [current]);
+        let copy;
+        if (arrayIsArray(current)) {
+          copy = [];
+          spend(2 + current.length);
+          const keys = reflectOwnKeys(current);
+          for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+            const key = keys[keyIndex];
+            if (key === "length") continue;
+            if (typeof key !== "string" || !reflectApply(regexpTest, /^(?:0|[1-9][0-9]*)$/u, [key])
+              || SafeNumber(key) >= current.length) throw new clean.Error(`${label} contains an ambiguous array key`);
+            const descriptor = getOwnPropertyDescriptor(current, key);
+            if (!descriptor?.enumerable || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or hidden array value`);
+          }
+          for (let index = 0; index < current.length; index += 1) {
+            const descriptor = getOwnPropertyDescriptor(current, SafeString(index));
+            if (!descriptor || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or sparse array`);
+            copy[index] = visit(descriptor.value, depth + 1);
+          }
+        } else {
+          if (!isPlainRecord(current)) throw new clean.Error(`${label} must contain only plain records`);
+          copy = objectCreate(null);
+          const keys = reflectOwnKeys(current);
+          spend(2 + keys.length);
+          for (let index = 0; index < keys.length; index += 1) {
+            const key = keys[index];
+            if (typeof key !== "string") throw new clean.Error(`${label} contains a symbol key`);
+            if (key.length > 1_000 || reflectApply(setHas, dangerousKeys, [key])) throw new clean.Error(`${label} contains an ambiguous key`);
+            const descriptor = getOwnPropertyDescriptor(current, key);
+            if (!descriptor?.enumerable || !("value" in descriptor)) throw new clean.Error(`${label} contains an accessor or hidden value`);
+            spend(utf8Bytes(key, true) + 3);
+            copy[key] = visit(descriptor.value, depth + 1);
+          }
+        }
+        reflectApply(setDelete, ancestors, [current]);
+        return copy;
+      };
+      return visit(value, 0);
+    };
+    const safeMessage = (message) => reflectApply(stringSlice, SafeString(message || "WebMCP error"), [0, 500]);
+    const errorEnvelope = (code, message, supported, source = null) => ({
+      error: { code, message: safeMessage(message) }, ok: false, source, supported
+    });
+    const serialize = (value) => {
+      try {
+        const encoded = reflectApply(safeJsonStringify, clean.JSON, [value]);
+        if (utf8Bytes(encoded) > maxEnvelopeBytes) throw new clean.Error("envelope too large");
+        return encoded;
+      } catch {
+        return "{\"ok\":false,\"supported\":false,\"source\":null,\"error\":{\"code\":\"WEBMCP_OUTPUT_INVALID\",\"message\":\"WebMCP adapter could not serialize its result\"}}";
+      }
+    };
+    const delay = (milliseconds, kind) => new SafePromise((resolve) => {
+      const timer = safeSetTimeout(() => {
+        reflectApply(setDelete, timers, [timer]);
+        resolve({ kind });
+      }, milliseconds);
+      reflectApply(setAdd, timers, [timer]);
+    });
+    const settle = (promise) => reflectApply(SafePromise.prototype.then, promise, [
+      (value) => ({ kind: "fulfilled", value }),
+      (error) => ({ error, kind: "rejected" })
+    ]);
+
+    try {
+      const documentContext = typeof document === "object" && document ? document.modelContext : null;
+      const navigatorContext = typeof navigator === "object" && navigator ? navigator.modelContext : null;
+      const context = documentContext && typeof documentContext === "object"
+        ? documentContext : navigatorContext && typeof navigatorContext === "object" ? navigatorContext : null;
+      const source = context === documentContext ? "document" : context === navigatorContext ? "navigator" : null;
+      if (!context) return serialize(operation === "list"
         ? { error: { code: "WEBMCP_UNSUPPORTED", message: "This page does not expose WebMCP" }, source: null, supported: false, tools: [] }
         : errorEnvelope("WEBMCP_UNSUPPORTED", "This page does not expose WebMCP", false));
-    }
-
-    const getTools = context.getTools;
-    if (typeof getTools !== "function") {
-      return serialize(operation === "list"
+      const getTools = context.getTools;
+      if (typeof getTools !== "function") return serialize(operation === "list"
         ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
         : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
-    }
-    const rawTools = await reflectApply(getTools, context, []);
-    if (invocationController?.signal.aborted) {
-      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation was aborted during discovery", true, source));
-    }
-    if (!arrayIsArray(rawTools)) throw new Error("WebMCP discovery returned an invalid tool list");
-    if (rawTools.length > maxTools) throw new Error("WebMCP tool list is too large");
-    const seen = new SafeSet();
-    const tools = [];
-    const metadataBudget = { characters: 0, maxCharacters: maxEnvelopeBytes };
-    for (let index = 0; index < rawTools.length; index += 1) {
-      const rawDescriptor = getOwnPropertyDescriptor(rawTools, SafeString(index));
-      if (!rawDescriptor || !("value" in rawDescriptor)) throw new Error("WebMCP tool list contains an accessor or sparse entry");
-      const raw = rawDescriptor.value;
-      if (!raw || typeof raw !== "object") throw new Error("WebMCP tool metadata is invalid");
-      if (!isPlainRecord(raw)) throw new Error("WebMCP tool metadata must be a plain record");
-      const nameDescriptor = getOwnPropertyDescriptor(raw, "name");
-      if (!nameDescriptor || !("value" in nameDescriptor) || typeof nameDescriptor.value !== "string"
-        || !reflectApply(regexpTest, namePattern, [nameDescriptor.value])) throw new Error("WebMCP tool name is invalid");
-      const name = nameDescriptor.value;
-      metadataBudget.characters += name.length;
-      if (reflectApply(setHas, seen, [name])) throw new Error("WebMCP tool names contain a duplicate");
-      reflectApply(setAdd, seen, [name]);
-      const descriptionDescriptor = getOwnPropertyDescriptor(raw, "description");
-      const description = descriptionDescriptor == null ? "" : "value" in descriptionDescriptor ? descriptionDescriptor.value : null;
-      if (typeof description !== "string" || description.length > maxDescriptionChars) throw new Error("WebMCP tool description is invalid or too large");
-      metadataBudget.characters += description.length;
-      if (metadataBudget.characters > metadataBudget.maxCharacters) throw new Error("WebMCP metadata exceeds the total character budget");
-      const schemaDescriptor = getOwnPropertyDescriptor(raw, "inputSchema");
-      const schema = schemaDescriptor == null ? {} : "value" in schemaDescriptor ? schemaDescriptor.value : null;
-      tools[index] = { description, inputSchema: cloneJson(schema, "WebMCP input schema", maxSchemaBytes, metadataBudget), name };
-    }
-    if (operation === "list") {
-      return serialize({ source, supported: true, tools });
-    }
-    if (operation !== "invoke" || !payload || typeof payload !== "object"
-      || !reflectApply(regexpTest, namePattern, [payload.toolName])) {
-      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation request is invalid", true, source));
-    }
-    let matches = 0;
-    for (let index = 0; index < tools.length; index += 1) if (tools[index].name === payload.toolName) matches += 1;
-    if (matches !== 1) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
-    const executeTool = context.executeTool;
-    if (typeof executeTool !== "function") {
-      return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
-    }
-    let timer;
-    let timedOut = false;
-    const execution = reflectApply(promiseThen, reflectApply(promiseResolve, SafePromise, []), [
-      () => reflectApply(executeTool, context, [payload.toolName, payload.input, { signal: invocationController.signal }])
-    ]);
-    const timeout = new SafePromise((resolve) => {
-      timer = safeSetTimeout(() => {
-        timedOut = true;
-        reflectApply(abortControllerAbort, invocationController, []);
-        resolve();
-      }, payload.timeoutMs);
-    });
-    let rawResult;
-    try {
-      await reflectApply(promiseRace, SafePromise, [[execution, timeout]]);
-      if (timedOut) {
-        try { await execution; } catch {}
-        return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP tool timed out", true, source));
+
+      const discovery = settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
+        () => reflectApply(getTools, context, [])
+      ]));
+      const discoveryOutcome = await reflectApply(SafePromise.race, SafePromise, [[
+        discovery, delay(payload.timeoutMs, "discovery-timeout"), abortPromise
+      ]]);
+      if (discoveryOutcome.kind === "discovery-timeout") {
+        return serialize(operation === "list"
+          ? { error: { code: "WEBMCP_DISCOVERY_TIMEOUT", message: "WebMCP discovery timed out" }, source: null, supported: false, tools: [] }
+          : errorEnvelope("WEBMCP_DISCOVERY_TIMEOUT", "WebMCP discovery timed out", true, source));
       }
-      rawResult = await execution;
+      if (discoveryOutcome.kind === "abort") return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP operation was aborted", true, source));
+      if (discoveryOutcome.kind === "rejected") throw discoveryOutcome.error;
+      const rawTools = discoveryOutcome.value;
+      if (!arrayIsArray(rawTools) || rawTools.length > 100) throw new clean.Error("WebMCP discovery returned an invalid tool list");
+      const seen = new SafeSet();
+      const entries = [];
+      const publicTools = [];
+      const metadataBudget = { bytes: 0, maxBytes: maxEnvelopeBytes };
+      for (let index = 0; index < rawTools.length; index += 1) {
+        const rawDescriptor = getOwnPropertyDescriptor(rawTools, SafeString(index));
+        if (!rawDescriptor || !("value" in rawDescriptor)) throw new clean.Error("WebMCP tool list contains an accessor or sparse entry");
+        const descriptor = rawDescriptor.value;
+        if (!descriptor || typeof descriptor !== "object" || !isPlainRecord(descriptor)) throw new clean.Error("WebMCP tool metadata must be a plain record");
+        const nameDescriptor = getOwnPropertyDescriptor(descriptor, "name");
+        if (!nameDescriptor || !("value" in nameDescriptor) || typeof nameDescriptor.value !== "string"
+          || !reflectApply(regexpTest, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/u, [nameDescriptor.value])) throw new clean.Error("WebMCP tool name is invalid");
+        const name = nameDescriptor.value;
+        if (reflectApply(setHas, seen, [name])) throw new clean.Error("WebMCP tool names contain a duplicate");
+        reflectApply(setAdd, seen, [name]);
+        const descriptionDescriptor = getOwnPropertyDescriptor(descriptor, "description");
+        const description = descriptionDescriptor == null ? "" : "value" in descriptionDescriptor ? descriptionDescriptor.value : null;
+        if (typeof description !== "string" || description.length > 2_000) throw new clean.Error("WebMCP tool description is invalid or too large");
+        metadataBudget.bytes += utf8Bytes(name) + utf8Bytes(description);
+        if (metadataBudget.bytes > metadataBudget.maxBytes) throw new clean.Error("WebMCP metadata exceeds the total byte budget");
+        const schemaDescriptor = getOwnPropertyDescriptor(descriptor, "inputSchema");
+        const schema = schemaDescriptor == null ? objectCreate(null) : "value" in schemaDescriptor ? schemaDescriptor.value : null;
+        const publicTool = { description, inputSchema: cloneJson(schema, "WebMCP input schema", 64 * 1024, metadataBudget), name };
+        entries[index] = { descriptor, publicTool };
+        publicTools[index] = publicTool;
+      }
+      if (operation === "list") return serialize({ source, supported: true, tools: publicTools });
+      if (operation !== "invoke" || typeof payload.toolName !== "string" || typeof payload.inputJson !== "string") {
+        return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", "WebMCP invocation request is invalid", true, source));
+      }
+      let selected = null;
+      for (let index = 0; index < entries.length; index += 1) {
+        if (entries[index].publicTool.name === payload.toolName) selected = selected === null ? entries[index] : false;
+      }
+      if (!selected) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
+      const descriptor = selected.descriptor;
+      const inputJson = payload.inputJson;
+      const executeTool = context.executeTool;
+      if (typeof executeTool !== "function") return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
+      const execution = settle(reflectApply(SafePromise.prototype.then, SafePromise.resolve(), [
+        () => reflectApply(executeTool, context, [descriptor, inputJson, { signal: controller.signal }])
+      ]));
+      const executionOutcome = await reflectApply(SafePromise.race, SafePromise, [[
+        execution, delay(payload.timeoutMs, "execution-timeout"), abortPromise
+      ]]);
+      if (executionOutcome.kind === "execution-timeout" || executionOutcome.kind === "abort") {
+        reflectApply(abortControllerAbort, controller, []);
+        const grace = await reflectApply(SafePromise.race, SafePromise, [[execution, delay(25, "unsettled")]]);
+        if (grace.kind === "unsettled") return serialize(errorEnvelope("WEBMCP_EXECUTION_UNSETTLED", "WebMCP execution ignored cancellation", true, source));
+        return serialize(errorEnvelope(executionOutcome.kind === "execution-timeout" ? "WEBMCP_TIMEOUT" : "WEBMCP_TOOL_ERROR",
+          executionOutcome.kind === "execution-timeout" ? "WebMCP tool timed out" : "WebMCP operation was aborted", true, source));
+      }
+      if (executionOutcome.kind === "rejected") return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, source));
+      let result;
+      try {
+        result = cloneJson(executionOutcome.value, "WebMCP output", 512 * 1024);
+      } catch (error) {
+        const message = SafeString(error?.message || error);
+        return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source));
+      }
+      return serialize({ invocation: "executeTool", ok: true, result, source, supported: true, toolName: payload.toolName });
     } catch (error) {
-      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", error?.message, true, source));
+      const message = safeMessage(error?.message || error);
+      if (operation === "list") return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
+      return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true));
     } finally {
-      safeClearTimeout(timer);
+      try { reflectApply(setForEach, timers, [(timer) => safeClearTimeout(timer)]); } catch {}
+      try { reflectApply(removeEventListener, globalThis, [payload.abortChannel, onAbort]); } catch {}
     }
-    let result;
-    try {
-      result = cloneJson(rawResult, "WebMCP output", maxOutputBytes);
-    } catch (error) {
-      const message = SafeString(error?.message || error);
-      return serialize(errorEnvelope(reflectApply(stringIncludes, message, ["too large"]) ? "WEBMCP_OUTPUT_TOO_LARGE" : "WEBMCP_OUTPUT_INVALID", message, true, source));
-    }
-    return serialize({ invocation: "executeTool", ok: true, result, source, supported: true, toolName: payload.toolName });
-  } catch (error) {
-    const message = SafeString(error?.message || error);
-    if (operation === "list") {
-      return serialize({ error: { code: "WEBMCP_METADATA_INVALID", message }, source: null, supported: false, tools: [] });
-    }
-    return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", message, true));
+  } catch {
+    return unsupported;
   } finally {
-    if (invocationRegistry && invocationToken !== null) {
-      delete invocationRegistry[invocationToken];
-      if (objectKeys(invocationRegistry).length === 0) delete globalThis[registryKey];
-    }
+    try {
+      if (frame && typeof removeFrame === "function") removeFrame.call(frame);
+      else frame?.remove();
+    } catch {}
   }
 }
 
