@@ -31,6 +31,25 @@ test("page asset bundles decode text and base64, dedupe safe names, and publish 
   assert.ok(manifest.assets.every((asset) => /^[a-f0-9]{64}$/u.test(asset.sha256) && asset.size > 0));
 });
 
+test("page asset publication never renames a directory with retained handles", async (t) => {
+  const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-no-dir-rename-"));
+  t.after(() => rm(projectDirectory, { recursive: true, force: true }));
+  let directoryRenameAttempts = 0;
+  const bundle = await materializePageAssetBundle({
+    projectDirectory,
+    outputDirectory: "assets",
+    assets: [{ url: "https://example.com/app.js", content: "safe" }],
+    renameBundle: async () => {
+      directoryRenameAttempts += 1;
+      const error = new Error("Windows forbids renaming an open directory");
+      error.code = "EPERM";
+      throw error;
+    }
+  });
+  assert.equal(directoryRenameAttempts, 0);
+  assert.equal(JSON.parse(await readFile(path.join(bundle.path, "manifest.json"), "utf8")).assets.length, 1);
+});
+
 test("page asset bundles enforce one total byte cap without publishing partial output", async (t) => {
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-limit-"));
   t.after(() => rm(projectDirectory, { recursive: true, force: true }));
@@ -65,11 +84,16 @@ test("page asset bundles reject invalid base64 and symlink output escapes", asyn
 
 test("page asset transaction cleanup never recursively follows an unverified final path", async () => {
   const source = await readFile(path.resolve(import.meta.dirname, "../src/workspace-artifacts.js"), "utf8");
-  assert.match(source, /stagingPath = path\.join\(directory\.projectRoot/u);
+  assert.match(source, /finalPath = path\.join\(directory\.resolvedDirectory/u);
+  assert.doesNotMatch(source, /renameBundle/u);
   assert.doesNotMatch(source, /rm\(finalPath,\s*\{\s*recursive:\s*true/u);
 });
 
 test("page asset publication rolls back its own bundle after an output-directory symlink swap", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows correctly prevents renaming the retained output directory");
+    return;
+  }
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-race-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-race-outside-"));
   t.after(() => Promise.all([
@@ -83,15 +107,19 @@ test("page asset publication rolls back its own bundle after an output-directory
     projectDirectory,
     outputDirectory: "artifacts",
     assets: [{ url: "https://example.com/app.js", mimeType: "text/javascript", content: "secret bytes" }],
-    renameBundle: async (source, destination) => {
+    afterBundleFilesWritten: async () => {
       await rename(path.join(projectDirectory, "artifacts"), originalDirectory);
       await symlink(outside, path.join(projectDirectory, "artifacts"));
-      await rename(source, destination);
     }
-  }), /output directory changed|identity|publish/iu);
+  }), /changed|identity|publish/iu);
   assert.deepEqual(await readdir(outside), ["unrelated.txt"]);
   assert.equal(await readFile(path.join(outside, "unrelated.txt"), "utf8"), "keep me");
-  assert.deepEqual(await readdir(originalDirectory), []);
+  const [partialBundle] = await readdir(originalDirectory);
+  const partialFiles = await readdir(path.join(originalDirectory, partialBundle));
+  assert.equal(partialFiles.includes("manifest.json"), false);
+  for (const filename of partialFiles) {
+    assert.equal((await readFile(path.join(originalDirectory, partialBundle, filename))).length, 0, filename);
+  }
 });
 
 test("page asset manifests propagate inventory overflow and never persist signed URL secrets", async (t) => {
@@ -115,6 +143,10 @@ test("page asset manifests propagate inventory overflow and never persist signed
 });
 
 test("page asset staging rejects a path swap before the first retained file is opened", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows correctly prevents renaming the retained bundle directory");
+    return;
+  }
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-open-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-open-outside-"));
   t.after(() => Promise.all([
@@ -137,6 +169,10 @@ test("page asset staging rejects a path swap before the first retained file is o
 });
 
 test("page asset staging zeroes every retained file when its directory inode moves outside", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows correctly prevents renaming the retained bundle directory");
+    return;
+  }
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-move-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-move-outside-"));
   t.after(() => Promise.all([
@@ -156,13 +192,18 @@ test("page asset staging zeroes every retained file when its directory inode mov
     }
   }), /staging|identity|changed/iu);
   const stolenFiles = await readdir(stolen);
-  assert.equal(stolenFiles.length, 3);
+  assert.equal(stolenFiles.length, 2);
+  assert.equal(stolenFiles.includes("manifest.json"), false);
   for (const filename of stolenFiles) {
     assert.equal((await readFile(path.join(stolen, filename))).length, 0, filename);
   }
 });
 
 test("page asset cleanup never deletes an unrelated staging-path replacement", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows correctly prevents renaming the retained bundle directory");
+    return;
+  }
   const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "opencode-page-assets-stage-cleanup-"));
   const owned = path.join(projectDirectory, "owned-moved-aside");
   t.after(() => rm(projectDirectory, { recursive: true, force: true }));

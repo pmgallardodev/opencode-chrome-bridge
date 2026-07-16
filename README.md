@@ -431,14 +431,17 @@ commits fail closed. `chrome_page_assets` combines DOM and CDP inventories, dedu
 URLs, and can materialize resource content under a project-relative `outputDirectory`.
 Its bundle contains collision-safe filenames plus a `manifest.json` with redacted source URLs,
 MIME types, SHA-256 hashes, byte sizes, truncation flags, and per-resource errors. Binary
-CDP resources are decoded from base64; total decoded content is capped at 10 MiB. Bundle
-publication is atomic and realpath/symlink containment checks reject workspace escapes.
+CDP resources are decoded from base64; total decoded content is capped at 10 MiB. Bundles
+are written directly below the verified output directory without renaming an open directory;
+an atomically published `manifest.json` is the commit marker, so partial directories are not
+returned as complete bundles. Realpath/symlink containment checks reject workspace escapes.
 Asset URLs redact credentials, fragments, and sensitive signed-query values before they
 enter a response, filename, or manifest. This release never fetches cross-origin content:
 cross-origin iframe and subresource URLs remain redacted inventory metadata with an
-explicit skipped-content error. Bundle publication retains identity-checked file handles
-through final verification and caps materialized content at 127 resource files plus the
-manifest; any additional inventory entries remain in the manifest with an explicit
+explicit skipped-content error. Bundle publication retains identity-checked asset handles
+through final verification, then reopens and verifies the manifest commit marker by identity
+and hash. It caps materialized content at 127 resource files plus the manifest; any additional
+inventory entries remain in the manifest with an explicit
 omission error and set its truncation flag.
 
 The `notifications` permission is used only by `chrome_notify`; notification text is

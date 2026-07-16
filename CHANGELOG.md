@@ -16,7 +16,7 @@ All notable changes to this project are documented in this file.
 - **Private network summaries.** `chrome_network_requests` exposes bounded lifecycle
   metadata while omitting bodies/headers and redacting credential-bearing URLs.
 - **Page asset bundles.** `chrome_page_assets` deduplicates DOM/CDP resources and can
-  atomically publish content plus a URL/MIME/hash/size manifest below the workspace.
+  publish content below the workspace with an atomic URL/MIME/hash/size manifest commit marker.
 - **Branded notifications.** `chrome_notify` uses the sole new `notifications`
   permission with strict 120-character title and 1,000-character message limits.
 - **Repair diagnostics.** The popup distinguishes missing hosts, protocol mismatch,
@@ -28,8 +28,10 @@ All notable changes to this project are documented in this file.
   collision-safe filenames, and rejects realpath/symlink escapes before atomic publish.
 - Asset URLs redact credentials and signed query values; cross-origin resource content
   is inventory-only and is never fetched or bundled in this release.
-- Asset staging keeps identity-pinned file handles through publication, zeroes retained
-  files on identity failure, and limits bundles to 127 content files plus the manifest.
+- Asset publication writes directly below the verified output parent without renaming an
+  open directory, keeps identity-pinned asset handles through final verification, publishes
+  the manifest last as the atomic commit marker, zeroes retained files on identity failure,
+  and limits bundles to 127 content files plus the manifest.
 - Popup health checks compare the full manifest permission/origin grant and the current
   extension capabilities instead of treating one permission as representative.
 - Browser origin authorization is recomputed after navigation and redirect; stale page

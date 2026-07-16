@@ -43,7 +43,6 @@ export async function materializePageAssetBundle({
   inventoryTruncated = false,
   outputDirectory,
   projectDirectory,
-  renameBundle = rename,
   totalByteLimit = MAX_PAGE_ASSET_BYTES
 }) {
   if (!Array.isArray(assets) || assets.length > MAX_PAGE_ASSETS) {
@@ -66,23 +65,25 @@ export async function materializePageAssetBundle({
   const directory = await resolveWorkspaceDirectory(projectDirectory, outputDirectory);
   await assertWorkspaceDirectoryIdentity(directory);
   const suffix = `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}`;
-  const stagingPath = path.join(directory.projectRoot, `.opencode-page-assets-${suffix}.tmp`);
   const finalPath = path.join(directory.resolvedDirectory, `page-assets-${suffix}`);
-  await mkdir(stagingPath, { mode: 0o700 });
-  const stagingInfo = await lstat(stagingPath);
-  if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) {
-    throw new Error("page asset staging bundle identity is invalid");
-  }
-  const stagingIdentity = identityOf(stagingInfo);
-  const stagingDirectoryHandle = await open(stagingPath, directoryNoFollowFlags());
-  const directoryHandleInfo = await stagingDirectoryHandle.stat();
-  if (!directoryHandleInfo.isDirectory() || identityOf(directoryHandleInfo) !== stagingIdentity) {
-    await stagingDirectoryHandle.close().catch(() => {});
-    throw new Error("page asset staging directory handle identity is invalid");
-  }
-  let published = false;
+  let bundleIdentity = null;
+  let bundleDirectoryHandle = null;
   const retainedFiles = [];
   try {
+    await assertWorkspaceDirectoryIdentity(directory);
+    await mkdir(finalPath, { mode: 0o700 });
+    const bundleInfo = await lstat(finalPath);
+    if (!bundleInfo.isDirectory() || bundleInfo.isSymbolicLink()) {
+      throw new Error("page asset bundle directory identity is invalid");
+    }
+    bundleIdentity = identityOf(bundleInfo);
+    bundleDirectoryHandle = await open(finalPath, directoryNoFollowFlags());
+    const directoryHandleInfo = await bundleDirectoryHandle.stat();
+    if (!directoryHandleInfo.isDirectory() || identityOf(directoryHandleInfo) !== bundleIdentity) {
+      throw new Error("page asset bundle directory handle identity is invalid");
+    }
+    await assertBundleDirectoryIdentity(finalPath, bundleIdentity, bundleDirectoryHandle, directory);
+
     const manifestAssets = [];
     let bundledBytes = 0;
     let bundleFileLimitReached = false;
@@ -108,13 +109,13 @@ export async function materializePageAssetBundle({
           const filename = pageAssetFilename(asset, manifestAssets.length);
           await writeRetainedBundleFile({
             beforeBundleFileOpen,
+            bundleDirectoryHandle,
+            bundleIdentity,
+            bundlePath: finalPath,
             data: asset.data,
             directory,
             filename,
-            retainedFiles,
-            stagingDirectoryHandle,
-            stagingIdentity,
-            stagingPath
+            retainedFiles
           });
           bundledBytes += asset.data.length;
           Object.assign(entry, {
@@ -137,53 +138,67 @@ export async function materializePageAssetBundle({
         || manifestAssets.some((asset) => asset.truncated === true),
       assets: manifestAssets
     };
-    await writeRetainedBundleFile({
+    await afterBundleFilesWritten({ bundlePath: finalPath, stagingPath: finalPath });
+    await validateCommittedBundle(
+      finalPath, bundleIdentity, directory, retainedFiles, bundleDirectoryHandle, { requireManifest: false }
+    );
+
+    const manifestTempName = `.manifest-${randomBytes(12).toString("hex")}.tmp`;
+    const manifestRecord = await writeRetainedBundleFile({
       beforeBundleFileOpen,
+      bundleDirectoryHandle,
+      bundleIdentity,
+      bundlePath: finalPath,
       data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"),
       directory,
-      filename: "manifest.json",
-      retainedFiles,
-      stagingDirectoryHandle,
-      stagingIdentity,
-      stagingPath
+      filename: manifestTempName,
+      retainedFiles
     });
-    await afterBundleFilesWritten({ stagingPath });
-    await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
-    await assertWorkspaceDirectoryIdentity(directory);
-    await renameBundle(stagingPath, finalPath);
-    published = true;
-    await validatePublishedBundle(finalPath, stagingIdentity, directory, retainedFiles, stagingDirectoryHandle);
+    await closeRetainedBundleFile(manifestRecord);
+    await assertBundleDirectoryIdentity(finalPath, bundleIdentity, bundleDirectoryHandle, directory);
+    await rename(path.join(finalPath, manifestTempName), path.join(finalPath, "manifest.json"));
+    manifestRecord.filename = "manifest.json";
+    manifestRecord.handle = await open(path.join(finalPath, "manifest.json"), readWriteNoFollowFlags());
+    const manifestInfo = await manifestRecord.handle.stat();
+    if (!manifestInfo.isFile() || identityOf(manifestInfo) !== manifestRecord.identity) {
+      throw new Error("published page asset manifest identity does not match its commit file");
+    }
+    await validateRetainedBundleContent(manifestRecord, manifestInfo);
+    await validateCommittedBundle(
+      finalPath, bundleIdentity, directory, retainedFiles, bundleDirectoryHandle, { requireManifest: true }
+    );
     await closeRetainedBundleFiles(retainedFiles);
-    await stagingDirectoryHandle.close();
+    await bundleDirectoryHandle.close();
+    bundleDirectoryHandle = null;
     return {
       ...manifest,
       path: finalPath,
       relativePath: path.relative(directory.projectRoot, finalPath)
     };
   } catch (error) {
-    await beforeBundleCleanup({ finalPath, stagingPath }).catch(() => {});
+    await beforeBundleCleanup({ bundlePath: finalPath, finalPath, stagingPath: finalPath }).catch(() => {});
     await zeroAndCloseRetainedBundleFiles(retainedFiles);
-    await stagingDirectoryHandle.close().catch(() => {});
-    const cleanupPath = published ? finalPath : stagingPath;
-    await quarantineAndRemoveOwnedBundle(cleanupPath, stagingIdentity, retainedFiles, directory)
-      .catch(() => {});
+    await bundleDirectoryHandle?.close().catch(() => {});
+    if (bundleIdentity) {
+      await quarantineAndRemoveOwnedBundle(finalPath, bundleIdentity, retainedFiles, directory).catch(() => {});
+    }
     throw error;
   }
 }
 
 async function writeRetainedBundleFile({
   beforeBundleFileOpen,
+  bundleDirectoryHandle,
+  bundleIdentity,
+  bundlePath,
   data,
   directory,
   filename,
-  retainedFiles,
-  stagingDirectoryHandle,
-  stagingIdentity,
-  stagingPath
+  retainedFiles
 }) {
-  await beforeBundleFileOpen({ filename, stagingPath });
-  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
-  const filePath = path.join(stagingPath, filename);
+  await beforeBundleFileOpen({ bundlePath, filename, stagingPath: bundlePath });
+  await assertBundleDirectoryIdentity(bundlePath, bundleIdentity, bundleDirectoryHandle, directory);
+  const filePath = path.join(bundlePath, filename);
   const handle = await open(filePath, exclusiveNoFollowWriteFlags(), 0o600);
   const record = {
     expectedHash: createHash("sha256").update(data).digest("hex"),
@@ -193,7 +208,7 @@ async function writeRetainedBundleFile({
     identity: null
   };
   retainedFiles.push(record);
-  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
+  await assertBundleDirectoryIdentity(bundlePath, bundleIdentity, bundleDirectoryHandle, directory);
   const handleInfo = await handle.stat();
   const pathInfo = await lstat(filePath);
   if (!handleInfo.isFile() || !pathInfo.isFile() || pathInfo.isSymbolicLink()
@@ -203,23 +218,25 @@ async function writeRetainedBundleFile({
   record.identity = identityOf(handleInfo);
   await handle.writeFile(data);
   await handle.sync();
-  await assertStagingDirectoryIdentity(stagingPath, stagingIdentity, stagingDirectoryHandle, directory);
+  await assertBundleDirectoryIdentity(bundlePath, bundleIdentity, bundleDirectoryHandle, directory);
+  return record;
 }
 
-async function assertStagingDirectoryIdentity(stagingPath, expectedIdentity, directoryHandle, directory) {
+async function assertBundleDirectoryIdentity(bundlePath, expectedIdentity, directoryHandle, directory) {
   try {
-    await assertProjectRootIdentity(directory);
+    await assertWorkspaceDirectoryIdentity(directory);
     const handleInfo = await directoryHandle.stat();
-    const pathInfo = await lstat(stagingPath);
-    const currentRealPath = await realpath(stagingPath);
+    const pathInfo = await lstat(bundlePath);
+    const currentRealPath = await realpath(bundlePath);
     if (!handleInfo.isDirectory() || !pathInfo.isDirectory() || pathInfo.isSymbolicLink()
       || identityOf(handleInfo) !== expectedIdentity || identityOf(pathInfo) !== expectedIdentity
-      || !samePath(currentRealPath, stagingPath)) {
+      || !samePath(currentRealPath, bundlePath)
+      || !samePath(path.dirname(currentRealPath), directory.resolvedDirectory)) {
       throw new Error();
     }
     assertPathWithin(directory.projectRoot, currentRealPath);
   } catch {
-    throw new Error("page asset staging directory changed during publication");
+    throw new Error("page asset bundle directory changed during publication");
   }
 }
 
@@ -231,20 +248,21 @@ async function assertProjectRootIdentity(directory) {
   }
 }
 
-async function validatePublishedBundle(finalPath, stagingIdentity, directory, retainedFiles, stagingDirectoryHandle) {
+async function validateCommittedBundle(
+  finalPath,
+  bundleIdentity,
+  directory,
+  retainedFiles,
+  bundleDirectoryHandle,
+  { requireManifest }
+) {
+  await assertBundleDirectoryIdentity(finalPath, bundleIdentity, bundleDirectoryHandle, directory);
   const publishedInfo = await lstat(finalPath);
-  const handleInfo = await stagingDirectoryHandle.stat();
+  const handleInfo = await bundleDirectoryHandle.stat();
   if (!publishedInfo.isDirectory() || publishedInfo.isSymbolicLink()
-    || identityOf(publishedInfo) !== stagingIdentity || identityOf(handleInfo) !== stagingIdentity) {
-    throw new Error("published page asset bundle identity does not match staging");
+    || identityOf(publishedInfo) !== bundleIdentity || identityOf(handleInfo) !== bundleIdentity) {
+    throw new Error("published page asset bundle identity does not match its retained directory");
   }
-  await assertWorkspaceDirectoryIdentity(directory);
-  const finalRealPath = await realpath(finalPath);
-  assertPathWithin(directory.projectRoot, finalRealPath);
-  if (!samePath(path.dirname(finalRealPath), directory.resolvedDirectory)) {
-    throw new Error("page asset bundle escaped its verified output directory");
-  }
-  await assertWorkspaceDirectoryIdentity(directory);
   for (const record of retainedFiles) {
     const fileInfo = await lstat(path.join(finalPath, record.filename));
     const retainedInfo = await record.handle.stat();
@@ -254,14 +272,13 @@ async function validatePublishedBundle(finalPath, stagingIdentity, directory, re
     }
     await validateRetainedBundleContent(record, retainedInfo);
   }
-  await assertWorkspaceDirectoryIdentity(directory);
-  const verifiedRealPath = await realpath(finalPath);
-  if (!samePath(path.dirname(verifiedRealPath), directory.resolvedDirectory)) {
-    throw new Error("published page asset bundle parent changed during verification");
+  if (requireManifest && !retainedFiles.some((record) => record.filename === "manifest.json")) {
+    throw new Error("published page asset bundle is missing its manifest commit marker");
   }
+  await assertBundleDirectoryIdentity(finalPath, bundleIdentity, bundleDirectoryHandle, directory);
   const finalInfo = await lstat(finalPath);
   if (!finalInfo.isDirectory() || finalInfo.isSymbolicLink()
-    || identityOf(finalInfo) !== stagingIdentity) {
+    || identityOf(finalInfo) !== bundleIdentity) {
     throw new Error("published page asset bundle changed during verification");
   }
 }
@@ -288,14 +305,19 @@ async function validateRetainedBundleContent(record, retainedInfo) {
 
 async function zeroAndCloseRetainedBundleFiles(records) {
   for (const record of records) {
-    await record.handle.truncate(0).catch(() => {});
-    await record.handle.sync().catch(() => {});
+    await record.handle?.truncate(0).catch(() => {});
+    await record.handle?.sync().catch(() => {});
   }
   await closeRetainedBundleFiles(records);
 }
 
 async function closeRetainedBundleFiles(records) {
-  for (const record of records) await record.handle.close().catch(() => {});
+  for (const record of records) await closeRetainedBundleFile(record);
+}
+
+async function closeRetainedBundleFile(record) {
+  await record.handle?.close().catch(() => {});
+  record.handle = null;
 }
 
 async function quarantineAndRemoveOwnedBundle(candidatePath, expectedIdentity, records, directory) {
@@ -779,6 +801,11 @@ async function rollbackWorkspaceArtifact(artifact) {
 function exclusiveNoFollowWriteFlags() {
   const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
   return fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | noFollow;
+}
+
+function readWriteNoFollowFlags() {
+  const noFollow = Number.isInteger(fsConstants.O_NOFOLLOW) ? fsConstants.O_NOFOLLOW : 0;
+  return fsConstants.O_RDWR | noFollow;
 }
 
 function directoryNoFollowFlags() {
