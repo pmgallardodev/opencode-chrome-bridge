@@ -783,7 +783,7 @@ test("every public tool has an explicit page or browser origin classification", 
   assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
 });
 
-test("WebMCP discovery and invocation require exact current-origin approval before MAIN execution", async () => {
+test("WebMCP discovery and invocation require exact current-origin approval before isolated execution", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const asks = [];
   const bridge = installBridge(({ method }) => {

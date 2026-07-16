@@ -26,6 +26,17 @@ const MAX_ORIGIN_GRANTS_PER_SESSION = 100;
 const WEBMCP_TRANSPORT_TIMEOUT_MS = 35_000;
 const pageOriginSessionGrants = new Map();
 
+async function webMcpBridgeCommand(method, params, signal) {
+  try {
+    return await bridgeCommand(method, params, { signal, timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS });
+  } catch (error) {
+    if (/Bridge request timed out/iu.test(error?.message ?? "")) {
+      throw new Error("WebMCP platform failure: the isolated native operation did not settle after cancellation");
+    }
+    throw error;
+  }
+}
+
 const DESTINATION_SCOPED_TOOLS = new Set(["chrome_open", "chrome_open_window"]);
 const TAB_SCOPED_TOOLS = new Set([
   "chrome_accessibility_tree", "chrome_activate_tab", "chrome_back", "chrome_cdp",
@@ -1205,10 +1216,7 @@ export default async function OpenCodeChromeBridgePlugin() {
           timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("WebMCP discovery deadline in milliseconds.")
         },
         async execute(args, context) {
-          return JSON.stringify(await bridgeCommand("webMcpList", args, {
-            signal: context.abort,
-            timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS
-          }), null, 2);
+          return JSON.stringify(await webMcpBridgeCommand("webMcpList", args, context.abort), null, 2);
         }
       }),
       chrome_webmcp_invoke: tool({
@@ -1220,12 +1228,12 @@ export default async function OpenCodeChromeBridgePlugin() {
           timeoutMs: schema.number().int().min(50).max(30_000).default(10_000).describe("Page tool timeout in milliseconds.")
         },
         async execute(args, context) {
-          return JSON.stringify(await bridgeCommand("webMcpInvoke", {
+          return JSON.stringify(await webMcpBridgeCommand("webMcpInvoke", {
             input: Object.hasOwn(args, "input") ? args.input : {},
             tabId: args.tabId,
             timeoutMs: args.timeoutMs,
             toolName: args.toolName
-          }, { signal: context.abort, timeoutMs: WEBMCP_TRANSPORT_TIMEOUT_MS }), null, 2);
+          }, context.abort), null, 2);
         }
       }),
       chrome_click_element: tool({

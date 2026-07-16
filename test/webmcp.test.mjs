@@ -26,10 +26,12 @@ test("plugin publishes two page-scoped WebMCP tools with one negotiated capabili
 
 test("WebMCP bridge calls forward cancellation and bounded timeout without bypass flags", async () => {
   const source = await readFile(new URL("../src/opencode-plugin.js", import.meta.url), "utf8");
-  assert.match(source, /webMcpList[\s\S]{0,400}signal:\s*context\.abort/u);
-  assert.match(source, /webMcpInvoke[\s\S]{0,500}signal:\s*context\.abort[\s\S]{0,200}timeoutMs/u);
+  assert.match(source, /webMcpBridgeCommand\("webMcpList", args, context\.abort\)/u);
+  assert.match(source, /webMcpBridgeCommand\("webMcpInvoke",[\s\S]{0,500}context\.abort\)/u);
   assert.match(source, /WEBMCP_TRANSPORT_TIMEOUT_MS\s*=\s*35_000/u);
-  assert.equal((source.match(/timeoutMs:\s*WEBMCP_TRANSPORT_TIMEOUT_MS/gu) ?? []).length, 2);
+  assert.equal((source.match(/timeoutMs:\s*WEBMCP_TRANSPORT_TIMEOUT_MS/gu) ?? []).length, 1);
+  assert.equal((source.match(/webMcpBridgeCommand\("webMcp(?:List|Invoke)"/gu) ?? []).length, 2);
+  assert.match(source, /WebMCP platform failure: the isolated native operation did not settle/u);
   assert.doesNotMatch(source, /chrome_webmcp_(?:list|invoke)[\s\S]{0,500}skipPermissions/gu);
 });
 
@@ -37,6 +39,8 @@ test("WebMCP dispatch is exact-document targeted and guarded by the scoped navig
   const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
   assert.match(source, /NAVIGATION_BARRIER_COMMANDS[\s\S]{0,800}"webMcpList"[\s\S]{0,100}"webMcpInvoke"/u);
   assert.match(source, /executeScript\(\{[\s\S]{0,300}documentIds:\s*\[documentId\]/u);
+  assert.match(source, /world:\s*"ISOLATED"/u);
+  assert.doesNotMatch(source, /world:\s*"MAIN"[\s\S]{0,500}webMcp/u);
 });
 
 test("WebMCP uses only documented discovery and abortable invocation methods", async () => {
@@ -47,9 +51,9 @@ test("WebMCP uses only documented discovery and abortable invocation methods", a
   assert.doesNotMatch(source, /\.listTools\(|\.invokeTool\(|\.callTool\(|context\.tools/u);
 });
 
-test("WebMCP uses an ephemeral clean realm and no fixed page-global registry", async () => {
+test("WebMCP isolated adapter needs no page-created clean realm or page-global registry", async () => {
   const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
-  assert.match(source, /createElement\(["']iframe["']\)[\s\S]{0,500}contentWindow/u);
-  assert.match(source, /finally[\s\S]{0,500}(?:remove|removeChild)/u);
+  const adapter = source.slice(source.indexOf("async function webMcp"), source.indexOf("function assertWebMcpFields"));
+  assert.doesNotMatch(adapter, /createElement\(["']iframe["']\)|contentWindow/u);
   assert.doesNotMatch(source, /__opencodeWebMcpInvocationRegistry|registryKey/u);
 });

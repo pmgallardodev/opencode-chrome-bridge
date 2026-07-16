@@ -702,9 +702,9 @@ async function executeCommandCore(method, params, options = {}) {
     case "waitFor":
       return waitFor(params, options);
     case "webMcpList":
-      return listWebMcpTools(params, options.signal, options.pageGuard);
+      return listWebMcpTools(params, options.webMcpExternalSignal, options.pageGuard, options.webMcpDeadlineEpochMs);
     case "webMcpInvoke":
-      return invokeWebMcpTool(params, options.signal, options.pageGuard);
+      return invokeWebMcpTool(params, options.webMcpExternalSignal, options.pageGuard, options.webMcpDeadlineEpochMs);
     case "browserBatch":
       return browserBatch(params, options);
     case "clickElement":
@@ -2030,6 +2030,21 @@ async function executeScopedPageCommand(envelope, options) {
   );
   const expectedBindings = validateExpectedPageBindings(envelope.expectedBindings);
   const params = envelope.params;
+  let commandOptions = options;
+  if (["webMcpList", "webMcpInvoke"].includes(method)) {
+    const timeoutMs = strictBatchInteger(
+      params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
+      DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
+    );
+    const webMcpDeadlineEpochMs = Date.now() + timeoutMs;
+    const deadlineSignal = AbortSignal.timeout(timeoutMs);
+    commandOptions = {
+      ...options,
+      signal: options.signal ? AbortSignal.any([options.signal, deadlineSignal]) : deadlineSignal,
+      webMcpDeadlineEpochMs,
+      webMcpExternalSignal: options.signal ?? null
+    };
+  }
   if (method === "workflowRun") {
     return executeCommand(method, params, {
       ...options, workflowExpectedBindings: expectedBindings,
@@ -2049,7 +2064,8 @@ async function executeScopedPageCommand(envelope, options) {
   if (expectedTabBinding && ["fileUploadCommit", "setCursorState", "setFaviconBadge"].includes(method)) {
     params.__expectedDocumentId = expectedTabBinding.documentId;
   }
-  const pageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
+  const rawPageGuard = createPageGuard(method, params, expectedScopes, expectedBindings);
+  const pageGuard = (...args) => abortableChromeOperation(rawPageGuard(...args), commandOptions.signal);
   if (method === "browserBatch") {
     if (!Array.isArray(params.actions) || params.actions.length !== 1) {
       throw new Error("origin-scoped browser batches must contain exactly one action");
@@ -2094,7 +2110,7 @@ async function executeScopedPageCommand(envelope, options) {
   try {
     const persistentMutation = NAVIGATION_BARRIER_PERSISTENT_COMMANDS.has(method);
     const run = async () => {
-      const value = await executeCommand(method, params, { ...options, pageGuard, workflowInternal: true });
+      const value = await executeCommand(method, params, { ...commandOptions, pageGuard, workflowInternal: true });
       if (persistentMutation) await pageGuard(params, value);
       return value;
     };
@@ -2102,7 +2118,7 @@ async function executeScopedPageCommand(envelope, options) {
     result = barrierTabId !== null
       && NAVIGATION_BARRIER_COMMANDS.has(method)
       && !(method === "cdpCommand" && params.method === "Page.navigate")
-      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, options.signal, { persistentMutation })
+      ? await withScopedNavigationBarrier(barrierTabId, pageGuard, run, commandOptions.signal, { persistentMutation })
       : await run();
   } catch (error) {
     if (method !== "click" || error?.authorizedPageEffect !== true) throw error;
@@ -2115,7 +2131,10 @@ async function executeScopedPageCommand(envelope, options) {
     if (method === "click" && after && !pageBindingMatches(after, expectedBindings, expectedScopes)) {
       return { ...result, transition: after };
     }
-    if (method !== "navigate") await pageGuard(params, result);
+    if (method !== "navigate"
+      && (!(["webMcpList", "webMcpInvoke"].includes(method)) || !commandOptions.signal?.aborted)) {
+      await pageGuard(params, result);
+    }
   }
   return result;
 }
@@ -2247,17 +2266,17 @@ function requireTabId(params) {
   return params.tabId;
 }
 
-async function listWebMcpTools(params, signal, pageGuard) {
+async function listWebMcpTools(params, signal, pageGuard, deadlineEpochMs) {
   assertWebMcpFields(params, ["tabId", "timeoutMs"], "WebMCP list");
   const tabId = requireTabId(params);
   const timeoutMs = strictBatchInteger(
     params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
     DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
   );
-  const deadlineEpochMs = Date.now() + timeoutMs;
+  if (!Number.isFinite(deadlineEpochMs)) throw new Error("WebMCP deadline is unavailable");
   const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
   const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
-  const envelope = await runWebMcpMainAdapter(tabId, documentId, "list", { abortChannel, deadlineEpochMs, timeoutMs }, signal);
+  const envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "list", { abortChannel, deadlineEpochMs, timeoutMs }, signal);
   if (envelope.supported === false) {
     if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_DISCOVERY_TIMEOUT"].includes(envelope.error?.code)) {
       throw new Error(`WebMCP metadata is invalid: ${sanitizeWebMcpError(envelope.error?.message)}`);
@@ -2279,7 +2298,7 @@ async function listWebMcpTools(params, signal, pageGuard) {
   };
 }
 
-async function invokeWebMcpTool(params, signal, pageGuard) {
+async function invokeWebMcpTool(params, signal, pageGuard, deadlineEpochMs) {
   assertWebMcpFields(params, ["input", "tabId", "timeoutMs", "toolName"], "WebMCP invoke");
   const tabId = requireTabId(params);
   const toolName = requireWebMcpToolName(params.toolName);
@@ -2287,7 +2306,7 @@ async function invokeWebMcpTool(params, signal, pageGuard) {
     params.timeoutMs, MIN_WEBMCP_TIMEOUT_MS, MAX_WEBMCP_TIMEOUT_MS,
     DEFAULT_WEBMCP_TIMEOUT_MS, "WebMCP timeoutMs"
   );
-  const deadlineEpochMs = Date.now() + timeoutMs;
+  if (!Number.isFinite(deadlineEpochMs)) throw new Error("WebMCP deadline is unavailable");
   const input = cloneBoundedWebMcpJson(
     Object.hasOwn(params, "input") ? params.input : {},
     "WebMCP input",
@@ -2296,13 +2315,13 @@ async function invokeWebMcpTool(params, signal, pageGuard) {
   const inputJson = JSON.stringify(input);
   const documentId = await requireWebMcpDocumentBinding(pageGuard, params);
   const abortChannel = `opencode-webmcp-abort-${crypto.randomUUID()}`;
-  const envelope = await runWebMcpMainAdapter(tabId, documentId, "invoke", { abortChannel, deadlineEpochMs, inputJson, timeoutMs, toolName }, signal);
+  const envelope = await runWebMcpIsolatedAdapter(tabId, documentId, "invoke", { abortChannel, deadlineEpochMs, inputJson, timeoutMs, toolName }, signal);
   if (!isRecord(envelope)) throw new Error("WebMCP invocation response is invalid");
   if (envelope.ok === false) {
     const error = validateWebMcpError(envelope.error);
     if (!["WEBMCP_UNSUPPORTED", "WEBMCP_DISCOVERY_UNSUPPORTED", "WEBMCP_INVOCATION_UNSUPPORTED",
       "WEBMCP_TOOL_NOT_FOUND", "WEBMCP_TOOL_ERROR", "WEBMCP_TIMEOUT",
-      "WEBMCP_DISCOVERY_TIMEOUT", "WEBMCP_EXECUTION_UNSETTLED",
+      "WEBMCP_DISCOVERY_TIMEOUT",
       "WEBMCP_OUTPUT_INVALID", "WEBMCP_OUTPUT_TOO_LARGE"].includes(error.code)) {
       throw new Error("WebMCP invocation returned an invalid error code");
     }
@@ -2339,14 +2358,14 @@ async function requireWebMcpDocumentBinding(pageGuard, params) {
   return binding.documentId;
 }
 
-async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signal) {
+async function runWebMcpIsolatedAdapter(tabId, documentId, operation, payload, signal) {
   throwIfAborted(signal);
   const target = { documentIds: [documentId], tabId };
   const execution = chrome.scripting.executeScript({
     args: [operation, payload],
-    func: webMcpMainAdapter,
+    func: webMcpIsolatedAdapter,
     target,
-    world: "MAIN"
+    world: "ISOLATED"
   });
   let abortExecution = null;
   let aborted = false;
@@ -2357,7 +2376,7 @@ async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signa
       args: [payload.abortChannel],
       func: webMcpAbortAdapter,
       target,
-      world: "MAIN"
+      world: "ISOLATED"
     }).catch(() => []);
   };
   signal?.addEventListener("abort", abortInvocation, { once: true });
@@ -2371,18 +2390,18 @@ async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signa
     }
     const message = error?.message ?? String(error);
     if (/document|frame|navigation|tab.*closed|not found/iu.test(message)) {
-      throw new Error("WebMCP exact approved document changed before MAIN-world dispatch");
+      throw new Error("WebMCP exact approved document changed before isolated-world dispatch");
     }
     return operation === "list"
-      ? webMcpUnsupportedList("The page or browser does not expose an executable MAIN-world WebMCP context")
-      : webMcpInvocationError("WEBMCP_UNSUPPORTED", "The page or browser does not expose an executable MAIN-world WebMCP context", false);
+      ? webMcpUnsupportedList("The page or browser does not expose an executable isolated-world WebMCP context")
+      : webMcpInvocationError("WEBMCP_UNSUPPORTED", "The page or browser does not expose an executable isolated-world WebMCP context", false);
   } finally {
     signal?.removeEventListener("abort", abortInvocation);
   }
   if (aborted) await abortExecution;
   throwIfAborted(signal);
   if (!Array.isArray(results) || results.length !== 1 || typeof results[0]?.result !== "string") {
-    throw new Error("WebMCP MAIN-world adapter returned an invalid envelope");
+    throw new Error("WebMCP isolated-world adapter returned an invalid envelope");
   }
   const serialized = results[0].result;
   if (new TextEncoder().encode(serialized).byteLength > MAX_WEBMCP_ENVELOPE_BYTES) {
@@ -2394,64 +2413,29 @@ async function runWebMcpMainAdapter(tabId, documentId, operation, payload, signa
   try {
     return JSON.parse(serialized);
   } catch {
-    throw new Error("WebMCP MAIN-world adapter returned invalid JSON");
+    throw new Error("WebMCP isolated-world adapter returned invalid JSON");
   }
 }
 
 function webMcpAbortAdapter(abortChannel) {
-  let frame = null;
-  let removeFrame = null;
   try {
-    frame = document.createElement("iframe");
-    frame.hidden = true;
-    document.documentElement.appendChild(frame);
-    const clean = frame.contentWindow;
-    if (!clean || typeof abortChannel !== "string" || typeof clean.Event !== "function"
-      || typeof clean.EventTarget?.prototype?.dispatchEvent !== "function"
-      || typeof clean.Reflect?.apply !== "function") return false;
-    removeFrame = frame.remove;
-    const event = new clean.Event(abortChannel);
-    clean.Reflect.apply(removeFrame, frame, []);
-    clean.Reflect.apply(clean.EventTarget.prototype.dispatchEvent, globalThis, [event]);
+    if (typeof abortChannel !== "string") return false;
+    globalThis.dispatchEvent(new Event(abortChannel));
     return true;
   } catch {
     return false;
-  } finally {
-    try {
-      if (frame && typeof removeFrame === "function") removeFrame.call(frame);
-      else frame?.remove();
-    } catch {}
   }
 }
 
-// This function is serialized by chrome.scripting and executes once in the page's
-// MAIN world. Keep every dependency local and return only a JSON string so page
-// functions, prototypes, and object identities never cross into the extension.
-async function webMcpMainAdapter(operation, payload) {
-  let frame = null;
-  let removeFrameSafely = null;
+// This function is serialized by chrome.scripting and executes once in Chrome's
+// trusted extension ISOLATED world. Keep every dependency local and return only
+// a JSON string so WebMCP descriptors never leave the injected call.
+async function webMcpIsolatedAdapter(operation, payload) {
   const unsupported = operation === "list"
-    ? "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"A clean WebMCP execution realm is unavailable\"},\"source\":null,\"supported\":false,\"tools\":[]}"
-    : "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"A clean WebMCP execution realm is unavailable\"},\"ok\":false,\"source\":null,\"supported\":false}";
+    ? "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"The isolated document does not expose WebMCP\"},\"source\":null,\"supported\":false,\"tools\":[]}"
+    : "{\"error\":{\"code\":\"WEBMCP_UNSUPPORTED\",\"message\":\"The isolated document does not expose WebMCP\"},\"ok\":false,\"source\":null,\"supported\":false}";
   try {
-    const bootstrapDocument = document;
-    const bootstrapCreateElement = bootstrapDocument.createElement;
-    const bootstrapRoot = bootstrapDocument.documentElement;
-    const bootstrapAppendChild = bootstrapRoot?.appendChild;
-    frame = bootstrapDocument.createElement("iframe");
-    frame.hidden = true;
-    bootstrapRoot.appendChild(frame);
-    const clean = frame.contentWindow;
-    if (!clean || clean === globalThis || typeof clean.Object?.create !== "function" || typeof clean.Object?.getOwnPropertyDescriptor !== "function"
-      || typeof clean.Object?.getPrototypeOf !== "function" || typeof clean.Array?.isArray !== "function"
-      || typeof clean.Number?.isFinite !== "function" || typeof clean.Promise?.race !== "function"
-      || typeof clean.Function?.prototype?.toString !== "function"
-      || typeof clean.Set !== "function" || typeof clean.AbortController !== "function"
-      || typeof clean.Reflect?.apply !== "function" || typeof clean.Reflect?.ownKeys !== "function"
-      || typeof clean.JSON?.stringify !== "function" || typeof clean.EventTarget?.prototype?.addEventListener !== "function"
-      || typeof clean.EventTarget?.prototype?.removeEventListener !== "function" || typeof clean.setTimeout !== "function"
-      || typeof clean.Date?.now !== "function" || typeof clean.Element?.prototype?.remove !== "function") return unsupported;
-
+    const clean = globalThis;
     const SafeObject = clean.Object;
     const SafeArray = clean.Array;
     const SafeNumber = clean.Number;
@@ -2481,27 +2465,7 @@ async function webMcpMainAdapter(operation, payload) {
     const safeClearTimeout = clean.clearTimeout;
     const safeJsonStringify = clean.JSON.stringify;
     const safeDateNow = clean.Date.now;
-    const functionToString = clean.Function.prototype.toString;
     const objectPrototype = SafeObject.prototype;
-    removeFrameSafely = () => reflectApply(clean.Element.prototype.remove, frame, []);
-    const findPrototypeDescriptor = (value, key) => {
-      if (getOwnPropertyDescriptor(value, key)) return null;
-      let prototype = getPrototypeOf(value);
-      while (prototype) {
-        const descriptor = getOwnPropertyDescriptor(prototype, key);
-        if (descriptor) return descriptor;
-        prototype = getPrototypeOf(prototype);
-      }
-      return null;
-    };
-    const createDescriptor = findPrototypeDescriptor(bootstrapDocument, "createElement");
-    const appendDescriptor = findPrototypeDescriptor(bootstrapRoot, "appendChild");
-    const contentWindowDescriptor = findPrototypeDescriptor(frame, "contentWindow");
-    const removeDescriptor = findPrototypeDescriptor(frame, "remove");
-    if (createDescriptor?.value !== bootstrapCreateElement || appendDescriptor?.value !== bootstrapAppendChild
-      || typeof contentWindowDescriptor?.get !== "function" || typeof removeDescriptor?.value !== "function"
-      || reflectApply(contentWindowDescriptor.get, frame, []) !== clean) return unsupported;
-    removeFrameSafely();
     const timers = new SafeSet();
     const maxEnvelopeBytes = 768 * 1024;
     const dangerousKeys = new SafeSet(["__proto__", "constructor", "prototype"]);
@@ -2639,17 +2603,10 @@ async function webMcpMainAdapter(operation, payload) {
       if (!context) return serialize(operation === "list"
         ? { error: { code: "WEBMCP_UNSUPPORTED", message: "This page does not expose WebMCP" }, source: null, supported: false, tools: [] }
         : errorEnvelope("WEBMCP_UNSUPPORTED", "This page does not expose WebMCP", false));
-      const getToolsDescriptor = findPrototypeDescriptor(context, "getTools");
-      const officialGetTools = getToolsDescriptor?.value;
-      const getToolsSource = typeof officialGetTools === "function"
-        ? reflectApply(functionToString, officialGetTools, []) : "";
-      // JavaScript has no universal Proxy detector. Requiring the exact named
-      // native WebIDL source and prototype descriptor rejects own overrides,
-      // ordinary monkeypatches, bound functions, and generic callable Proxies;
-      // any shape that cannot be authenticated fails closed as unsupported.
-      if (!getToolsDescriptor || getToolsDescriptor.enumerable || getToolsDescriptor.writable !== true
-        || getToolsDescriptor.configurable !== true
-        || !reflectApply(regexpTest, /^function getTools\(\) \{\s*\[native code\]\s*\}$/u, [getToolsSource])) return unsupported;
+      const officialGetTools = context.getTools;
+      if (typeof officialGetTools !== "function") return serialize(operation === "list"
+        ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
+        : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
       const discoveryBudgetMs = remainingMs();
       if (discoveryBudgetMs <= 0) return serialize(operation === "list"
         ? { error: { code: "WEBMCP_DISCOVERY_TIMEOUT", message: "WebMCP discovery timed out" }, source: null, supported: false, tools: [] }
@@ -2670,7 +2627,6 @@ async function webMcpMainAdapter(operation, payload) {
         if (discoveryOutcome.error?.code === "WEBMCP_DISCOVERY_UNSUPPORTED") return serialize(operation === "list"
           ? { error: { code: "WEBMCP_DISCOVERY_UNSUPPORTED", message: "The WebMCP context has no supported discovery method" }, source: null, supported: false, tools: [] }
           : errorEnvelope("WEBMCP_DISCOVERY_UNSUPPORTED", "The WebMCP context has no supported discovery method", true, source));
-        if (discoveryOutcome.error?.name === "TypeError") return unsupported;
         throw discoveryOutcome.error;
       }
       const rawTools = discoveryOutcome.value;
@@ -2712,19 +2668,12 @@ async function webMcpMainAdapter(operation, payload) {
       if (!selected) return serialize(errorEnvelope("WEBMCP_TOOL_NOT_FOUND", "The exact WebMCP tool was not found", true, source));
       const descriptor = selected.descriptor;
       const inputJson = payload.inputJson;
-      const executeToolDescriptor = findPrototypeDescriptor(context, "executeTool");
-      const officialExecuteTool = executeToolDescriptor?.value;
-      const executeToolSource = typeof officialExecuteTool === "function"
-        ? reflectApply(functionToString, officialExecuteTool, []) : "";
-      if (!executeToolDescriptor || executeToolDescriptor.enumerable || executeToolDescriptor.writable !== true
-        || executeToolDescriptor.configurable !== true
-        || !reflectApply(regexpTest, /^function executeTool\(\) \{\s*\[native code\]\s*\}$/u, [executeToolSource])) {
-        return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no trusted invocation method", true, source));
+      const officialExecuteTool = context.executeTool;
+      if (typeof officialExecuteTool !== "function") {
+        return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
       }
       const executionRemainingMs = remainingMs();
       if (executionRemainingMs <= 0) return serialize(errorEnvelope("WEBMCP_TIMEOUT", "WebMCP tool timed out", true, source));
-      const reservedGraceMs = Math.min(25, Math.floor(executionRemainingMs / 2));
-      const activeExecutionMs = Math.max(0, executionRemainingMs - reservedGraceMs);
       const abortSignalGetter = getOwnPropertyDescriptor(SafeAbortController.prototype, "signal")?.get;
       if (typeof abortSignalGetter !== "function") return unsupported;
       const signal = reflectApply(abortSignalGetter, controller, []);
@@ -2732,15 +2681,13 @@ async function webMcpMainAdapter(operation, payload) {
         () => reflectApply(officialExecuteTool, context, [descriptor, inputJson, { signal }])
       ]));
       const executionOutcome = await reflectApply(SafePromise.race, SafePromise, [[
-        execution, delay(activeExecutionMs, "execution-timeout"), abortPromise
+        execution, delay(executionRemainingMs, "execution-timeout"), abortPromise
       ]]);
       if (executionOutcome.kind === "execution-timeout" || executionOutcome.kind === "abort") {
         reflectApply(abortControllerAbort, controller, []);
-        const graceMs = Math.min(reservedGraceMs || 1, remainingMs());
-        const grace = graceMs > 0
-          ? await reflectApply(SafePromise.race, SafePromise, [[execution, delay(graceMs, "unsettled")]])
-          : { kind: "unsettled" };
-        if (grace.kind === "unsettled") return serialize(errorEnvelope("WEBMCP_EXECUTION_UNSETTLED", "WebMCP execution ignored cancellation", true, source));
+        // The official isolated-world executeTool contract owns cancellation.
+        // Never release the scoped barrier while its promise is still pending.
+        await execution;
         return serialize(errorEnvelope(executionOutcome.kind === "execution-timeout" ? "WEBMCP_TIMEOUT" : "WEBMCP_TOOL_ERROR",
           executionOutcome.kind === "execution-timeout" ? "WebMCP tool timed out" : "WebMCP operation was aborted", true, source));
       }
@@ -2748,7 +2695,6 @@ async function webMcpMainAdapter(operation, payload) {
         if (executionOutcome.error?.code === "WEBMCP_INVOCATION_UNSUPPORTED") {
           return serialize(errorEnvelope("WEBMCP_INVOCATION_UNSUPPORTED", "The WebMCP context has no supported invocation method", true, source));
         }
-        if (executionOutcome.error?.name === "TypeError") return unsupported;
         return serialize(errorEnvelope("WEBMCP_TOOL_ERROR", executionOutcome.error?.message, true, source));
       }
       let result;
@@ -2769,10 +2715,6 @@ async function webMcpMainAdapter(operation, payload) {
     }
   } catch {
     return unsupported;
-  } finally {
-    try {
-      removeFrameSafely?.();
-    } catch {}
   }
 }
 

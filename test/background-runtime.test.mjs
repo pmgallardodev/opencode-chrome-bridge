@@ -4978,7 +4978,7 @@ function webMcpMainWorld({ bootstrapPoison = null, cleanRealmAvailable = true, d
   }
   class CleanModelContext {}
   Object.defineProperties(CleanModelContext.prototype, {
-    getTools: { configurable: true, writable: true, value: function getTools() {
+    getTools: { configurable: true, enumerable: true, writable: true, value: function getTools() {
       const implementation = officialContexts.get(this);
       if (!implementation) throw new TypeError("Illegal invocation");
       if (typeof implementation.getTools !== "function") {
@@ -4988,7 +4988,7 @@ function webMcpMainWorld({ bootstrapPoison = null, cleanRealmAvailable = true, d
       }
       return implementation.getTools.call(this);
     } },
-    executeTool: { configurable: true, writable: true, value: function executeTool(descriptor, inputJson, options) {
+    executeTool: { configurable: true, enumerable: true, writable: true, value: function executeTool(descriptor, inputJson, options) {
       const implementation = officialContexts.get(this);
       if (!implementation) throw new TypeError("Illegal invocation");
       if (typeof implementation.executeTool !== "function") {
@@ -5089,16 +5089,29 @@ function webMcpMainWorld({ bootstrapPoison = null, cleanRealmAvailable = true, d
   if (trustPageSetupContext && page.document?.modelContext) {
     page.document.modelContext = makeOfficialContext(page.document.modelContext);
   }
+  const isolatedDocument = documentContext === undefined ? {} : { modelContext: officialDocumentContext };
+  const isolated = vm.createContext({
+    AbortController,
+    addEventListener: CleanEventTarget.prototype.addEventListener,
+    clearTimeout,
+    dispatchEvent: CleanEventTarget.prototype.dispatchEvent,
+    document: isolatedDocument,
+    Event: CleanEvent,
+    EventTarget: CleanEventTarget,
+    navigator: navigatorContext === undefined ? {} : { modelContext: officialNavigatorContext },
+    removeEventListener: CleanEventTarget.prototype.removeEventListener,
+    setTimeout
+  });
   const execute = async (details) => {
-    assert.equal(details.world, "MAIN");
+    assert.equal(details.world, "ISOLATED");
     assert.equal(Array.isArray(details.files), false);
     onRun?.();
-    const injected = vm.runInContext(`(${details.func.toString()})`, page);
+    const injected = vm.runInContext(`(${details.func.toString()})`, isolated);
     return [{ result: await injected(...(details.args ?? [])) }];
   };
   execute.page = page;
   execute.setOfficialDocumentContext = (context) => {
-    page.document.modelContext = makeOfficialContext(context);
+    isolatedDocument.modelContext = makeOfficialContext(context);
   };
   Object.defineProperties(execute, {
     framesCreated: { get: () => framesCreated },
@@ -5478,22 +5491,20 @@ test("WebMCP output and metadata reject accessors and non-plain objects without 
   }
 });
 
-test("WebMCP captures intrinsics before page callbacks monkeypatch globals", async () => {
-  const mainWorld = webMcpMainWorld({ trustPageSetupContext: true, pageSetup: `
-    const pageSafeJsonParse = JSON.parse;
-    document.modelContext = {
-      async getTools() {
-        globalThis.JSON = { parse() { throw new Error("poison JSON.parse"); }, stringify() { throw new Error("poison JSON.stringify"); } };
-        globalThis.Object = { keys() { throw new Error("poison Object.keys"); } };
-        Set.prototype.has = () => { throw new Error("poison Set.has"); };
-        String.prototype.charCodeAt = () => { throw new Error("poison charCodeAt"); };
-        globalThis.Promise = { race() { throw new Error("poison Promise.race"); } };
-        globalThis.setTimeout = () => { throw new Error("poison setTimeout"); };
-        return [{ name: "safe", description: "Safe", inputSchema: { type: "object" } }];
-      },
-      async executeTool(descriptor, inputJson, { signal }) { return { name: descriptor.name, input: pageSafeJsonParse(inputJson), aborted: signal.aborted }; }
-    };
-  ` });
+test("WebMCP isolated-world intrinsics ignore page-global monkeypatches", async () => {
+  const mainWorld = webMcpMainWorld({
+    documentContext: {
+      async getTools() { return [{ name: "safe", description: "Safe", inputSchema: { type: "object" } }]; },
+      async executeTool(descriptor, inputJson, { signal }) { return { name: descriptor.name, input: JSON.parse(inputJson), aborted: signal.aborted }; }
+    },
+    pageSetup: `
+      globalThis.AbortController = function PoisonAbort() { throw new Error("poison AbortController"); };
+      globalThis.JSON = { parse() { throw new Error("poison JSON.parse"); }, stringify() { throw new Error("poison JSON.stringify"); } };
+      globalThis.Object = { create() { throw new Error("poison Object"); } };
+      globalThis.Promise = { race() { throw new Error("poison Promise.race"); } };
+      globalThis.setTimeout = () => { throw new Error("poison setTimeout"); };
+    `
+  });
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
   const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
     input: { value: 1 }, timeoutMs: 1_000, toolName: "safe"
@@ -5520,21 +5531,23 @@ test("WebMCP discovery hard deadline returns structurally and releases the scope
   assert.equal(followup.supported, true);
 });
 
-test("WebMCP noncooperative execution returns bounded incompatibility and releases the barrier", async () => {
+test("WebMCP never returns or releases the barrier before an aborted official execution settles", async () => {
+  let releaseExecution;
   const mainWorld = webMcpMainWorld({ documentContext: {
     getTools: async () => [{ name: "stuck", description: "Stuck" }],
-    executeTool: async () => new Promise(() => {})
+    executeTool: async () => new Promise((resolve) => { releaseExecution = resolve; })
   } });
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
-  const outcome = await Promise.race([
-    harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
-      input: {}, timeoutMs: 50, toolName: "stuck"
-    })),
-    new Promise((resolve) => setTimeout(() => resolve("still-pending"), 400))
-  ]);
-  assert.notEqual(outcome, "still-pending");
+  let settled = false;
+  const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
+    input: {}, timeoutMs: 50, toolName: "stuck"
+  })).finally(() => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(settled, false);
+  releaseExecution({ stopped: true });
+  const outcome = await run;
   assert.equal(outcome.ok, false);
-  assert.equal(outcome.error.code, "WEBMCP_EXECUTION_UNSETTLED");
+  assert.equal(outcome.error.code, "WEBMCP_TIMEOUT");
 
   mainWorld.setOfficialDocumentContext({ getTools: async () => [] });
   const followup = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
@@ -5553,25 +5566,17 @@ test("WebMCP enforces output limits by incremental UTF-8 bytes", async () => {
   assert.equal(result.error.code, "WEBMCP_OUTPUT_TOO_LARGE");
 });
 
-test("WebMCP abort channel is not exposed on globals and survives getTools tampering", async () => {
-  const mainWorld = webMcpMainWorld({ trustPageSetupContext: true, pageSetup: `
-    globalThis.testExposedKeys = [];
-    globalThis.testLateEffects = 0;
-    document.modelContext = {
-      async getTools() {
-        globalThis.testExposedKeys = Reflect.ownKeys(globalThis)
-          .filter((key) => typeof key === "string" && /opencode.*webmcp/i.test(key));
-        for (const key of globalThis.testExposedKeys) delete globalThis[key];
-        return [{ name: "slow", description: "Slow" }];
-      },
-      async executeTool(_descriptor, _inputJson, { signal }) {
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => { globalThis.testLateEffects += 1; resolve({ late: true }); }, 80);
-          signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
-        });
-      }
-    };
-  ` });
+test("WebMCP abort channel stays isolated and official abort settles with no late effect", async () => {
+  let lateEffects = 0;
+  const mainWorld = webMcpMainWorld({ documentContext: {
+    async getTools() { return [{ name: "slow", description: "Slow" }]; },
+    async executeTool(_descriptor, _inputJson, { signal }) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { lateEffects += 1; resolve({ late: true }); }, 80);
+        signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+      });
+    }
+  } });
   const controller = new AbortController();
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
   const run = harness.execute("scopedCommand", webMcpEnvelope("webMcpInvoke", {
@@ -5581,11 +5586,13 @@ test("WebMCP abort channel is not exposed on globals and survives getTools tampe
   controller.abort(new Error("hidden-channel abort"));
   await assert.rejects(run, /hidden-channel abort/u);
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.deepEqual(Array.from(mainWorld.page.testExposedKeys), []);
-  assert.equal(mainWorld.page.testLateEffects, 0);
+  const exposedKeys = Reflect.ownKeys(mainWorld.page)
+    .filter((key) => typeof key === "string" && /opencode.*webmcp/i.test(key));
+  assert.deepEqual(exposedKeys, []);
+  assert.equal(lateEffects, 0);
 });
 
-test("WebMCP uses clean ephemeral realm intrinsics when MAIN globals are pre-poisoned", async () => {
+test("WebMCP isolated execution ignores pre-poisoned MAIN globals", async () => {
   let callbacks = 0;
   const mainWorld = webMcpMainWorld({
     documentContext: { getTools: async () => { callbacks += 1; return []; } },
@@ -5602,10 +5609,10 @@ test("WebMCP uses clean ephemeral realm intrinsics when MAIN globals are pre-poi
   const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
   assert.equal(result.supported, true);
   assert.equal(callbacks, 1);
-  assert.equal(mainWorld.framesCreated, mainWorld.framesRemoved);
+  assert.equal(mainWorld.framesCreated, 0);
 });
 
-test("WebMCP fails unsupported before callbacks when a clean realm is unavailable", async () => {
+test("WebMCP does not require a page-created clean realm", async () => {
   let callbacks = 0;
   const mainWorld = webMcpMainWorld({
     cleanRealmAvailable: false,
@@ -5613,9 +5620,9 @@ test("WebMCP fails unsupported before callbacks when a clean realm is unavailabl
   });
   const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
   const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
-  assert.equal(result.supported, false);
-  assert.equal(result.error.code, "WEBMCP_UNSUPPORTED");
-  assert.equal(callbacks, 0);
+  assert.equal(result.supported, true);
+  assert.equal(callbacks, 1);
+  assert.equal(mainWorld.framesCreated, 0);
 });
 
 test("WebMCP discovery and execution share one end-to-end deadline", async () => {
@@ -5690,7 +5697,7 @@ test("WebMCP does not mistake Proxy or bound callables for native modelContext m
   }
 });
 
-test("WebMCP fails closed before callbacks when clean-realm DOM bootstrap hooks are replaced", async () => {
+test("WebMCP isolated adapter never touches poisoned page DOM bootstrap hooks", async () => {
   for (const bootstrapPoison of ["createElement", "appendChild", "contentWindow", "remove", "retain", "mutationObserver"]) {
     let callbacks = 0;
     const mainWorld = webMcpMainWorld({
@@ -5699,10 +5706,10 @@ test("WebMCP fails closed before callbacks when clean-realm DOM bootstrap hooks 
     });
     const harness = createBackgroundHarness({ scriptingExecuteScript: mainWorld });
     const result = await harness.execute("scopedCommand", webMcpEnvelope("webMcpList", { timeoutMs: 100 }));
-    assert.equal(result.supported, false, bootstrapPoison);
-    assert.equal(result.error.code, "WEBMCP_UNSUPPORTED", bootstrapPoison);
-    assert.equal(callbacks, 0, bootstrapPoison);
+    assert.equal(result.supported, true, bootstrapPoison);
+    assert.equal(callbacks, 1, bootstrapPoison);
     assert.equal(mainWorld.framesCreated, mainWorld.framesRemoved, bootstrapPoison);
+    assert.equal(mainWorld.framesCreated, 0, bootstrapPoison);
   }
 });
 
@@ -5887,6 +5894,7 @@ function createBackgroundHarness({
   harnessConsole.error = consoleError;
   const context = vm.createContext({
     AbortController,
+    AbortSignal,
     atob,
     chrome,
     console: harnessConsole,
