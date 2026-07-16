@@ -272,6 +272,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 registerBrowserEventListeners();
 
 connectNativeHost();
+// A service worker can be suspended and later recreated without Chrome firing
+// runtime.onStartup. Reconcile durable schedule state on every module load too.
+void restoreScheduleAlarms();
 
 function connectNativeHost() {
   if (nativePort || reconnecting) return;
@@ -1337,6 +1340,9 @@ async function createSchedule(params) {
     schedule.nextRunAt = nextScheduleRunAt(schedule.recurrence, Date.now());
     const collection = await loadScheduleCollection();
     if (collection.schedules.length >= MAX_SCHEDULES) throw new Error(`Schedule storage is full; max ${MAX_SCHEDULES}`);
+    if (collection.schedules.some((entry) => entry.id === schedule.id)) {
+      throw new Error("Schedule creation ids are single-use and must not replace an existing schedule");
+    }
     await transitionScheduleAlarm(collection, { operation: "upsert", scheduleId: schedule.id, nextSchedule: schedule });
     return schedule;
   });

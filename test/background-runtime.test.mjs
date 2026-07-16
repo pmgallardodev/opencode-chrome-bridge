@@ -4613,6 +4613,45 @@ test("schedule approval is an exact canonical fingerprint and every policy chang
   assert.notEqual(updated.approval.pattern, approval.pattern);
 });
 
+test("schedule creation approval is single-use and cannot overwrite history", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await harness.execute("scheduleApprovalPreview", draft);
+  const schedule = await harness.execute("scheduleCreate", { ...draft, approval });
+  state.local.opencodeSchedules.schedules[0].history.push({
+    id: "history-a", finishedAt: "2026-01-01T00:00:01.000Z", ok: true,
+    startedAt: "2026-01-01T00:00:00.000Z", trigger: "manual"
+  });
+  const alarmCreates = harness.calls.alarmsCreate.length;
+  await assert.rejects(
+    () => harness.execute("scheduleCreate", { ...draft, name: "Overwrite", approval }),
+    /single-use|must not replace/iu
+  );
+  assert.equal(state.local.opencodeSchedules.schedules[0].id, schedule.id);
+  assert.equal(state.local.opencodeSchedules.schedules[0].name, schedule.name);
+  assert.equal(state.local.opencodeSchedules.schedules[0].history.length, 1);
+  assert.equal(harness.calls.alarmsCreate.length, alarmCreates);
+});
+
+test("approved schedule create and manual run-now completes successfully", async () => {
+  const state = managedScheduleState();
+  const harness = createBackgroundHarness({
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const schedule = await createApprovedSchedule(harness);
+  const result = await harness.execute("scheduleRunNow", { id: schedule.id });
+  assert.equal(result.ok, true);
+  assert.equal(result.trigger, "manual");
+  assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 1);
+});
+
 test("scheduled workflows reject incognito tabs and recycled managed-tab identities before effects", async () => {
   const state = managedScheduleState([{ method: "activateTab", params: { tabId: 7 } }]);
   let incognito = false;
@@ -4777,6 +4816,32 @@ test("restart converts a claimed alarm into one sanitized interrupted audit entr
   assert.equal(effects, 0);
   await harness.events.runtimeOnStartup.emit();
   assert.equal((await harness.execute("scheduleHistory", { id: schedule.id })).length, 1);
+});
+
+test("service-worker module load reconciles a durable alarm journal without runtime startup", async () => {
+  const state = managedScheduleState();
+  const first = createBackgroundHarness({
+    alarmsCreate: async () => { throw new Error("alarm create failed"); },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  const draft = scheduleDraft();
+  const approval = await first.execute("scheduleApprovalPreview", draft);
+  await assert.rejects(() => first.execute("scheduleCreate", { ...draft, approval }), /alarm create failed/u);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 1);
+
+  let rearmed = 0;
+  const reloaded = createBackgroundHarness({
+    alarmsCreate: async () => { rearmed += 1; },
+    storageGet: async () => structuredClone(state.session),
+    storageLocalGet: async () => structuredClone(state.local),
+    storageLocalSet: async (value) => { state.local = { ...state.local, ...structuredClone(value) }; }
+  });
+  await reloaded.waitForScheduleRestore();
+  assert.equal(rearmed, 1);
+  assert.equal(state.local.opencodeSchedules.alarmJournal.length, 0);
+  assert.equal(state.local.opencodeSchedules.schedules.length, 1);
 });
 
 test("schedules create named alarms, restore them, and deduplicate one occurrence", async () => {
@@ -5055,6 +5120,9 @@ function createBackgroundHarness({
   vm.runInContext(backgroundSource, context, { filename: "extension/background.js" });
 
   return {
+    async waitForScheduleRestore() {
+      await vm.runInContext("scheduleMutationQueue", context);
+    },
     activeNativeCommandCount() {
       return vm.runInContext("activeNativeCommands.size", context);
     },
