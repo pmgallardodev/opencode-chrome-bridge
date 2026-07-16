@@ -637,6 +637,89 @@ test("Page frame before webNavigation commit reconciles to the committed exact d
   assert.ok(current.navigationGeneration > 0);
 });
 
+test("same-scope commit before CDP frame never relabels the old loader as the reloaded document", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: "document-a1", frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 601, origin: "https://example.com" }
+  });
+
+  await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://example.com/app" });
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-a2", frameId: 0, tabId: 7, url: "https://example.com/app"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 602, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "late-a1" }], executionContextId: 601, type: "log"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "premature-a2" }], executionContextId: 602, type: "log"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a2", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 603, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-a2" }], executionContextId: 603, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a2");
+});
+
+test("same-scope CDP frame before commit stays pending and drops every precommit context", async () => {
+  const harness = createBackgroundHarness({
+    tabsGet: async (tabId) => ({ active: true, id: tabId, url: "https://example.com/app", windowId: 1 }),
+    webNavigationGetFrame: async () => ({ documentId: "document-a1", frameId: 0 })
+  });
+  await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: true });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 701, origin: "https://example.com" }
+  });
+
+  await harness.events.webNavigationOnBeforeNavigate.emit({ frameId: 0, tabId: 7, url: "https://example.com/app" });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a1", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Page.frameNavigated", {
+    frame: { id: "persistent-main", loaderId: "loader-a2", url: "https://example.com/app" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 702, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "late-a1-before-commit" }], executionContextId: 701, type: "log"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "premature-a2-before-commit" }], executionContextId: 702, type: "log"
+  });
+  const precommit = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(precommit.logs.length, 0);
+  await harness.events.webNavigationOnCommitted.emit({
+    documentId: "document-a2", frameId: 0, tabId: 7, url: "https://example.com/app"
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.executionContextCreated", {
+    context: { auxData: { frameId: "persistent-main", isDefault: true }, id: 703, origin: "https://example.com" }
+  });
+  await harness.events.debuggerOnEvent.emit({ tabId: 7 }, "Runtime.consoleAPICalled", {
+    args: [{ type: "string", value: "current-a2-after-commit" }], executionContextId: 703, type: "log"
+  });
+  const logs = await harness.execute("getConsoleLogs", { tabId: 7, autoAttach: false });
+  assert.equal(logs.logs.map((entry) => entry.text).join("\n"), "current-a2-after-commit");
+});
+
 test("top-level B to A navigation cannot expose old or late B network entries", async () => {
   const harness = createBackgroundHarness();
   await harness.execute("networkRequests", { tabId: 7, autoAttach: true });
