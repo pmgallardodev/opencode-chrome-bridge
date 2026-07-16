@@ -100,7 +100,7 @@ test("no-timeout WebMCP quota rejects excess while regular commands and status r
   const handshake = await frames.next((message) => message.type === "command" && message.method === "handshake")
     .catch((error) => { throw new Error(`status handshake: ${error.message}`); });
   writeNativeFrame(child.stdin, { type: "response", id: handshake.id, ok: true, result: {
-    capabilities: ["bridge.handshake"], extensionId: "test-extension", extensionVersion: "1.4.0",
+    capabilities: ["bridge.handshake"], extensionId: "test-extension", extensionVersion: "1.4.1",
     hostName: "com.opencode.chrome_bridge", protocolVersion: "1.0.0"
   } });
   const status = await statusRequest;

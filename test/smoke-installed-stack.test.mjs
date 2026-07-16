@@ -25,11 +25,11 @@ test("installed-stack smoke owns and cleans one dedicated workflow and schedule 
     throw new Error(`unexpected ${method}`);
   };
   const status = async () => ({
-    client: { version: "1.4.0" },
+    client: { version: "1.4.1" },
     compatible: true,
     connected: true,
-    extension: { extensionVersion: "1.4.0" },
-    host: { version: "1.4.0" },
+    extension: { extensionVersion: "1.4.1" },
+    host: { version: "1.4.1" },
     ok: true
   });
   const server = {
@@ -56,24 +56,24 @@ test("installed-stack smoke rejects stale or incompatible extension before creat
     command: async () => { commands += 1; },
     createFixtureServer: async () => { throw new Error("fixture must not start"); },
     status: async () => ({
-      client: { version: "1.4.0" },
+      client: { version: "1.4.1" },
       compatible: true,
       connected: true,
       extension: { extensionVersion: "1.3.0" },
-      host: { version: "1.4.0" },
+      host: { version: "1.4.1" },
       ok: true
     })
-  }), /extension.*1\.4\.0/iu);
+  }), /extension.*1\.4\.1/iu);
   assert.equal(commands, 0);
 });
 
 test("installed-stack smoke rejects stale native host or client versions before creating a tab", async () => {
   for (const status of [
     {
-      client: { version: "1.4.0" },
+      client: { version: "1.4.1" },
       compatible: true,
       connected: true,
-      extension: { extensionVersion: "1.4.0" },
+      extension: { extensionVersion: "1.4.1" },
       host: { version: "1.3.0" },
       ok: true
     },
@@ -81,8 +81,8 @@ test("installed-stack smoke rejects stale native host or client versions before 
       client: { version: "1.3.0" },
       compatible: true,
       connected: true,
-      extension: { extensionVersion: "1.4.0" },
-      host: { version: "1.4.0" },
+      extension: { extensionVersion: "1.4.1" },
+      host: { version: "1.4.1" },
       ok: true
     }
   ]) {
@@ -91,7 +91,7 @@ test("installed-stack smoke rejects stale native host or client versions before 
       command: async () => { commands += 1; },
       createFixtureServer: async () => { throw new Error("fixture must not start"); },
       status: async () => status
-    }), /requires .*1\.4\.0/iu);
+    }), /requires .*1\.4\.1/iu);
     assert.equal(commands, 0);
   }
 });
@@ -111,11 +111,11 @@ test("installed-stack smoke safely finalizes its dedicated session after a parti
       close: async () => { methods.push("fixtureClose"); }
     }),
     status: async () => ({
-      client: { version: "1.4.0" },
+      client: { version: "1.4.1" },
       compatible: true,
       connected: true,
-      extension: { extensionVersion: "1.4.0" },
-      host: { version: "1.4.0" },
+      extension: { extensionVersion: "1.4.1" },
+      host: { version: "1.4.1" },
       ok: true
     })
   }), /tab not found/iu);
