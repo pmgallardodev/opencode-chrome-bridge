@@ -242,6 +242,26 @@ test("legacy host status is distinct from a current host with a disconnected ext
   }
 });
 
+test("successful bridge responses with invalid JSON fail with a clear error", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("not json", {
+    headers: { "Content-Type": "application/json" },
+    status: 200
+  });
+  try {
+    await assert.rejects(
+      () => bridgeClient.bridgeCommand("listTabs"),
+      /invalid JSON response/u
+    );
+    await assert.rejects(
+      () => bridgeClient.pollEvents(0),
+      /invalid JSON response/u
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("legacy host recognition rejects lookalike payloads with extra fields", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({

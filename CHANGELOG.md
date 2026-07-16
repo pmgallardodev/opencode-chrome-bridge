@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.4.2 — 2026-07-16
+
+### Fixed
+
+- A bridge HTTP response that reports success but carries an invalid or empty JSON
+  body now fails with a clear "Bridge returned an invalid JSON response" error in
+  both bridge-client transports, instead of surfacing later as a confusing
+  `TypeError` when the command result is read.
+
+### Maintenance
+
+- Full-codebase bug review of the extension, native host, plugin, bridge client,
+  content scripts, and installer scripts; behavioral probes over navigation-policy
+  matching, key event synthesis, schedule recurrence, and scope canonicalization
+  confirmed no further functional defects.
+- Removed an unused `rm` import from the workspace artifact writer.
+
 ## v1.4.1 — 2026-07-16
 
 ### Fixed

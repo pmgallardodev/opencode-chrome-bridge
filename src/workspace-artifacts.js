@@ -9,7 +9,6 @@ import {
   realpath,
   rename,
   rmdir,
-  rm,
   unlink
 } from "node:fs/promises";
 

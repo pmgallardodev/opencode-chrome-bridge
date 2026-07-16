@@ -29,10 +29,10 @@ function compatibleStatus() {
     compatible: true,
     hostReachable: true,
     legacy: false,
-    host: { name: "com.opencode.chrome_bridge", version: "1.4.1", protocolMin: "1.0.0", protocolMax: "1.0.0" },
-    client: { name: "opencode-plugin", version: "1.4.1", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    host: { name: "com.opencode.chrome_bridge", version: "1.4.2", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    client: { name: "opencode-plugin", version: "1.4.2", protocolMin: "1.0.0", protocolMax: "1.0.0" },
     extension: {
-      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.4.1", protocolVersion: "1.0.0",
+      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.4.2", protocolVersion: "1.0.0",
       hostName: "com.opencode.chrome_bridge",
       capabilities: pluginModule.ALL_TOOL_REQUIRED_CAPABILITIES
     },
