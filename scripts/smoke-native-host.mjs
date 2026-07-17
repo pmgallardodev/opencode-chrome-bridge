@@ -80,7 +80,7 @@ try {
       capabilities: ["bridge.handshake", "browser.tabs"],
       extensionId: "smoke-extension",
       extensionName: "OpenCode Chrome Bridge",
-      extensionVersion: "1.4.2",
+      extensionVersion: "1.4.3",
       hostName: "com.opencode.chrome_bridge",
       protocolVersion: "1.0.0"
     }
@@ -92,7 +92,7 @@ try {
     || payload.legacy !== false || payload.extension?.extensionId !== "smoke-extension") {
     throw new Error(`Bridge status did not negotiate the extension: ${JSON.stringify(payload)}`);
   }
-  if (payload.host?.version !== "1.4.2" || payload.client?.version !== "1.4.2") {
+  if (payload.host?.version !== "1.4.3" || payload.client?.version !== "1.4.3") {
     throw new Error(`Bridge status did not report host/client versions: ${JSON.stringify(payload)}`);
   }
   if (response.headers.get("cache-control") !== "no-store") throw new Error("Status response must disable caching");
