@@ -23,7 +23,7 @@
     "smoke:installed": "node scripts/smoke-installed-stack.mjs"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.20"
+    "@opencode-ai/plugin": "1.18.3"
   },
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
