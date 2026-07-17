@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.4.3 — 2026-07-17
+
+### Fixed
+
+- `chrome_wizard_step` no longer fails after a click that navigates: the tab
+  metadata reads that re-bind the wizard to the live page (and the binding
+  read inside `authorizePageTransition`) were sent under the stale pre-click
+  page scopes, so the extension's page guard rejected them before the new
+  page could be authorized. These reads now escape the inherited scope
+  context through the new `withoutBridgePageScopes` bridge-client helper,
+  matching the unscoped pre-approval metadata reads.
+- The background service worker now deletes `windowActivationGenerations`
+  entries when a Chrome window closes instead of retaining them for the
+  worker's lifetime.
+
+### Security
+
+- The main-world pre-evaluation origin guard used by `chrome_evaluate` and
+  scoped `Runtime.evaluate` no longer compares scopes with
+  `Array.prototype.includes`, which a hostile page could patch to always
+  return true. The guard now compares unforgeable `location` fields with a
+  plain `===` loop, and both call sites share one helper.
+
+### Maintenance
+
+- Full-codebase bug and OWASP review of the extension background worker,
+  content scripts, popup, native host, bridge client, OpenCode plugin,
+  workspace artifact writer, and installer scripts.
+- The `chrome_get_console_logs` description and README now match the
+  implemented behavior: only the Runtime domain is enabled and only console
+  messages and uncaught exceptions are buffered.
+
 ## v1.4.2 — 2026-07-16
 
 ### Fixed

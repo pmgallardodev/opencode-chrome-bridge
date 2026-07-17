@@ -12,7 +12,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 const MAX_REQUEST_TIMEOUT_MS = 126000;
 const MAX_CAPABILITY_HEADER_CHARS = 10_000;
 const NATIVE_HOST_NAME = "com.opencode.chrome_bridge";
-export const BRIDGE_CLIENT_VERSION = "1.4.2";
+export const BRIDGE_CLIENT_VERSION = "1.4.3";
 export const BRIDGE_PROTOCOL_MIN = "1.0.0";
 export const BRIDGE_PROTOCOL_MAX = "1.0.0";
 const DEFAULT_REQUIRED_CAPABILITIES = Object.freeze(["bridge.handshake"]);
@@ -219,6 +219,15 @@ export async function bridgeCommand(method, params = {}, options = {}) {
     timeoutMs: options.timeoutMs
   }, {}, options.signal);
   return response.result;
+}
+
+export function withoutBridgePageScopes(operation) {
+  // Runs a bridge read outside any inherited page-scope context. Used for tab
+  // metadata reads that feed a new authorization prompt: inside a scoped
+  // operation the inherited scopes describe the pre-navigation page, so a
+  // scoped getTab would be rejected by the extension's page guard before the
+  // plugin can ask the user to approve the page the tab actually shows now.
+  return pageScopeContext.exit(operation);
 }
 
 export function withBridgePageScopes(expectedScopes, operation, expectedBindings = []) {

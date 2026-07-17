@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.4.2-0f766e?style=flat-square" alt="Version v1.4.2" />
+  <img src="https://img.shields.io/badge/Version-v1.4.3-0f766e?style=flat-square" alt="Version v1.4.3" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -381,7 +381,7 @@ Element references survive page mutations but are invalidated by navigation — 
 | Tool | Description |
 | --- | --- |
 | `chrome_events` | Poll buffered browser events (tabs, windows, downloads, CDP) since a sequence number |
-| `chrome_get_console_logs` | Read accumulated console messages, network log entries, and uncaught exceptions for a tab |
+| `chrome_get_console_logs` | Read accumulated console messages and uncaught exceptions for a tab |
 | `chrome_network_requests` | Read bounded lifecycle summaries with credential-bearing URL fields redacted |
 | `chrome_release_debuggers` | Release persistent debugger attachments created for logging or CDP subscriptions |
 
@@ -862,7 +862,7 @@ What each command proves:
   never selected or modified. WebMCP discovery is reported conditionally when Chrome enables it.
 
 Reload the unpacked extension at `chrome://extensions` before `npm run smoke:installed` after
-changing extension code. The command requires a connected, compatible v1.4.2 extension and
+changing extension code. The command requires a connected, compatible v1.4.3 extension and
 fails before opening its fixture tab when Chrome still runs an older service worker.
 
 For a direct bridge status check:

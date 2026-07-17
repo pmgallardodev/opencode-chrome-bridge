@@ -55,12 +55,12 @@ for (const [name, version] of [
   ["package-lock root", packageLock.packages?.[""]?.version],
   ["extension manifest", manifest.version]
 ]) {
-  if (version !== "1.4.2") throw new Error(`${name} release version must be 1.4.2`);
+  if (version !== "1.4.3") throw new Error(`${name} release version must be 1.4.3`);
 }
 const popupHtml = await readFile(path.join(repoRoot, "extension", "popup.html"), "utf8");
 const popupJs = await readFile(path.join(repoRoot, "extension", "popup.js"), "utf8");
-if (!popupHtml.includes('id="version">v1.4.2</span>') || !popupJs.includes('"v1.4.2"')) {
-  throw new Error("popup release metadata must be v1.4.2");
+if (!popupHtml.includes('id="version">v1.4.3</span>') || !popupJs.includes('"v1.4.3"')) {
+  throw new Error("popup release metadata must be v1.4.3");
 }
 const bridgeClientSource = await readFile(path.join(repoRoot, "src", "bridge-client.js"), "utf8");
 const nativeHostSource = await readFile(path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs"), "utf8");
@@ -71,7 +71,7 @@ for (const [name, source] of [
   ["bridge client", bridgeClientSource],
   ["native host", nativeHostSource]
 ]) {
-  if (!source.includes('"1.4.2"')) throw new Error(`${name} release metadata must be v1.4.2`);
+  if (!source.includes('"1.4.3"')) throw new Error(`${name} release metadata must be v1.4.3`);
 }
 for (const required of [
   "chrome_workflow_start",
@@ -82,7 +82,7 @@ for (const required of [
 ]) {
   if (!readme.includes(required)) throw new Error(`README must document ${required}`);
 }
-if (!changelog.includes("## v1.4.2 — 2026-07-16")) throw new Error("CHANGELOG must contain the v1.4.2 release");
+if (!changelog.includes("## v1.4.3 — 2026-07-17")) throw new Error("CHANGELOG must contain the v1.4.3 release");
 if (!security.includes("committed semantics") || !security.includes("irrevocable")) {
   throw new Error("SECURITY must document committed schedule and irrevocable WebMCP semantics");
 }
