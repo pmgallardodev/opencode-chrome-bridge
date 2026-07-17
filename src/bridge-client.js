@@ -221,6 +221,15 @@ export async function bridgeCommand(method, params = {}, options = {}) {
   return response.result;
 }
 
+export function withoutBridgePageScopes(operation) {
+  // Runs a bridge read outside any inherited page-scope context. Used for tab
+  // metadata reads that feed a new authorization prompt: inside a scoped
+  // operation the inherited scopes describe the pre-navigation page, so a
+  // scoped getTab would be rejected by the extension's page guard before the
+  // plugin can ask the user to approve the page the tab actually shows now.
+  return pageScopeContext.exit(operation);
+}
+
 export function withBridgePageScopes(expectedScopes, operation, expectedBindings = []) {
   if (!Array.isArray(expectedScopes) || expectedScopes.length === 0) {
     throw new Error("withBridgePageScopes requires at least one expected page scope");

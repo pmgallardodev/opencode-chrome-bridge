@@ -102,6 +102,28 @@ test("scoped native input preserves CDP mouse, keyboard, text, scroll, evaluate,
   assert.ok(commands.some(({ method, params }) => method === "Input.dispatchMouseEvent" && params.type === "mouseReleased" && params.x === 5 && params.y === 6));
 });
 
+test("scoped evaluate wraps expressions in a prototype-safe origin guard", async () => {
+  const harness = createBackgroundHarness({
+    debuggerSendCommand: async (_target, method) => method === "Runtime.evaluate"
+      ? { result: { value: "guarded" } }
+      : {}
+  });
+  await harness.execute("scopedCommand", {
+    expectedBindings: [pageBinding()], expectedScopes: ["https://example.com:443/"],
+    method: "evaluate", params: { tabId: 7, expression: "1 + 1" }
+  });
+  const evaluate = harness.calls.debuggerCommands.find(({ method }) => method === "Runtime.evaluate");
+  assert.ok(evaluate, "scoped evaluate must dispatch Runtime.evaluate");
+  const expression = evaluate.params.expression;
+  assert.ok(expression.includes(JSON.stringify("https://example.com:443/")), "guard must embed the approved scopes");
+  assert.match(expression, /===\s*s/u, "guard must compare scopes with the unpatchable === operator");
+  assert.doesNotMatch(
+    expression,
+    /\.includes\(/u,
+    "guard runs in the page's main world and must not call page-patchable Array.prototype methods"
+  );
+});
+
 test("every native mutation family emits zero CDP effects after document identity changes", async () => {
   const cases = [
     ["click", { button: "left", x: 1, y: 2 }],

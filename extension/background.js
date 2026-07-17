@@ -3307,6 +3307,15 @@ async function pageGuardStillAuthorized(pageGuard) {
   try { await pageGuard(); return true; } catch { return false; }
 }
 
+// Builds the main-world pre-evaluation origin guard. It runs in the page's
+// realm, where a hostile document can patch Array.prototype and
+// String.prototype, so the scope comparison uses only unforgeable location
+// fields, primitive string concatenation, and the === operator in a plain
+// loop — never a prototype method the page could have replaced.
+function scopeGuardedExpression(expectedScopes, expression) {
+  return `(() => { const p = location.port || (location.protocol === "https:" ? "443" : "80"); const s = location.protocol + "//" + location.hostname + ":" + p + (location.pathname || "/"); const allowed = ${JSON.stringify(expectedScopes)}; let authorized = false; for (let i = 0; i < allowed.length; i += 1) { if (allowed[i] === s) { authorized = true; break; } } if (!authorized) throw new Error("Page scope changed before evaluation"); return (0, eval)(${JSON.stringify(expression)}); })()`;
+}
+
 async function evaluateInTab(params, pageGuard) {
   const tabId = requireTabId(params);
   if (typeof params.expression !== "string" || params.expression.length === 0) {
@@ -3318,7 +3327,7 @@ async function evaluateInTab(params, pageGuard) {
   return withDebugger(tabId, async (target) => {
     await pageGuard?.();
     const guardedExpression = Array.isArray(params.__expectedScopes)
-      ? `(() => { const p = location.port || (location.protocol === "https:" ? "443" : "80"); const s = location.protocol + "//" + location.hostname + ":" + p + (location.pathname || "/"); if (!${JSON.stringify(params.__expectedScopes)}.includes(s)) throw new Error("Page scope changed before evaluation"); return (0, eval)(${JSON.stringify(params.expression)}); })()`
+      ? scopeGuardedExpression(params.__expectedScopes, params.expression)
       : params.expression;
     const response = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       awaitPromise: true,
@@ -4251,7 +4260,7 @@ async function cdpCommand(params, pageGuard) {
     if (typeof commandParams.expression !== "string") throw new Error("Runtime.evaluate requires an expression string");
     commandParams = {
       ...commandParams,
-      expression: `(() => { const p = location.port || (location.protocol === "https:" ? "443" : "80"); const s = location.protocol + "//" + location.hostname + ":" + p + (location.pathname || "/"); if (!${JSON.stringify(params.__expectedScopes)}.includes(s)) throw new Error("Page scope changed before evaluation"); return (0, eval)(${JSON.stringify(commandParams.expression)}); })()`
+      expression: scopeGuardedExpression(params.__expectedScopes, commandParams.expression)
     };
   }
   return withDebuggerTarget(target, async (attachedTarget, { reused }) => {
@@ -4680,6 +4689,9 @@ function registerBrowserEventListeners() {
   chrome.windows.onFocusChanged.addListener((windowId) =>
     sendEvent({ category: "windows", type: "windowFocusChanged", windowId })
   );
+  chrome.windows.onRemoved?.addListener((windowId) => {
+    windowActivationGenerations.delete(windowId);
+  });
   chrome.downloads.onCreated.addListener((item) =>
     sendEvent({ category: "downloads", type: "downloadCreated", downloadId: item.id, filename: item.filename, url: item.url })
   );

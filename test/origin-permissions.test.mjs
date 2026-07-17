@@ -827,6 +827,41 @@ test("wizard re-resolves an asynchronous navigation committed during wait withou
   assert.equal(bridge.calls.find((entry) => entry.method === "evaluate").expectedBindings[0].documentId, "document-b");
 });
 
+test("wizard re-binding tab reads escape the stale pre-click page scopes", async () => {
+  const plugin = await OpenCodeChromeBridgePlugin();
+  let tabReads = 0;
+  const bridge = installBridge(({ method }) => {
+    if (method === "getTab") {
+      tabReads += 1;
+      const redirected = tabReads > 1;
+      return {
+        documentId: redirected ? "document-b" : "document-a",
+        id: 7,
+        navigationGeneration: redirected ? 2 : 1,
+        url: redirected ? "https://b.example/finish" : "https://a.example/start"
+      };
+    }
+    if (method === "click") return { clicked: true };
+    if (method === "evaluate") return "finished-on-b";
+    throw new Error(`unexpected ${method}`);
+  });
+  try {
+    await plugin.tool.chrome_wizard_step.execute({
+      expression: "document.title", tabId: 7, waitMs: 0, x: 1, y: 2
+    }, context([]));
+  } finally {
+    bridge.restore();
+  }
+  // In the live extension a scopedCommand getTab is rejected by the page
+  // guard once the tab left the pre-click scope, so the reads that feed the
+  // transition authorization prompt must be sent unscoped.
+  assert.equal(
+    bridge.calls.filter((entry) => entry.method === "getTab" && entry.scoped === true).length,
+    0,
+    "wizard tab metadata reads must not inherit the stale pre-click page scopes"
+  );
+});
+
 test("scope race rejects combined page data before any workspace artifact is written", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const outputDirectory = path.join(stateDir, "race-artifacts");

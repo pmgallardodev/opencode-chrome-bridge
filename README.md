@@ -381,7 +381,7 @@ Element references survive page mutations but are invalidated by navigation — 
 | Tool | Description |
 | --- | --- |
 | `chrome_events` | Poll buffered browser events (tabs, windows, downloads, CDP) since a sequence number |
-| `chrome_get_console_logs` | Read accumulated console messages, network log entries, and uncaught exceptions for a tab |
+| `chrome_get_console_logs` | Read accumulated console messages and uncaught exceptions for a tab |
 | `chrome_network_requests` | Read bounded lifecycle summaries with credential-bearing URL fields redacted |
 | `chrome_release_debuggers` | Release persistent debugger attachments created for logging or CDP subscriptions |
 

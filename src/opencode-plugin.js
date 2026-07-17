@@ -7,6 +7,7 @@ import {
   pollEvents,
   requireBridgeCapabilities,
   withBridgePageScopes,
+  withoutBridgePageScopes,
   writeDataUrlToFile
 } from "./bridge-client.js";
 import {
@@ -829,8 +830,11 @@ export default async function OpenCodeChromeBridgePlugin() {
 
           // A navigation may commit asynchronously after the native click has
           // already returned. Always bind the finishing work to the live page
-          // after the wait, without repeating the click.
-          const liveTab = await bridgeCommand("getTab", { tabId: args.tabId });
+          // after the wait, without repeating the click. This metadata read
+          // must escape the inherited pre-click page scopes: after a
+          // navigation those scopes no longer match the tab and a scoped
+          // getTab would be rejected before the transition can be authorized.
+          const liveTab = await withoutBridgePageScopes(() => bridgeCommand("getTab", { tabId: args.tabId }));
           if (typeof liveTab?.url !== "string") throw new Error("Wizard target no longer exposes a page URL");
           const liveScope = canonicalPageScope(liveTab.url);
           if (typeof context.authorizePageTransition !== "function") {
@@ -1088,7 +1092,7 @@ export default async function OpenCodeChromeBridgePlugin() {
         }
       }),
       chrome_get_console_logs: tool({
-        description: "Read accumulated console messages, network log entries, and uncaught exceptions for a Chrome tab. On the first call, auto-attaches a persistent debugger and enables Console, Log, and Runtime domains so events flow into the buffer. Pass clear:true to reset the buffer after reading. Useful to diagnose runtime errors such as 404s on script includes.",
+        description: "Read accumulated console messages and uncaught exceptions for a Chrome tab. On the first call, auto-attaches a persistent debugger and enables the Runtime domain so console events flow into the buffer. Pass clear:true to reset the buffer after reading. Useful to diagnose runtime errors on the page.",
         args: {
           tabId: schema.number().int().describe("Chrome tab id."),
           clear: schema.boolean().optional().describe("If true, empty the buffer after returning the entries."),
@@ -1580,8 +1584,11 @@ function requireApprovals(tools, schema) {
               },
               callGrants
             );
+            // authorizePageTransition is called from inside the scoped
+            // execution; the binding read describes the newly authorized page,
+            // so it must not be sent under the stale pre-transition scopes.
             return Number.isInteger(executionArgs.tabId)
-              ? (await resolvePageBindings(name, executionArgs))[0]
+              ? (await withoutBridgePageScopes(() => resolvePageBindings(name, executionArgs)))[0]
               : undefined;
           }
         };
