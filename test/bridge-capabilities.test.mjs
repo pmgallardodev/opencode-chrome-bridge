@@ -3,7 +3,8 @@ import os from "node:os";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin, { ALL_TOOL_REQUIRED_CAPABILITIES, TOOL_CAPABILITY_REQUIREMENTS } from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin from "../src/opencode-plugin.js";
+import { ALL_TOOL_REQUIRED_CAPABILITIES, TOOL_CAPABILITY_REQUIREMENTS } from "../src/tool-metadata.js";
 import * as pluginModule from "../src/opencode-plugin.js";
 import { writeDataUrlToFile } from "../src/bridge-client.js";
 import { createLauncher, isSupportedNodeVersion, nativeHostLayout } from "../scripts/lib/platform-support.mjs";
@@ -457,7 +458,7 @@ test("managed resumable sessions expose one capability-gated resume tool", async
   assert.ok(plugin.tool.chrome_resume_session, "chrome_resume_session tool missing");
   assert.match(plugin.tool.chrome_resume_session.description, /resume|handoff|session/iu);
   assert.deepEqual(
-    [...pluginModule.TOOL_CAPABILITY_REQUIREMENTS.chrome_resume_session],
+    [...TOOL_CAPABILITY_REQUIREMENTS.chrome_resume_session],
     ["bridge.handshake", "browser.tab-groups", "browser.tabs", "session.resume"].sort()
   );
   assert.match(await readFile(path.join(repoRoot, "extension", "background.js"), "utf8"), /onCreatedNavigationTarget/u);

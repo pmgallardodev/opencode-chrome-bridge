@@ -14,6 +14,7 @@ await writeFile(path.join(stateDir, "state.json"), JSON.stringify({
 }), { mode: 0o600 });
 
 const pluginModule = await import("../src/opencode-plugin.js");
+const toolMetadata = await import("../src/tool-metadata.js");
 const OpenCodeChromeBridgePlugin = pluginModule.default;
 
 after(async () => {
@@ -29,12 +30,12 @@ function compatibleStatus() {
     compatible: true,
     hostReachable: true,
     legacy: false,
-    host: { name: "com.opencode.chrome_bridge", version: "1.4.3", protocolMin: "1.0.0", protocolMax: "1.0.0" },
-    client: { name: "opencode-plugin", version: "1.4.3", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    host: { name: "com.opencode.chrome_bridge", version: "1.4.4", protocolMin: "1.0.0", protocolMax: "1.0.0" },
+    client: { name: "opencode-plugin", version: "1.4.4", protocolMin: "1.0.0", protocolMax: "1.0.0" },
     extension: {
-      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.4.3", protocolVersion: "1.0.0",
+      extensionId: "extension-id", extensionName: "opencode-chrome-bridge", extensionVersion: "1.4.4", protocolVersion: "1.0.0",
       hostName: "com.opencode.chrome_bridge",
-      capabilities: pluginModule.ALL_TOOL_REQUIRED_CAPABILITIES
+      capabilities: toolMetadata.ALL_TOOL_REQUIRED_CAPABILITIES
     },
     missingCapabilities: [],
     diagnostics: []
@@ -903,11 +904,11 @@ test("CDP target listing filters internal and devtools targets", async () => {
 test("every public tool has an explicit page or browser origin classification", async () => {
   const plugin = await OpenCodeChromeBridgePlugin();
   const publicNames = Object.keys(plugin.tool).filter((name) => name !== "chrome_status").sort();
-  assert.deepEqual(Object.keys(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION).sort(), publicNames);
-  assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_cursor_state, "page");
-  assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_favicon_badge, "page");
-  assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_events, "page");
-  assert.equal(pluginModule.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
+  assert.deepEqual(Object.keys(toolMetadata.TOOL_ORIGIN_SCOPE_CLASSIFICATION).sort(), publicNames);
+  assert.equal(toolMetadata.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_cursor_state, "page");
+  assert.equal(toolMetadata.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_favicon_badge, "page");
+  assert.equal(toolMetadata.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_events, "page");
+  assert.equal(toolMetadata.TOOL_ORIGIN_SCOPE_CLASSIFICATION.chrome_history, "browser");
 });
 
 test("WebMCP discovery and invocation require exact current-origin approval before isolated execution", async () => {

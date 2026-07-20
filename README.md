@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.4.3-0f766e?style=flat-square" alt="Version v1.4.3" />
+  <img src="https://img.shields.io/badge/Version-v1.4.4-0f766e?style=flat-square" alt="Version v1.4.4" />
   <img src="https://img.shields.io/badge/Node-22.22.2%2B-339933?logo=node.js&logoColor=white&style=flat-square" alt="Node 22.22.2 or a supported newer release" />
   <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white&style=flat-square" alt="Chrome MV3" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT" />
@@ -862,7 +862,7 @@ What each command proves:
   never selected or modified. WebMCP discovery is reported conditionally when Chrome enables it.
 
 Reload the unpacked extension at `chrome://extensions` before `npm run smoke:installed` after
-changing extension code. The command requires a connected, compatible v1.4.3 extension and
+changing extension code. The command requires a connected, compatible v1.4.4 extension and
 fails before opening its fixture tab when Chrome still runs an older service worker.
 
 For a direct bridge status check:

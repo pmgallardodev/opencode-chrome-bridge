@@ -16,10 +16,11 @@ await writeFile(path.join(stateDir, "state.json"), JSON.stringify({
 }), { mode: 0o600 });
 const bridgeClient = await import("../src/bridge-client.js");
 const pluginModule = await import("../src/opencode-plugin.js");
+const toolMetadata = await import("../src/tool-metadata.js");
 const { requireBridgeCapabilities, validateBridgeStatus } = bridgeClient;
 const OpenCodeChromeBridgePlugin = pluginModule.default;
-const TOOL_CAPABILITY_REQUIREMENTS = pluginModule.TOOL_CAPABILITY_REQUIREMENTS;
-const ALL_TOOL_REQUIRED_CAPABILITIES = pluginModule.ALL_TOOL_REQUIRED_CAPABILITIES;
+const TOOL_CAPABILITY_REQUIREMENTS = toolMetadata.TOOL_CAPABILITY_REQUIREMENTS;
+const ALL_TOOL_REQUIRED_CAPABILITIES = toolMetadata.ALL_TOOL_REQUIRED_CAPABILITIES;
 
 after(async () => {
   if (previousStateDir === undefined) delete process.env.OPENCODE_CHROME_BRIDGE_STATE_DIR;

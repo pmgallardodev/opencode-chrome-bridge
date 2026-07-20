@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
-import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/opencode-plugin.js";
+import { ALL_TOOL_REQUIRED_CAPABILITIES } from "../src/tool-metadata.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const backgroundSource = await readFile(path.join(repoRoot, "extension", "background.js"), "utf8");
@@ -1564,7 +1564,7 @@ test("extension handshake exposes a stable sorted capability contract", async ()
   const result = await harness.execute("handshake", {});
 
   assert.equal(result.extensionId, "test-extension");
-  assert.equal(result.extensionVersion, "1.4.3");
+  assert.equal(result.extensionVersion, "1.4.4");
   assert.equal(result.hostName, "com.opencode.chrome_bridge");
   assert.match(result.protocolVersion, /^\d+\.\d+\.\d+$/u);
   assert.ok(result.capabilities.includes("bridge.handshake"));
@@ -1577,7 +1577,7 @@ test("popup status compares actual extension capabilities with host client requi
   const harness = createBackgroundHarness();
   const status = harness.popupStatus({
     name: "com.opencode.chrome_bridge",
-    version: "1.4.3",
+    version: "1.4.4",
     protocolMin: "1.0.0",
     protocolMax: "1.0.0",
     requiredCapabilities: ["browser.tabs", "browser.future", "bridge.handshake"]
@@ -5941,7 +5941,7 @@ function createBackgroundHarness({
     },
     runtime: {
       connectNative: () => nativePort,
-      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.4.3" }),
+      getManifest: () => ({ name: "OpenCode Chrome Bridge", version: "1.4.4" }),
       id: "test-extension",
       onInstalled: createEvent(),
       onMessage: events.runtimeOnMessage,

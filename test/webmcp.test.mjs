@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin, {
+import OpenCodeChromeBridgePlugin from "../src/opencode-plugin.js";
+import {
   TOOL_CAPABILITY_REQUIREMENTS,
   TOOL_ORIGIN_SCOPE_CLASSIFICATION
-} from "../src/opencode-plugin.js";
+} from "../src/tool-metadata.js";
 
 const webMcpTools = ["chrome_webmcp_list", "chrome_webmcp_invoke"];
 

@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## v1.4.4 — 2026-07-20
+
+### Fixed
+
+- The OpenCode plugin loads again under OpenCode 1.18. The plugin loader
+  validates every module export and invokes each one as a plugin factory, so
+  the non-function exports in `src/opencode-plugin.js` (`TOOL_CAPABILITY_REQUIREMENTS`,
+  `ALL_TOOL_REQUIRED_CAPABILITIES`, and `TOOL_ORIGIN_SCOPE_CLASSIFICATION`)
+  aborted the load with "Plugin export is not a function", and the exported
+  helper functions failed when invoked with the plugin context. Tool metadata
+  now lives in the new `src/tool-metadata.js` module, and the package
+  entrypoint is the new `src/plugin-entry.js`, which exposes exactly one
+  export: the plugin factory. The implementation module keeps its helper
+  exports for tests without leaking them into the plugin entrypoint.
+
+### Maintenance
+
+- `@opencode-ai/plugin` dependency and lockfile updated to 1.18.4, matching
+  the OpenCode 1.18 plugin contract.
+- Package, lockfile, manifest, popup, bridge client, native host, smoke
+  fixtures, and release verification report version 1.4.4 together.
+
 ## v1.4.3 — 2026-07-17
 
 ### Fixed

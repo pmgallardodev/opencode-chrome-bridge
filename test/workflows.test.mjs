@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import OpenCodeChromeBridgePlugin, { TOOL_CAPABILITY_REQUIREMENTS, TOOL_ORIGIN_SCOPE_CLASSIFICATION } from "../src/opencode-plugin.js";
+import OpenCodeChromeBridgePlugin from "../src/opencode-plugin.js";
+import { TOOL_CAPABILITY_REQUIREMENTS, TOOL_ORIGIN_SCOPE_CLASSIFICATION } from "../src/tool-metadata.js";
 
 const workflowTools = ["chrome_workflow_start", "chrome_workflow_stop", "chrome_workflow_cancel", "chrome_workflows", "chrome_workflow_get", "chrome_workflow_import", "chrome_workflow_delete", "chrome_workflow_run"];
 

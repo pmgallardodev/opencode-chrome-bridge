@@ -89,8 +89,8 @@ test("package metadata is safe and complete for a public source repository", asy
   assert.equal(packageJson.bugs?.url, "https://github.com/pmgallardodev/opencode-chrome-bridge/issues");
 });
 
-test("release metadata is synchronized for v1.4.3", async () => {
-  const expectedVersion = "1.4.3";
+test("release metadata is synchronized for v1.4.4", async () => {
+  const expectedVersion = "1.4.4";
   const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
   const packageLock = JSON.parse(await readFile(path.join(repoRoot, "package-lock.json"), "utf8"));
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
@@ -104,16 +104,16 @@ test("release metadata is synchronized for v1.4.3", async () => {
   assert.equal(packageLock.version, expectedVersion);
   assert.equal(packageLock.packages[""].version, expectedVersion);
   assert.equal(manifest.version, expectedVersion);
-  assert.match(popupHtml, /<span id="version">v1\.4\.3<\/span>/u);
-  assert.match(popupJs, /"v1\.4\.3"/u);
-  assert.match(readme, /Version-v1\.4\.3-/u);
-  assert.match(readme, /alt="Version v1\.4\.3"/u);
-  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.4\.3"/u);
-  assert.match(nativeHost, /HOST_VERSION = "1\.4\.3"/u);
-  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.17.20");
-  assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.17.20");
-  assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.17.20");
-  assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.17.20");
+  assert.match(popupHtml, /<span id="version">v1\.4\.4<\/span>/u);
+  assert.match(popupJs, /"v1\.4\.4"/u);
+  assert.match(readme, /Version-v1\.4\.4-/u);
+  assert.match(readme, /alt="Version v1\.4\.4"/u);
+  assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.4\.4"/u);
+  assert.match(nativeHost, /HOST_VERSION = "1\.4\.4"/u);
+  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.18.4");
+  assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.18.4");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.18.4");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.18.4");
 });
 
 test("v1.4 documentation covers every new workflow, schedule, and WebMCP contract", async () => {
@@ -131,7 +131,7 @@ test("v1.4 documentation covers every new workflow, schedule, and WebMCP contrac
     "origin-isolated", "document.modelContext.getTools()", "document.modelContext.executeTool(descriptor, inputJson, { signal })",
     "ISOLATED", "admission", "irrevocable", "8", "30,000 ms", "upgrade", "repair", "privacy"
   ]) assert.match(readme, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"), `README is missing ${text}`);
-  assert.match(changelog, /## v1\.4\.3 — 2026-07-17/u);
+  assert.match(changelog, /## v1\.4\.4 — 2026-07-20/u);
   assert.match(changelog, /workflow|schedule|WebMCP/iu);
   assert.match(security, /unattended[\s\S]*explicit approval/iu);
   assert.match(security, /WebMCP[\s\S]*irrevocable|irrevocable[\s\S]*WebMCP/iu);
