@@ -34,6 +34,7 @@ OpenCode tool -> local HTTP bridge -> Chrome native host -> Chrome extension -> 
 - [Project structure](#project-structure)
 - [Security model](#security-model)
 - [Manual installation](#manual-installation)
+  - [OpenCode 2 support](#opencode-2-support)
 - [Verification](#verification)
 - [Troubleshooting](#troubleshooting)
 - [OpenCode Chrome Bridge vs MCP Playwright](#opencode-chrome-bridge-vs-mcp-playwright)
@@ -54,6 +55,7 @@ Key points:
 - Fixed extension ID via RSA key in `manifest.json` — no config drift between installs.
 - Vanilla JS throughout — no bundler, no build step required.
 - macOS, Linux, and Windows 10/11 supported.
+- Runs on OpenCode 1 and OpenCode 2 (`opencode2`) from a single install — see [OpenCode 2 support](#opencode-2-support).
 
 ## Architecture
 
@@ -109,7 +111,7 @@ The native host binds only to `127.0.0.1`. Every request must include a `Bearer`
 
 - **Node.js** 22.22.2, 24.15.0, or 26.0.0+
 - **Google Chrome** (stable) with Developer mode enabled
-- **OpenCode** CLI installed and configured
+- **OpenCode** CLI installed and configured — OpenCode 1 (`opencode`), OpenCode 2 (`opencode2`), or both side by side
 - **macOS**, **Linux**, or **Windows 10/11**
 - On macOS, `sips` (bundled with the OS) is used to generate extension icons
 
@@ -616,12 +618,17 @@ opencode-chrome-bridge/
 |   `-- verify.mjs
 |-- src/
 |   |-- bridge-client.js
-|   `-- opencode-plugin.js
+|   |-- opencode-plugin.js
+|   |-- opencode-plugin-v2.js
+|   |-- opencode-service-client.js
+|   |-- plugin-entry.js
+|   `-- plugin-entry-v2.js
 |-- test/
 |   |-- background-runtime.test.mjs
 |   |-- bridge-capabilities.test.mjs
 |   |-- content-script-runtime.test.mjs
 |   |-- documentation.test.mjs
+|   |-- opencode2-plugin.test.mjs
 |   |-- platform-support.test.mjs
 |   `-- windows-setup.test.mjs
 |-- CHANGELOG.md
@@ -807,17 +814,22 @@ If you change `manifest.json`, popup files, or icons, reload the extension card 
 npm run install:opencode
 ```
 
-2. It updates `~/.config/opencode/opencode.jsonc` to include this repository in the `plugin` array:
+2. It updates `~/.config/opencode/opencode.jsonc` for both OpenCode generations. OpenCode 1 reads the `plugin` array; OpenCode 2 (`opencode2`) renamed the key to `plugins`. Both keys live in the same file, so one install serves both:
 
 ```jsonc
 {
   "plugin": [
     "/absolute/path/to/opencode-chrome-bridge"
+  ],
+  "plugins": [
+    "/absolute/path/to/opencode-chrome-bridge/src/plugin-entry-v2.js"
   ]
 }
 ```
 
-3. Restart OpenCode after the config changes.
+The OpenCode 2 entry points at `src/plugin-entry-v2.js` rather than the repository root because OpenCode 2 resolves a directory through the package's `exports`/`main` field, which points at the OpenCode 1 entrypoint. Set `OPENCODE_CONFIG_DIR` before running the installer to target a different config directory.
+
+3. Restart OpenCode after the config changes. For OpenCode 2 the plugin is loaded by the background server, so run `opencode2 service restart`.
 
 4. Verify:
 
@@ -832,9 +844,31 @@ Expected result:
   "ok": true,
   "extensionId": "miccjajdhchpcdpmmiahheilooppepnl",
   "nativeHostName": "com.opencode.chrome_bridge",
-  "opencodePluginPath": "/absolute/path/to/opencode-chrome-bridge"
+  "opencodePluginPath": "/absolute/path/to/opencode-chrome-bridge",
+  "opencode2PluginPath": "/absolute/path/to/opencode-chrome-bridge/src/plugin-entry-v2.js"
 }
 ```
+
+Confirm that OpenCode 2 loaded it:
+
+```bash
+opencode2 plugin list   # must include opencode-chrome-bridge
+```
+
+### OpenCode 2 support
+
+The same 82 tools, the same native bridge, and the same deny-by-default approval policy run on both generations. `src/opencode-plugin.js` stays the single source of truth for tool behaviour; `src/opencode-plugin-v2.js` only translates the surrounding contract, which OpenCode 2 changed in four places:
+
+| Contract | OpenCode 1 | OpenCode 2 |
+| --- | --- | --- |
+| Module shape | default export is a factory returning `{ tool: { ... } }` | default export is `{ id, setup }`, tools registered via `ctx.tool.transform()` |
+| Tool input | Zod shape | JSON Schema, derived here from the same Zod shapes |
+| Project directory | `context.directory` | resolved from `ctx.session.get()` → `location.directory` |
+| Approval prompt | `context.ask()` | `POST /api/session/{id}/permission` on the local service |
+
+OpenCode 2 dropped `context.ask()` from the tool context, but its permission engine is still reachable over the local service API, so every approval prompt — including the per-origin page scopes — behaves exactly as it does on OpenCode 1. The plugin reads the service URL and password from `~/.local/state/opencode/service.json` (honouring `XDG_STATE_HOME`) and authenticates with HTTP Basic against `127.0.0.1`; nothing leaves the machine. If that service is unreachable the tools fail closed instead of running unapproved. Sessions started with `opencode2 --standalone` use a private server that the shared service cannot reach, so browser tools report that they cannot request approval there.
+
+Because OpenCode 2 also parses the legacy `plugin` key, it logs one `failed to load plugin` warning per OpenCode 1 entry, including this repository's root path. That warning is expected while both keys coexist and does not affect the `plugins` entry.
 
 ## Verification
 
@@ -931,6 +965,21 @@ npm run verify
 ```
 
 Restart OpenCode after the config changes.
+
+On OpenCode 2 the plugin is loaded by the background server rather than the CLI, so restart that server and confirm the plugin is registered:
+
+```bash
+opencode2 service restart
+opencode2 plugin list   # must include opencode-chrome-bridge
+```
+
+If the plugin is missing, check the server log for a `failed to load plugin` line naming `src/plugin-entry-v2.js`:
+
+```bash
+grep "failed to load plugin" ~/.local/share/opencode/log/opencode.log
+```
+
+Warnings that name the repository root instead are expected: OpenCode 2 also parses the OpenCode 1 `plugin` key and cannot load OpenCode 1 entrypoints.
 
 ### Manifest changed but Chrome shows the old extension
 

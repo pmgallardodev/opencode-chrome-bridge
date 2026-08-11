@@ -2,25 +2,44 @@ export function parseJsonc(input) {
   return JSON.parse(stripTrailingCommas(stripJsonComments(input)));
 }
 
-export function withPluginPath(config, pluginPath) {
+// OpenCode 1 reads `plugin`; OpenCode 2 renamed it to `plugins` and replaced
+// `[path, options]` tuples with `{ package, options }` objects. Both keys can
+// coexist in one config file, so a single install can serve both runtimes.
+export const V1_PLUGIN_KEY = "plugin";
+export const V2_PLUGIN_KEY = "plugins";
+
+export function withPluginPath(config, pluginPath, key = V1_PLUGIN_KEY) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new TypeError("OpenCode config must be an object");
   }
-  if (config.plugin !== undefined && !Array.isArray(config.plugin)) {
-    throw new TypeError("OpenCode config plugin must be an array");
+  if (config[key] !== undefined && !Array.isArray(config[key])) {
+    throw new TypeError(`OpenCode config ${key} must be an array`);
   }
-  const plugins = [...(config.plugin ?? [])];
-  if (plugins.some((entry) => typeof entry !== "string")) {
-    throw new TypeError("OpenCode config plugin array must contain only strings");
+  const plugins = [...(config[key] ?? [])];
+  if (plugins.some((entry) => entryPackage(entry, key) === undefined)) {
+    throw new TypeError(
+      key === V2_PLUGIN_KEY
+        ? "OpenCode config plugins array must contain strings or { package } objects"
+        : "OpenCode config plugin array must contain only strings"
+    );
   }
-  if (!plugins.includes(pluginPath)) plugins.push(pluginPath);
-  return { ...config, plugin: plugins };
+  if (!plugins.some((entry) => entryPackage(entry, key) === pluginPath)) plugins.push(pluginPath);
+  return { ...config, [key]: plugins };
+}
+
+function entryPackage(entry, key) {
+  if (typeof entry === "string") return entry;
+  if (key !== V2_PLUGIN_KEY || entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    return undefined;
+  }
+  return typeof entry.package === "string" ? entry.package : undefined;
 }
 
 export async function installOpenCodePlugin({
   configPath,
   configDirectory,
   pluginPath,
+  key = V1_PLUGIN_KEY,
   readFile,
   writeFile,
   mkdir
@@ -34,19 +53,19 @@ export async function installOpenCodePlugin({
     if (error?.code !== "ENOENT") throw error;
   }
 
-  const updated = withPluginPath(config, pluginPath);
+  const updated = withPluginPath(config, pluginPath, key);
   const changed = JSON.stringify(updated) !== JSON.stringify(config);
   await mkdir(configDirectory, { recursive: true });
   if (changed) {
     const nextSource = source === null
       ? `${JSON.stringify(updated, null, 2)}\n`
-      : updatePluginInJsonc(source, updated.plugin);
+      : updatePluginInJsonc(source, updated[key], key);
     await writeFile(configPath, nextSource);
   }
   return { configPath, changed };
 }
 
-function updatePluginInJsonc(source, plugins) {
+function updatePluginInJsonc(source, plugins, key = V1_PLUGIN_KEY) {
   const tokens = tokenizeJsonc(source);
   const newline = source.includes("\r\n") ? "\r\n" : "\n";
   const rootOpen = tokens.findIndex((token) => token.type === "{");
@@ -63,7 +82,7 @@ function updatePluginInJsonc(source, plugins) {
     else if (token.type === "]") arrayDepth -= 1;
     else if (
       token.type === "string"
-      && token.value === "plugin"
+      && token.value === key
       && objectDepth === 1
       && arrayDepth === 0
       && tokens[index + 1]?.type === ":"
@@ -75,11 +94,11 @@ function updatePluginInJsonc(source, plugins) {
   }
 
   if (pluginProperties.length > 1) {
-    throw new SyntaxError("OpenCode config contains duplicate plugin keys");
+    throw new SyntaxError(`OpenCode config contains duplicate ${key} keys`);
   }
   if (pluginProperties.length === 1) {
     const [{ keyIndex, openIndex, closeIndex }] = pluginProperties;
-    if (closeIndex === null) throw new TypeError("OpenCode config plugin must be an array");
+    if (closeIndex === null) throw new TypeError(`OpenCode config ${key} must be an array`);
     const indent = lineIndentAt(source, tokens[keyIndex].start);
     return appendPluginArrayEntry(
       source,
@@ -93,23 +112,23 @@ function updatePluginInJsonc(source, plugins) {
     );
   }
 
-  return appendRootPlugin(source, tokens, plugins);
+  return appendRootPlugin(source, tokens, plugins, key);
 }
 
 function appendPluginArrayEntry(source, tokens, openIndex, closeIndex, pluginPath, elementIndent, closingIndent, newline) {
-  const elementTokenIndexes = [];
-  for (let index = openIndex + 1; index < closeIndex; index += 1) {
-    if (tokens[index].type === "string") elementTokenIndexes.push(index);
-  }
-
+  // Walk back from the closing bracket instead of scanning for string tokens:
+  // OpenCode 2 entries can be `{ "package": "..." }` objects, whose inner
+  // strings must not be mistaken for array elements.
   let updated = source;
   let closeStart = tokens[closeIndex].start;
   let preserveTrailingComma = false;
-  const lastElementIndex = elementTokenIndexes.at(-1);
+  let cursor = closeIndex - 1;
+  while (cursor > openIndex && tokens[cursor].type === ",") {
+    preserveTrailingComma = true;
+    cursor -= 1;
+  }
+  const lastElementIndex = cursor > openIndex ? cursor : undefined;
   if (lastElementIndex !== undefined) {
-    preserveTrailingComma = tokens
-      .slice(lastElementIndex + 1, closeIndex)
-      .some((token) => token.type === ",");
     if (!preserveTrailingComma) {
       const insertionPoint = tokens[lastElementIndex].end;
       updated = `${updated.slice(0, insertionPoint)},${updated.slice(insertionPoint)}`;
@@ -137,7 +156,7 @@ function matchingArrayClose(tokens, openIndex) {
   throw new SyntaxError("Unterminated plugin array in OpenCode config");
 }
 
-function appendRootPlugin(source, tokens, plugins) {
+function appendRootPlugin(source, tokens, plugins, key = V1_PLUGIN_KEY) {
   let depth = 0;
   let closeIndex = -1;
   for (let index = 0; index < tokens.length; index += 1) {
@@ -157,7 +176,7 @@ function appendRootPlugin(source, tokens, plugins) {
   const closeIndent = lineIndentAt(source, closeToken.start);
   const propertyIndent = `${closeIndent}  `;
   const newline = source.includes("\r\n") ? "\r\n" : "\n";
-  const property = `${propertyIndent}"plugin": ${formatPluginArray(plugins, `${propertyIndent}  `, propertyIndent, newline)}`;
+  const property = `${propertyIndent}${JSON.stringify(key)}: ${formatPluginArray(plugins, `${propertyIndent}  `, propertyIndent, newline)}`;
 
   let updated = source;
   let closeStart = closeToken.start;

@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- OpenCode 2 (`opencode2`) support alongside OpenCode 1, from a single install.
+  OpenCode 2 replaced the plugin contract wholesale, so the new
+  `src/opencode-plugin-v2.js` adapter translates it while `src/opencode-plugin.js`
+  remains the only source of truth for tool behaviour and approval policy: the
+  module is now `{ id, setup }` instead of a factory returning `{ tool: ... }`,
+  tools register through `ctx.tool.transform()`, tool inputs are JSON Schema
+  derived from the existing Zod shapes, and the project directory comes from
+  `ctx.session.get()` because `context.directory` is gone. The new
+  `src/plugin-entry-v2.js` is the OpenCode 2 entrypoint and is published as the
+  package's `./v2` export.
+- `src/opencode-service-client.js` rebuilds the approval prompt that OpenCode 2
+  removed from the tool context. It discovers the local service from
+  `service.json` (honouring `XDG_STATE_HOME`), rejects any registration that is
+  not loopback, authenticates with HTTP Basic, and raises prompts through
+  OpenCode 2's own permission engine, so deny-by-default and the per-origin page
+  scopes behave identically on both generations. An unreachable service fails
+  closed.
+
+### Changed
+
+- `npm run install:opencode` now writes both plugin keys into the same config
+  file: `plugin` for OpenCode 1 and `plugins` for OpenCode 2, which renamed the
+  key. It honours `OPENCODE_CONFIG_DIR`, and `npm run verify` checks both
+  entries.
+- The JSONC config writer no longer treats strings nested inside an array
+  element as elements themselves, so it appends correctly to an OpenCode 2
+  `plugins` array that already contains `{ "package": ... }` objects.
+
 ## v1.4.4 — 2026-07-20
 
 ### Fixed

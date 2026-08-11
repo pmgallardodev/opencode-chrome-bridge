@@ -113,6 +113,15 @@ const opencodeConfig = parseJsonc(await readInstalledFile(opencodeConfigPath(), 
 if (!Array.isArray(opencodeConfig.plugin) || !opencodeConfig.plugin.includes(repoRoot)) {
   throw new Error(`OpenCode config must include plugin path ${repoRoot}`);
 }
+// OpenCode 2 reads the `plugins` key and needs the v2 entrypoint directly; the
+// package root would resolve to the OpenCode 1 entry through package exports.
+const opencode2PluginPath = path.join(repoRoot, "src", "plugin-entry-v2.js");
+const opencode2Entries = (opencodeConfig.plugins ?? []).map(
+  (entry) => (typeof entry === "string" ? entry : entry?.package)
+);
+if (!Array.isArray(opencodeConfig.plugins) || !opencode2Entries.includes(opencode2PluginPath)) {
+  throw new Error(`OpenCode config must include plugins path ${opencode2PluginPath}`);
+}
 
 const hostPath = path.join(repoRoot, "native-host", "opencode-chrome-native-host.mjs");
 const { launcherPath: expectedLauncherPath, manifestPath, runtimeMetadataPath, requiresRegistry } = nativeHostLayout({
@@ -164,7 +173,8 @@ console.log(JSON.stringify({
   ok: true,
   extensionId,
   nativeHostName: NATIVE_HOST_NAME,
-  opencodePluginPath: repoRoot
+  opencodePluginPath: repoRoot,
+  opencode2PluginPath
 }, null, 2));
 
 async function checkJson(relativePath) {
@@ -178,7 +188,9 @@ function extensionIdFromKey(keyBase64) {
 }
 
 function opencodeConfigPath() {
-  return path.join(os.homedir(), ".config", "opencode", "opencode.jsonc");
+  const configDirectory = process.env.OPENCODE_CONFIG_DIR
+    || path.join(os.homedir(), ".config", "opencode");
+  return path.join(configDirectory, "opencode.jsonc");
 }
 
 async function readInstalledFile(filePath, label, repairCommand) {
