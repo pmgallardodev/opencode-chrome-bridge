@@ -110,10 +110,10 @@ test("release metadata is synchronized for v1.4.4", async () => {
   assert.match(readme, /alt="Version v1\.4\.4"/u);
   assert.match(bridgeClient, /BRIDGE_CLIENT_VERSION = "1\.4\.4"/u);
   assert.match(nativeHost, /HOST_VERSION = "1\.4\.4"/u);
-  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.18.4");
-  assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.18.4");
-  assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.18.4");
-  assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.18.4");
+  assert.equal(packageJson.dependencies["@opencode-ai/plugin"], "1.18.5");
+  assert.equal(packageLock.packages[""].dependencies["@opencode-ai/plugin"], "1.18.5");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/plugin"].version, "1.18.5");
+  assert.equal(packageLock.packages["node_modules/@opencode-ai/sdk"].version, "1.18.5");
 });
 
 test("v1.4 documentation covers every new workflow, schedule, and WebMCP contract", async () => {
