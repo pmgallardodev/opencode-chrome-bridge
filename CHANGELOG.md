@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## v1.5.0 — 2026-08-11
 
 ### Added
 
@@ -33,6 +33,14 @@ All notable changes to this project are documented in this file.
 - The JSONC config writer no longer treats strings nested inside an array
   element as elements themselves, so it appends correctly to an OpenCode 2
   `plugins` array that already contains `{ "package": ... }` objects.
+
+### Maintenance
+
+- `@opencode-ai/plugin` dependency and lockfile updated to 1.18.15.
+- Package, lockfile, manifest, popup, bridge client, native host, smoke
+  fixtures, and release verification report version 1.5.0 together. Reload the
+  unpacked extension in `chrome://extensions` after upgrading so the extension
+  reports the matching version.
 
 ## v1.4.4 — 2026-07-20
 
